@@ -6,12 +6,14 @@ import * as THREE from 'three';
 import { GameRuntime } from './core/GameRuntime';
 import { SIM_H } from './core/FixedStepDriver';
 import { Calm } from './render/Calm';
-import { BellTrail } from './render/BellTrail';
+import { BellTrail, bellGlow } from './render/BellTrail';
 import { PostFX } from './render/PostFX';
+import { GameCamera } from './render/Camera';
 import { Riggers } from './render/Rigger';
 import { RigLines } from './render/RigLine';
 import { AudioEngine } from './audio/AudioEngine';
 import { HUD } from './ui/HUD';
+import { Onboarding } from './ui/Onboarding';
 import { LandingScreen } from './ui/LandingScreen';
 import { TitleScreen } from './ui/TitleScreen';
 import { BracketScreen } from './ui/BracketScreen';
@@ -39,16 +41,19 @@ const scene = new THREE.Scene();
 const calm = new Calm(scene);
 const camera = new THREE.PerspectiveCamera(60, 1, 0.1, 4000);
 const post = new PostFX(renderer, scene, camera);
-const trail = new BellTrail(scene);
+const trail = new BellTrail(scene, camera);
+const gcam = new GameCamera(camera);
 const riggers = new Riggers(scene);
 const riglines = new RigLines(scene);
 const audio = new AudioEngine();
 const hud = new HUD(app);
+const onboarding = new Onboarding(app);
 const landing = new LandingScreen(app);
 const title = new TitleScreen(app);
 const bracketUI = new BracketScreen(app);
 const input = new InputManager(renderer.domElement, camera);
 const ai = new AiSystem();
+let shownOnboarding = false;
 
 const bellMesh = new THREE.Mesh(
   new THREE.SphereGeometry(0.95, 24, 16),
@@ -114,8 +119,16 @@ async function runMatch(
     { side: 'away', profile: styleToProfile(awayFr.styleTag, awayFr.cylinderClass), difficulty: 'pro' },
   ];
   trail.clear();
+  gcam.reset();
+  input.setFaithRingX?.(GATE_X); // player (home) attacks the +x Faith ring
+  if (!shownOnboarding) {
+    shownOnboarding = true;
+    onboarding.show();
+  }
   let acc = 0;
   let ended = false;
+  let prevLoop = false;
+  let prevFire = false;
 
   const reArm = (): void => {
     if (match.state.winner !== null || match.state.phase === 'live') return;
@@ -137,26 +150,46 @@ async function runMatch(
         const p1in = input.get(SIM_H);
         const aiFrame = ai.tick(snap, match.state as never, cfgs, gameSeed);
         const frame: InputFrame = { tick: snap.tick, players: [p1in, ...aiFrame.players] };
-        match.consume(sim.step(frame), sim.snapshot() as never);
+        const evs = sim.step(frame);
+        const upd = match.consume(evs, sim.snapshot() as never);
+        // Soul: drive the one-shot audio off real events.
+        for (const e of evs) {
+          if (e.type === 'bell_caught') audio.event('catch');
+          else if (e.type === 'bell_clatter' || e.type === 'bell_bobble') audio.event('clatter');
+        }
+        if (p1in.throwReleased) audio.event('throw');
+        if (!!p1in.fireLineAt && !prevFire) audio.event('grapple');
+        prevFire = !!p1in.fireLineAt;
+        if (upd && upd.scored) {
+          const k = upd.scored.kind;
+          audio.event(
+            k === 'loop' ? 'score_loop' : k === 'rise' || k === 'curl' ? 'score_rise'
+              : k === 'ground' ? 'score_ground' : 'score_fall',
+          );
+        } else if (upd && upd.turnover) {
+          audio.event('turnover');
+        }
         reArm();
         acc -= SIM_H;
         steps++;
       }
       const s = sim.snapshot();
+      const lg = s.loopTier === 'loop' ? 1 : s.loopTier === 'curl' ? 0.4 : 0;
+      const isLoop = s.loopTier === 'loop';
       bellMesh.position.set(s.bell.p.x, s.bell.p.y, s.bell.p.z);
-      (bellMesh.material as THREE.MeshStandardMaterial).emissiveIntensity = 0.3 + s.bell.chime * 1.6;
+      (bellMesh.material as THREE.MeshStandardMaterial).emissiveIntensity = bellGlow(s.bell.chime);
       trail.push(s.bell.p.x, s.bell.p.y, s.bell.p.z, s.bell.chime);
-      trail.setLoopMode(s.loopTier === 'loop');
-      post.setLoopGlow(s.loopTier === 'loop' ? 1 : s.loopTier === 'curl' ? 0.4 : 0);
+      trail.setLoopMode(isLoop);
+      post.setLoopGlow(lg);
       riggers.sync(s.players, 'P1');
       riglines.sync(s.players);
       audio.setBell(s.bell.chime, Math.hypot(s.bell.w.x, s.bell.w.y, s.bell.w.z),
         Math.max(-1, Math.min(1, s.bell.p.z / REG.R)), s.bell.heldBy === null);
-      audio.setHush(s.loopTier === 'loop' ? 1 : 0);
-      const bp = s.bell.p;
-      camera.position.set(bp.x - 34, bp.y * 0.35 + 26, 72);
-      camera.lookAt(bp.x + 8, bp.y * 0.45, 0);
-      camera.updateProjectionMatrix();
+      audio.setHush(lg);
+      if (isLoop && !prevLoop) audio.event('loop_building');
+      prevLoop = isLoop;
+      const p1r = s.players.find((pp) => pp.id === 'P1');
+      gcam.update(s.bell.p, p1r ? p1r.p : s.bell.p, GATE_X, lg, REG.R, Math.min(dt, 1 / 30));
       hud.render(s as never, match.state as never, input.view);
 
       if (!ended && match.state.winner !== null) {
@@ -224,6 +257,17 @@ function enterJump(f: Franchise): void {
   title.hide();
   bracketUI.show(bracket.state as never, f.id, proceed);
 }
+
+// Pointer-lock only on a genuine in-canvas click (a valid user gesture);
+// swallow the promise rejection browsers throw when it can't lock.
+renderer.domElement.addEventListener('click', () => {
+  try {
+    const r = (input.requestPointerLock?.() as unknown) as Promise<unknown> | undefined;
+    if (r && typeof r.catch === 'function') r.catch(() => {});
+  } catch {
+    /* pointer lock unavailable — fine, free-mouse aim still works */
+  }
+});
 
 landing.show(() => title.show(enterJump));
 console.info('RIG v2 P5 — full shell. master seed %s', masterSeed);

@@ -263,7 +263,7 @@ export class HUD {
     // hint for now. The orchestrator can wire in a Three.js project helper
     // for accurate screen-space dots; here we draw them as a stylistic
     // scatter near the reticle center as a charge-level indicator.
-    if (input.ghostArc.length > 1 && input.chargeLevel > 0.01) {
+    if (input.ghostArc.length > 1) {
       // Draw a dot-trail converging outward from center
       const n = input.ghostArc.length;
       for (let i = 1; i < n; i++) {
@@ -293,11 +293,12 @@ export class HUD {
 
     // ── Reticle ─────────────────────────────────────────────────────────
     const reticle = input.reticleState;
-    if (reticle !== 'none') {
+    if (reticle !== 'free') {
       let col: string;
-      if      (reticle === 'valid')       col = PAL.cyanCss;
+      if      (reticle === 'anchor-lock')  col = PAL.cyanCss;
       else if (reticle === 'out_of_range') col = PAL.dimCss;
-      else                                col = PAL.orangeCss;
+      else if (reticle === 'charging')     col = PAL.orangeCss;
+      else                                 col = PAL.paperCss; // 'free' — soft dot
 
       const r = RETICLE_R;
       const GAP = 4;
