@@ -108,6 +108,7 @@ export type SimEvent =
       touched: boolean;
       loopTier: 'loop' | 'curl' | 'none';
     }
+  | { type: 'bell_missed'; end: '+x' | '-x' }
   | { type: 'bell_caught'; by: PlayerId }
   | { type: 'bell_bobble'; by: PlayerId }
   | { type: 'bell_clatter'; by: PlayerId | null }

@@ -138,7 +138,7 @@ async function runMatch(
     if (match.state.winner !== null || match.state.phase === 'live') return;
     const poss = match.state.possession;
     sim.setBellHeld(ROSTER.find((r) => r.team === poss)!.id);
-    match.consume([{ type: 'foul_garrote', by: '__resume__' }], sim.snapshot());
+    match.resumeLive();
   };
 
   runtime?.stop();
@@ -305,7 +305,7 @@ async function runWatch(
     if (match.state.winner !== null || match.state.phase === 'live') return;
     const poss = match.state.possession;
     sim.setBellHeld(WATCH_ROSTER.find((r) => r.team === poss)!.id);
-    match.consume([{ type: 'foul_garrote', by: '__resume__' }], sim.snapshot());
+    match.resumeLive();
   };
 
   runtime?.stop();
@@ -356,6 +356,17 @@ async function runWatch(
       const cinePlayers = s.players.map((pp) => ({ id: pp.id, p: pp.p, team: pp.team }));
       gcam.cinematic(s.bell.p, cinePlayers, atkX, lg, REG.R, Math.min(dt, 1 / 30));
       hud.render(s as never, match.state as never, input.view);
+      // Diagnostic hook (cheap; lets a harness observe real AI progression).
+      (window as unknown as { __rig?: unknown }).__rig = {
+        tick: s.tick, bx: s.bell.p.x,
+        br: Math.hypot(s.bell.p.y, s.bell.p.z),
+        held: s.bell.heldBy,
+        poss: match.state.possession,
+        sh: match.state.scoreHome, sa: match.state.scoreAway,
+        inning: match.state.inning, phase: match.state.phase,
+        gate: match.state.cast.gate, throwsLeft: match.state.cast.throwsLeft,
+        msg: match.state.message,
+      };
 
       if (!ended && match.state.winner !== null) {
         ended = true;

@@ -12,6 +12,11 @@ use crate::player::{make_player, push_off, step_player, thrumbler, PlayerBody};
 use crate::rng::Rng;
 use crate::tuning::{GATE_RADIUS, GATE_X, OMEGA};
 
+/// A free, untouched-to-rest bell that neither scores nor is caught within
+/// this many ticks is a dead ball (30 s at 240 Hz — generous, longer than a
+/// legitimate Loop's return period so real loops are never killed).
+const MAX_FREE_TICKS: u64 = 7200;
+
 // ── throw constants ──────────────────────────────────────────────────────────
 
 const THROW_MIN: f64 = 9.0; // m/s minimum release speed
@@ -60,6 +65,12 @@ pub enum SimEvent {
         end: RingEnd,
         touched: bool,
         loop_tier: LoopTierOut,
+    },
+    /// A free bell left play without scoring: it crossed a gate plane but
+    /// missed the ring, or it drifted free far too long (no catch, no ring).
+    /// This is the "dead ball" the match machine needs to re-cast.
+    BellMissed {
+        end: RingEnd,
     },
     BellCaught {
         by: String,
@@ -183,6 +194,11 @@ pub struct SimWorld {
     pub bell_held_by: Option<String>,
     pub bell_thrown_by: Option<String>,
     pub bell_touched: bool,
+    /// Free bell has resolved out of play (missed/expired) — frozen until
+    /// the next launch/set re-casts it. Prevents runaway + event spam.
+    pub bell_dead: bool,
+    /// Consecutive ticks the bell has been in free flight.
+    pub free_ticks: u64,
     pub pass_chain: Vec<String>,
     pub release_pos: Vec3,
     pub release_tick: u64,
@@ -206,6 +222,8 @@ impl SimWorld {
             bell_held_by: None,
             bell_thrown_by: None,
             bell_touched: true,
+            bell_dead: false,
+            free_ticks: 0,
             pass_chain: vec![],
             release_pos: Vec3::new(0.0, 0.0, 0.0),
             release_tick: 0,
@@ -235,6 +253,8 @@ impl SimWorld {
         self.bell_held_by = None;
         self.bell_thrown_by = thrown_by.map(|s| s.to_string());
         self.bell_touched = false;
+        self.bell_dead = false;
+        self.free_ticks = 0;
         self.release_pos = p;
         self.release_tick = self.tick;
         if let Some(id) = thrown_by {
@@ -249,6 +269,8 @@ impl SimWorld {
     pub fn set_bell_held(&mut self, player_id: &str) {
         self.bell_held_by = Some(player_id.to_string());
         self.bell_touched = true;
+        self.bell_dead = false;
+        self.free_ticks = 0;
     }
 
     // ── Internal helpers ──────────────────────────────────────────────────────
@@ -338,7 +360,7 @@ impl SimWorld {
                 self.bell.p = self.players[idx].body.p;
                 self.bell.v = self.players[idx].body.v;
             }
-        } else {
+        } else if !self.bell_dead {
             let prev_x = self.bell.p.x;
             self.bell = step_bell(self.bell, OMEGA, h);
 
@@ -376,6 +398,8 @@ impl SimWorld {
                     CatchResult::Caught => {
                         self.bell_held_by = Some(w.id.clone());
                         self.bell_touched = true;
+                        self.bell_dead = false;
+                        self.free_ticks = 0;
                         self.loop_tracker.on_touch();
                         if self.pass_chain.last().map(|s: &String| s.as_str())
                             != Some(&w.id)
@@ -412,8 +436,25 @@ impl SimWorld {
                 }
             }
 
-            // Ring crossing.
+            // Ring crossing (may score, or emit BellMissed + go dead).
             self.check_ring(prev_x);
+
+            // Dead-ball on excessive free flight (no catch, no ring): a bell
+            // that drifts forever would freeze the match. check_ring may have
+            // already killed it this tick.
+            if !self.bell_dead {
+                self.free_ticks += 1;
+                if self.free_ticks > MAX_FREE_TICKS {
+                    let end = if self.bell.p.x >= 0.0 {
+                        RingEnd::PlusX
+                    } else {
+                        RingEnd::MinusX
+                    };
+                    self.events.push(SimEvent::BellMissed { end });
+                    self.bell_thrown_by = None;
+                    self.bell_dead = true;
+                }
+            }
         }
 
         self.tick += 1;
@@ -445,6 +486,15 @@ impl SimWorld {
                 loop_tier: tier.into(),
             });
             self.bell_thrown_by = None;
+        } else if crossed_pos {
+            // Crossed the +x gate plane but missed the ring — dead ball.
+            self.events.push(SimEvent::BellMissed { end: RingEnd::PlusX });
+            self.bell_thrown_by = None;
+            self.bell_dead = true;
+        } else if crossed_neg {
+            self.events.push(SimEvent::BellMissed { end: RingEnd::MinusX });
+            self.bell_thrown_by = None;
+            self.bell_dead = true;
         }
     }
 
@@ -651,6 +701,62 @@ mod tests {
             info.turn,
             LOOP_TURN
         );
+    }
+
+    /// A thrown bell that misses the ring must NOT run away forever: it
+    /// emits BellMissed when it crosses a gate plane off-ring, goes dead,
+    /// and stays bounded (regression for the x→∞ runaway).
+    #[test]
+    fn missed_throw_off_ring_is_a_dead_ball_not_a_runaway() {
+        let mut w = SimWorld::new(3);
+        // Aimed straight down +x but well outside the 8 m ring (rho = 20 m).
+        w.launch_bell(
+            Vec3::new(-180.0, 20.0, 0.0),
+            Vec3::new(40.0, 0.0, 0.0),
+            Vec3::new(0.0, 0.0, 0.0),
+            Some("P1"),
+        );
+        let idle = InputFrame::idle(0);
+        let mut saw_missed = false;
+        for _ in 0..(240 * 30) {
+            for ev in w.step(&idle, SIM_H) {
+                if matches!(ev, SimEvent::BellMissed { .. }) {
+                    saw_missed = true;
+                }
+            }
+        }
+        assert!(saw_missed, "an off-ring gate-plane crossing must emit BellMissed");
+        assert!(w.bell_dead, "the missed bell must be a dead ball");
+        assert!(
+            w.bell.p.x.abs() < GATE_X + 50.0,
+            "dead bell must stay bounded, got x={}",
+            w.bell.p.x
+        );
+    }
+
+    /// A free bell that never scores and is never caught must time out into
+    /// a dead ball (otherwise the match freezes).
+    #[test]
+    fn free_bell_times_out_into_a_dead_ball() {
+        let mut w = SimWorld::new(4);
+        // Near-stationary mid-tube: never reaches a gate plane on its own.
+        w.launch_bell(
+            Vec3::new(0.0, 10.0, 0.0),
+            Vec3::new(0.0, 0.0, 0.0),
+            Vec3::new(0.0, 0.0, 0.0),
+            Some("P1"),
+        );
+        let idle = InputFrame::idle(0);
+        let mut saw_missed = false;
+        for _ in 0..(MAX_FREE_TICKS as usize + 240) {
+            for ev in w.step(&idle, SIM_H) {
+                if matches!(ev, SimEvent::BellMissed { .. }) {
+                    saw_missed = true;
+                }
+            }
+        }
+        assert!(saw_missed, "a never-resolved free bell must time out");
+        assert!(w.bell_dead, "timed-out bell must be a dead ball");
     }
 
     /// The FNV hash is deterministic across calls.

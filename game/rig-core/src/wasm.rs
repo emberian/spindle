@@ -481,6 +481,10 @@ impl RigSim {
                         json_str(tier_str),
                     )
                 }
+                SimEvent::BellMissed { end } => {
+                    let end_str = if *end == RingEnd::PlusX { "+x" } else { "-x" };
+                    format!("{{\"type\":\"bell_missed\",\"end\":{}}}", json_str(end_str))
+                }
                 SimEvent::BellCaught { by } => {
                     format!("{{\"type\":\"bell_caught\",\"by\":{}}}", json_str(by))
                 }

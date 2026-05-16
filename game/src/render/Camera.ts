@@ -92,7 +92,30 @@ export class GameCamera {
   private cineOrder: CinematicAngle[] = ['broadcast', 'low', 'goal', 'wide'];
   private cineT = 0; // running clock for slow drift moves
 
+  // Smoothed attack direction (−1..+1). Possession flips pivot the rig over
+  // ~1 s instead of snapping 180°/64 m — the big "schizophrenic" cause.
+  private dirS = 0;
+  // Loop-cam hysteresis latch so frequent CURLS (loopGlow≈0.4) never trip the
+  // hero broadside cut; only a real LOOP (≈1.0) does, and it holds.
+  private loopLatch = false;
+
   constructor(private cam: THREE.PerspectiveCamera) {}
+
+  /** Smoothed attack direction; eases across possession flips. */
+  private smoothDir(attackX: number, dt: number): number {
+    const raw = Math.sign(attackX) || 1;
+    if (this.dirS === 0) this.dirS = raw;
+    else this.dirS = dampScalar(this.dirS, raw, 1.6, dt);
+    // keep magnitude ~1 so offsets don't shrink mid-pivot
+    const m = Math.abs(this.dirS);
+    return m < 0.25 ? (this.dirS < 0 ? -0.25 : 0.25) : this.dirS;
+  }
+
+  /** Loop-cam hysteresis: enter only on a true loop, hold through the dip. */
+  private wantLoopCam(loopGlow: number): boolean {
+    this.loopLatch = this.loopLatch ? loopGlow > 0.55 : loopGlow > 0.85;
+    return this.loopLatch;
+  }
 
   /**
    * Gentle player look. Pass normalised look intent each frame BEFORE
@@ -121,12 +144,13 @@ export class GameCamera {
    * @param skinR   cylinder radius (for framing scale)
    */
   update(bell: V3, p1: V3, attackX: number, loopGlow: number, skinR: number, dt: number): void {
-    const dir = Math.sign(attackX) || 1; // +1 attack +x, −1 attack −x
+    const dir = this.smoothDir(attackX, dt); // smoothed; no possession snap
 
-    // Focus = weighted blend of the bell (lead) and your rigger, nudged
-    // toward the attacked goal so you always see where you're going.
+    // Focus = weighted blend of the bell (lead) and your rigger. (No raw
+    // attackX pull — it lurched the frame 64 m on every turnover; the aim
+    // target below already leans goal-ward via `dir`.)
     const focus = new V(
-      bell.x * 0.6 + p1.x * 0.3 + attackX * 0.1,
+      bell.x * 0.66 + p1.x * 0.34,
       bell.y * 0.58 + p1.y * 0.42,
       bell.z * 0.58 + p1.z * 0.42,
     );
@@ -163,7 +187,7 @@ export class GameCamera {
     let fovTarget: number;
     let upTarget: THREE.Vector3;
 
-    const wantLoop = loopGlow > 0.15;
+    const wantLoop = this.wantLoopCam(loopGlow);
     this.loopBlend += ((wantLoop ? 1 : 0) - this.loopBlend) * (1 - Math.exp(-4 * dt));
 
     // Ease player look toward request, spring to 0 when not actively looking.
@@ -258,7 +282,7 @@ export class GameCamera {
     dt: number,
   ): void {
     this.cineT += dt;
-    const dir = Math.sign(attackX) || 1;
+    const dir = this.smoothDir(attackX, dt);
 
     // Cluster of players near the bell → centroid + spread (for framing).
     let cx = bell.x,
@@ -280,7 +304,7 @@ export class GameCamera {
       if (d < skinR * 2.5) maxd = Math.max(maxd, d);
     }
     const focus = new V(
-      (cx / wsum) * 0.55 + bell.x * 0.35 + attackX * 0.1,
+      (cx / wsum) * 0.6 + bell.x * 0.4,
       (cy / wsum) * 0.6 + bell.y * 0.4,
       (cz / wsum) * 0.6 + bell.z * 0.4,
     );
@@ -296,7 +320,7 @@ export class GameCamera {
     let fovTarget: number;
     let upTarget: THREE.Vector3;
 
-    const wantLoop = loopGlow > 0.15;
+    const wantLoop = this.wantLoopCam(loopGlow);
     this.loopBlend += ((wantLoop ? 1 : 0) - this.loopBlend) * (1 - Math.exp(-4 * dt));
 
     // framing scale grows with the spread so the cluster never overflows
@@ -306,7 +330,7 @@ export class GameCamera {
       // Hero broadside loop-cam (shared with PLAY) — never gimbal-locks
       // because up = ±spine here, fully orthogonal to the radial standoff.
       const standoff = skinR * (2.1 - 0.5 * loopGlow);
-      const drift = Math.sin(this.cineT * 0.25) * skinR * 0.35; // slow track
+      const drift = Math.sin(this.cineT * 0.12) * skinR * 0.12; // gentle track
       camTarget = new V(bell.x - dir * (skinR * 0.5 + drift), ry * standoff, rz * standoff);
       aimTarget = new V(bell.x, bell.y * 0.5, bell.z * 0.5);
       fovTarget = 44 - 6 * loopGlow;
@@ -357,7 +381,7 @@ export class GameCamera {
           // Broadcast-follow: behind & lifted, slow parallax track.
           const back = frame * 1.7;
           const lift = skinR * 0.55;
-          const side = skinR * 0.45 + Math.sin(this.cineT * 0.3) * skinR * 0.25;
+          const side = skinR * 0.45 + Math.sin(this.cineT * 0.12) * skinR * 0.08;
           camTarget = new V(
             focus.x - dir * back,
             focus.y - ry * lift + ty * side,
@@ -414,5 +438,7 @@ export class GameCamera {
     this.lookPitch = 0;
     this.lookActive = false;
     this.cineT = 0;
+    this.dirS = 0;
+    this.loopLatch = false;
   }
 }

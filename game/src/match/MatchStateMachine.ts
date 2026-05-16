@@ -164,6 +164,25 @@ export class MatchStateMachine {
   }
 
   /**
+   * Re-cast a dead / inning-break ball back to LIVE, preserving the current
+   * cast (throwsLeft / gate / spotX). The outer loop calls this right after
+   * re-gripping the bell on the possessing rigger. Distinct from foul_garrote,
+   * which is a real foul that resets the cast.
+   */
+  resumeLive(): void {
+    const s = this._state;
+    if (
+      s.winner !== null ||
+      s.phase === 'final' ||
+      s.phase === 'live' ||
+      s.phase === 'contest'
+    ) {
+      return;
+    }
+    this._state = { ...s, phase: 'live' };
+  }
+
+  /**
    * Resolve a pending contest after the outer loop has called Contest.resolveContest().
    */
   resolveContest(result: { winner: 'thrower' | 'contester' }, _sim: SimState): MatchUpdate {
@@ -218,6 +237,9 @@ export class MatchStateMachine {
       case 'bell_bobble':
       case 'bell_clatter':
         if (phase === 'live') this._onThrowSpent(sim, update);
+        break;
+      case 'bell_missed':
+        if (phase === 'live') this._onBellMissed(sim, update);
         break;
       case 'bell_skin':
         // Bell bouncing off skin: no throw consumed, no score.
@@ -331,6 +353,37 @@ export class MatchStateMachine {
       };
       if (newLeft === 0) this._applyTurnover(update);
     }
+  }
+
+  /**
+   * A free bell left play without scoring (crossed a gate plane outside the
+   * ring, or drifted free far too long). Same gate/throw bookkeeping as a
+   * spent throw, but it is a DEAD BALL — the outer loop re-grips it on the
+   * possessing rigger and calls resumeLive() (cast preserved, so a run of
+   * misses actually exhausts the cast and turns the ball over).
+   */
+  private _onBellMissed(sim: SimState, update: MatchUpdate): void {
+    const s = this._state;
+    const bellX = sim.bell.p.x;
+    const spotX = Math.max(-GATE_X, Math.min(GATE_X, bellX));
+
+    // A miss is a FAILED throw — it always burns one, no matter how far the
+    // dead bell sailed. (Only a *caught* bell beyond a gate advances the
+    // cast; rewarding raw distance here let possession never turn over.)
+    const newLeft = (s.cast.throwsLeft - 1) as 0 | 1 | 2 | 3;
+    if (newLeft <= 0) {
+      // Cast exhausted on a miss → turnover (this also ends the inning).
+      this._state = { ...s, cast: { ...s.cast, spotX } };
+      this._applyTurnover(update);
+      return;
+    }
+    this._state = {
+      ...s,
+      cast: { ...s.cast, throwsLeft: newLeft, spotX },
+      phase: 'dead',
+      message: `Missed throw — ${newLeft} left`,
+    };
+    update.resets.push('set');
   }
 
   private _onFoulGarrote(update: MatchUpdate): void {
