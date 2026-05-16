@@ -12,6 +12,7 @@ import { Riggers } from './render/Rigger';
 import { RigLines } from './render/RigLine';
 import { AudioEngine } from './audio/AudioEngine';
 import { HUD } from './ui/HUD';
+import { LandingScreen } from './ui/LandingScreen';
 import { TitleScreen } from './ui/TitleScreen';
 import { BracketScreen } from './ui/BracketScreen';
 import { InputManager } from './input/InputManager';
@@ -43,6 +44,7 @@ const riggers = new Riggers(scene);
 const riglines = new RigLines(scene);
 const audio = new AudioEngine();
 const hud = new HUD(app);
+const landing = new LandingScreen(app);
 const title = new TitleScreen(app);
 const bracketUI = new BracketScreen(app);
 const input = new InputManager(renderer.domElement, camera);
@@ -223,5 +225,5 @@ function enterJump(f: Franchise): void {
   bracketUI.show(bracket.state as never, f.id, proceed);
 }
 
-title.show(enterJump);
+landing.show(() => title.show(enterJump));
 console.info('RIG v2 P5 — full shell. master seed %s', masterSeed);
