@@ -6,7 +6,8 @@
   "license": "Apache-2.0",
   "scripts": {
     "dev": "vite",
-    "build": "tsc --noEmit && vite build",
+    "build:wasm": "cd rig-core && wasm-pack build --target web --release",
+    "build": "npm run build:wasm && tsc --noEmit && vite build",
     "typecheck": "tsc --noEmit",
     "test": "tsc --noEmit && vitest run",
     "test:watch": "vitest",

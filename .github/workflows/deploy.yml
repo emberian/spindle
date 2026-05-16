@@ -22,6 +22,11 @@ jobs:
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
       - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - name: Install wasm-pack
+        run: curl -sSf https://rustwasm.github.io/wasm-pack/installer/init.sh | sh
       - uses: actions/setup-node@v4
         with:
           node-version: 20
@@ -30,7 +35,13 @@ jobs:
       - name: Install
         run: npm ci
         working-directory: game
-      - name: Typecheck + unit tests (incl. the Number gate)
+      - name: Rust core — cargo test (incl. the Number gate + RNG parity)
+        run: cargo test --release
+        working-directory: game/rig-core
+      - name: Build the WASM physics core
+        run: wasm-pack build --target web --release
+        working-directory: game/rig-core
+      - name: Typecheck + unit tests (TS oracle + match + league)
         run: npm test
         working-directory: game
       - name: Build
