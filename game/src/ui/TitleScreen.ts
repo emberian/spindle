@@ -470,8 +470,9 @@ export class TitleScreen {
   private _confirm(): void {
     if (!this.selected || !this.onPick) return;
     const pick = this.selected;
+    const cb = this.onPick; // hide() nulls this.onPick — capture first
     this.hide();
-    this.onPick(pick);
+    cb(pick);
   }
 
   // ── Keyboard navigation ───────────────────────────────────────────────────
