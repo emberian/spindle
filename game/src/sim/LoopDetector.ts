@@ -6,8 +6,14 @@
 
 import type { Vec3 } from './vec';
 
-const TURN_THRESHOLD = Math.PI * 0.85; // radians of accumulated heading change
-const CLOSE_RADIUS = 14; // m — must return near the release line in (y,z)
+// Loop = an *approximate* closed orbit: winds enough heading to read as
+// "coming back around" and lands near where it was thrown. Curl = a big
+// untouched curve that doesn't quite close — scored as a lesser highlight.
+export const LOOP_TURN = 2.2; // rad — approximate coming-around
+export const CURL_TURN = 1.1; // rad — a notable curve, short of a loop
+const CLOSE_RADIUS = 22; // m — looser "approximately back where it came"
+
+export type LoopTier = 'loop' | 'curl' | 'none';
 
 export class LoopTracker {
   private active = false;
@@ -50,12 +56,20 @@ export class LoopTracker {
     this.hasPrev = true;
   }
 
-  /** At a ring crossing: was this a legal closed-arc Loop? */
+  /** At a ring crossing: Loop (approx-closed), Curl (big curve), or none. */
+  tier(p: Vec3): LoopTier {
+    if (this.touched) return 'none';
+    if (this.cumTurn >= LOOP_TURN) {
+      const back = Math.hypot(p.y - this.releaseY, p.z - this.releaseZ);
+      if (back <= CLOSE_RADIUS) return 'loop';
+    }
+    if (this.cumTurn >= CURL_TURN) return 'curl';
+    return 'none';
+  }
+
+  /** Back-compat: a strict-ish loop check (now = approximate). */
   isLoop(p: Vec3): boolean {
-    if (!this.active || this.touched) return false;
-    if (this.cumTurn < TURN_THRESHOLD) return false;
-    const back = Math.hypot(p.y - this.releaseY, p.z - this.releaseZ);
-    return back <= CLOSE_RADIUS;
+    return this.tier(p) === 'loop';
   }
 
   get untouched(): boolean {

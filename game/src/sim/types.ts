@@ -102,7 +102,12 @@ export interface InputFrame {
 
 // Events the sim emits (consumed by match rules + render/audio, read-only).
 export type SimEvent =
-  | { type: 'bell_through_ring'; end: '+x' | '-x'; touched: boolean; closedArc: boolean }
+  | {
+      type: 'bell_through_ring';
+      end: '+x' | '-x';
+      touched: boolean;
+      loopTier: 'loop' | 'curl' | 'none';
+    }
   | { type: 'bell_caught'; by: PlayerId }
   | { type: 'bell_bobble'; by: PlayerId }
   | { type: 'bell_clatter'; by: PlayerId | null }

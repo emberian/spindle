@@ -21,20 +21,26 @@ export interface TuningReport {
   tSkin: number; // s, for a representative near-axis launch
   axialReach: number; // m at strong-throw speed
   traversable: boolean;
-  // (2) Loop must be dramatic but controllable: ω·τ in a band.
-  omegaTauLoop: number;
-  loopDramatic: boolean;
+  // (2) An *approximate* closed Loop must be achievable: a gentle near-axis
+  //     throw winds enough heading (≈ LOOP_TURN_TARGET rad) before skinning.
+  loopWind: number; // rad of heading wound by the gentle loop throw
+  loopAchievable: boolean;
+  loopFlight: number; // s the gentle loop stays airborne
   // (3) Gradient felt but not lethal.
   gSkinFraction: number; // g at the literal skin, in Earth-g
   gradientOk: boolean;
   pass: boolean;
 }
 
-// Representative test throw: launched near the axis, modest cross-axis speed.
+// Representative throws.
 const STRONG_THROW = 30; // m/s axial component of a hard throw
 const LAUNCH_RHO = 2; // m off-axis at release
 const LAUNCH_VPERP = 2; // m/s cross-axis at release
-const LOOP_FLIGHT = 5; // s — the flight time of a dramatic loop
+// The gentle "loop" throw: near the axis, low cross-axis speed so it can
+// linger and wind a coming-around arc without skinning.
+const LOOP_RHO = 1.5;
+const LOOP_VPERP = 4;
+export const LOOP_TURN_TARGET = 2.2; // rad — "comes back around" enough to read
 
 // Time for cross-axis radius to reach R, by closed-form |ζ(t)|.
 export function timeToSkin(omega: number, R: number, rho0: number, vPerp: number): number {
@@ -56,8 +62,11 @@ export function evaluateTuning(inp: TuningInput): TuningReport {
   const axialReach = STRONG_THROW * tSkin;
   const traversable = axialReach >= 0.5 * L; // reach at least half the field
 
-  const omegaTauLoop = omega * LOOP_FLIGHT;
-  const loopDramatic = omegaTauLoop >= 0.5 && omegaTauLoop <= 1.2;
+  // The gentle loop throw lingers ~ this long before the skin; heading winds
+  // at ≈ ω, so it accumulates ≈ ω·t of turn — "comes back around".
+  const loopFlight = timeToSkin(omega, R, LOOP_RHO, LOOP_VPERP);
+  const loopWind = omega * loopFlight;
+  const loopAchievable = loopWind >= LOOP_TURN_TARGET && loopWind <= 6.5;
 
   const gSkin = omega * omega * R; // m/s² at the skin
   const gSkinFraction = gSkin / earthG;
@@ -67,22 +76,23 @@ export function evaluateTuning(inp: TuningInput): TuningReport {
     tSkin,
     axialReach,
     traversable,
-    omegaTauLoop,
-    loopDramatic,
+    loopWind,
+    loopAchievable,
+    loopFlight,
     gSkinFraction,
     gradientOk,
-    pass: traversable && loopDramatic && gradientOk,
+    pass: traversable && loopAchievable && gradientOk,
   };
 }
 
 // Inverse helper: given desired ω·τ_loop and g-fraction, derive ω and R.
 export function solveConstants(
-  targetOmegaTauLoop: number,
+  targetLoopWind: number,
   targetGFraction: number,
   earthG: number,
-  loopFlight = LOOP_FLIGHT,
+  loopFlight = 8,
 ): { omega: number; R: number } {
-  const omega = targetOmegaTauLoop / loopFlight;
+  const omega = targetLoopWind / loopFlight;
   const R = (targetGFraction * earthG) / (omega * omega);
   return { omega, R };
 }

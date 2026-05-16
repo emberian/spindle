@@ -9,10 +9,12 @@
 // here). Motion parallel to +X is inertial. Faith ring at +x end, Free at -x.
 
 export const REG = {
-  omega: 0.15, // rad/s (spin period ≈ 41.9 s)
-  R: 100, // m — skin radius (cross-axis bound)
+  // Retuned (P2.5) so an *approximate* closed Loop is achievable in a
+  // snappy ~8 s gentle near-axis orbit instead of an ~18 s knife-edge.
+  omega: 0.32, // rad/s (spin period ≈ 19.6 s)
+  R: 45, // m — skin radius (tighter calm → loop closes sooner, gradient sane)
   L: 640, // m — axial field length (gate rings at x = ±L/2)
-  gateRadius: 9, // m — scoring ring radius
+  gateRadius: 8, // m — scoring ring radius
   EARTH_G: 9.80665,
 } as const;
 

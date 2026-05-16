@@ -206,7 +206,7 @@ export class SimWorld {
         type: 'bell_through_ring',
         end: '+x',
         touched: this.bellTouched,
-        closedArc: this.loop.isLoop(this.bell.p),
+        loopTier: this.loop.tier(this.bell.p),
       });
       this.bellThrownBy = null;
     } else if (crossed(-GATE_X) && through) {
@@ -214,7 +214,7 @@ export class SimWorld {
         type: 'bell_through_ring',
         end: '-x',
         touched: this.bellTouched,
-        closedArc: this.loop.isLoop(this.bell.p),
+        loopTier: this.loop.tier(this.bell.p),
       });
       this.bellThrownBy = null;
     }
