@@ -1,21 +1,28 @@
-// P2 boot: the deterministic SimWorld driving the calm, the chime-driven
-// money-shot trail, bloom, and the Loop moment — slow-mo + scene-dim + a
-// down-the-spine loop-cam + the crowd hush. A scripted rigger fires a
-// canonical Loop on a cycle so the signature play is always on screen.
+// P3 — the first genuinely playable assembly. The Rust/WASM core drives a
+// real match: you (P1) play a home rigger via mouse+keys; the other riggers
+// (both teams) are the AI; MatchStateMachine consumes the Rust events;
+// Calm/Riggers/RigLines/BellTrail/PostFX/HUD render it. No clock; 9 innings.
 
 import * as THREE from 'three';
 import { GameRuntime } from './core/GameRuntime';
-import { FixedStepDriver, SIM_H } from './core/FixedStepDriver';
+import { SIM_H } from './core/FixedStepDriver';
 import { Calm } from './render/Calm';
 import { BellTrail } from './render/BellTrail';
 import { PostFX } from './render/PostFX';
+import { Riggers } from './render/Rigger';
+import { RigLines } from './render/RigLine';
 import { AudioEngine } from './audio/AudioEngine';
-import { SimWorld } from './sim/SimWorld';
-import { REG } from './sim/RegConstants';
-import type { InputFrame } from './sim/types';
+import { HUD } from './ui/HUD';
+import { InputManager } from './input/InputManager';
+import { AiSystem, type TeamConfig } from './ai/index';
+import { MatchStateMachine } from './match/MatchStateMachine';
+import { createWasmSim, type WasmSim } from './sim/wasm';
+import { REG, GATE_X } from './sim/RegConstants';
+import { TEAMS, styleToProfile } from './league/teams';
+import type { InputFrame, TeamSide, RiggerRole } from './sim/types';
 
 const app = document.getElementById('app')!;
-document.getElementById('boot')?.remove();
+const boot = document.getElementById('boot');
 
 const renderer = new THREE.WebGLRenderer({ antialias: true });
 renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
@@ -25,12 +32,13 @@ app.appendChild(renderer.domElement);
 
 const scene = new THREE.Scene();
 const calm = new Calm(scene);
-const camera = new THREE.PerspectiveCamera(58, 1, 0.1, 4000);
-const trail = new BellTrail(scene);
+const camera = new THREE.PerspectiveCamera(60, 1, 0.1, 4000);
 let post = new PostFX(renderer, scene, camera);
+const trail = new BellTrail(scene);
+const riggers = new Riggers(scene);
+const riglines = new RigLines(scene);
 const audio = new AudioEngine();
-addEventListener('pointerdown', () => audio.start(), { once: true });
-addEventListener('keydown', () => audio.start(), { once: true });
+const hud = new HUD(app);
 
 const bellMesh = new THREE.Mesh(
   new THREE.SphereGeometry(0.95, 24, 16),
@@ -47,100 +55,127 @@ function resize(): void {
 addEventListener('resize', resize);
 resize();
 
-// ── Scripted demo: P1 holds, fires a canonical Loop, recycle ──────────────
-const REL = { x: -50, y: 2, z: 0 };
-function makeWorld(): SimWorld {
-  const w = new SimWorld(1);
-  w.addPlayer('P1', 'home', 'spinner', { ...REL });
-  w.addPlayer('A1', 'away', 'reach', { x: 305, y: 0, z: 0 });
-  w.bellHeldBy = 'P1';
-  return w;
-}
-let world = makeWorld();
-let simTick = 0;
-const THROW_TICK = 60; // ~0.25 s after spawn
-function frameFor(tick: number): InputFrame {
-  return {
-    tick,
-    players: [
-      {
-        id: 'P1',
-        aim: { x: 0.30, y: 0.62, z: -0.72 }, // up-and-antispinward Coriolis sweep
-        fireLineAt: null,
-        reel: 0,
-        release: false,
-        pushoff: false,
-        throwCharge: 0.55,
-        throwReleased: tick === THROW_TICK,
-        throwSpin: 0,
-        thrumbler: { x: 0, y: 0, z: 0 },
-      },
-    ],
-  };
+// Spar anchor points — mirror Calm.ts's 16×3 layout for the aim raycast.
+const SPARS: { x: number; y: number; z: number }[] = [];
+for (let i = 0; i < 16; i++) {
+  const x = -GATE_X + ((i + 0.5) / 16) * REG.L;
+  for (let a = 0; a < 3; a++) {
+    const ang = (a / 3) * Math.PI * 2;
+    SPARS.push({ x, y: Math.cos(ang) * REG.R * 0.62, z: Math.sin(ang) * REG.R * 0.62 });
+  }
 }
 
-const driver = new FixedStepDriver(
-  () => {
-    world.step(frameFor(simTick), SIM_H);
-    simTick++;
-  },
-  () => world.snapshot(),
-);
+const SEED = 20260516;
+const input = new InputManager(renderer.domElement, camera);
+input.setSpars(SPARS);
+const ai = new AiSystem();
 
-let loopGlow = 0;
-let scoreFlash = 0;
-const runtime = new GameRuntime(
-  (dt) => {
-    calm.update(dt);
-    driver.advance(dt);
+// Two canon franchises for flavour + AI identity.
+const homeFr = TEAMS.find((t) => t.id === 'tuebor-spin-detroiters') ?? TEAMS[0];
+const awayFr = TEAMS.find((t) => t.id === 'toliman-gradient') ?? TEAMS[1];
+const teamConfigs: TeamConfig[] = [
+  { side: 'home', profile: styleToProfile(homeFr.styleTag, homeFr.cylinderClass), difficulty: 'pro' },
+  { side: 'away', profile: styleToProfile(awayFr.styleTag, awayFr.cylinderClass), difficulty: 'pro' },
+];
 
-    const a = driver.alpha;
-    const b0 = driver.prev.bell;
-    const b1 = driver.cur.bell;
-    const bx = b0.p.x + (b1.p.x - b0.p.x) * a;
-    const by = b0.p.y + (b1.p.y - b0.p.y) * a;
-    const bz = b0.p.z + (b1.p.z - b0.p.z) * a;
-    const ch = b1.chime;
-    bellMesh.position.set(bx, by, bz);
-    (bellMesh.material as THREE.MeshStandardMaterial).emissiveIntensity = 0.3 + ch * 1.6;
-    trail.push(bx, by, bz, ch);
+let sim: WasmSim;
+let match: MatchStateMachine;
 
-    // Loop state → glow / slow-mo / hush / cam.
-    const li = world.loopInfo();
-    const looping = li.free && li.untouched && li.turn > 0.6;
-    const target = looping ? Math.min(1, (li.turn - 0.6) / (Math.PI * 0.9)) : 0;
-    loopGlow += (target - loopGlow) * Math.min(1, dt * 6);
-    trail.setLoopMode(loopGlow > 0.15);
-    post.setLoopGlow(loopGlow);
-    runtime.timeScale = 1 - 0.28 * loopGlow; // gentle slow-mo (don't stall the arc)
-    audio.setHush(Math.max(loopGlow, 0));
-    const sp = Math.hypot(b1.w.x, b1.w.y, b1.w.z);
-    audio.setBell(ch, sp, Math.max(-1, Math.min(1, bz / REG.R)), li.free);
+// Roster: P1 (the human, home spinner) + 3 home AI + 4 away AI.
+const ROSTER: { id: string; team: TeamSide; role: RiggerRole; x: number }[] = [
+  { id: 'P1', team: 'home', role: 'spinner', x: -40 },
+  { id: 'H2', team: 'home', role: 'anchor', x: -90 },
+  { id: 'H3', team: 'home', role: 'faithwing', x: -20 },
+  { id: 'H4', team: 'home', role: 'reach', x: -260 },
+  { id: 'A1', team: 'away', role: 'spinner', x: 40 },
+  { id: 'A2', team: 'away', role: 'anchor', x: 90 },
+  { id: 'A3', team: 'away', role: 'freewing', x: 20 },
+  { id: 'A4', team: 'away', role: 'reach', x: 260 },
+];
 
-    if (scoreFlash > 0) scoreFlash = Math.max(0, scoreFlash - dt);
+function seatBell(): void {
+  // Hand the bell to a player of the team in possession to (re)start a cast.
+  const poss: TeamSide = match.state.possession;
+  const holder = ROSTER.find((r) => r.team === poss) ?? ROSTER[0];
+  sim.setBellHeld(holder.id);
+}
 
-    // Camera: normally a broadside down the calm; during a Loop, swing to a
-    // down-the-spine shot so the closed Coriolis arc reads as a loop.
-    // Side-on chase: track the bell from inside the calm so the Coriolis
-    // curve fills the frame (loopGlow adds a touch of push-in).
-    camera.position.set(bx - 34, by * 0.35 + 26, 72 - loopGlow * 14);
-    camera.lookAt(bx + 8, by * 0.45, 0);
-    camera.fov = 56 + loopGlow * 8;
-    camera.updateProjectionMatrix();
+function reArm(): void {
+  // Return the match to 'live' after a dead ball / inning break and re-seat
+  // the bell — the same toLive trick the league sim uses.
+  if (match.state.winner !== null) return;
+  if (match.state.phase !== 'live') {
+    seatBell();
+    match.consume([{ type: 'foul_garrote', by: '__resume__' }], sim.snapshot());
+  }
+}
 
-    // Recycle: bell left the field or long flight done.
-    if (Math.abs(b1.p.x) > REG.L / 2 + 5 || simTick > 240 * 17) {
-      if (Math.abs(b1.p.x) > REG.L / 2) {
-        audio.erupt(0.8);
-        scoreFlash = 1;
+let acc = 0;
+let runtime: GameRuntime;
+
+async function start(): Promise<void> {
+  sim = await createWasmSim(SEED);
+  for (const r of ROSTER) {
+    const ang = (ROSTER.indexOf(r) / ROSTER.length) * Math.PI * 2;
+    sim.addPlayer(r.id, r.team, r.role, {
+      x: r.x,
+      y: Math.cos(ang) * 8,
+      z: Math.sin(ang) * 8,
+    });
+  }
+  sim.setBellHeld('P1');
+  match = new MatchStateMachine('+x', 'home');
+  match.consume([{ type: 'foul_garrote', by: '__start__' }], sim.snapshot());
+
+  boot?.remove();
+  runtime = new GameRuntime(
+    (dt) => {
+      calm.update(dt);
+      acc += dt;
+      let steps = 0;
+      while (acc >= SIM_H && steps < 8 && match.state.winner === null) {
+        const snap = sim.snapshot();
+        const p1 = snap.players.find((p) => p.id === 'P1');
+        if (p1) input.setPlayerState(p1.p, p1.v, snap.bell.heldBy === 'P1');
+        const p1in = input.get(SIM_H);
+        const aiFrame = ai.tick(snap, match.state as never, teamConfigs, SEED);
+        const frame: InputFrame = { tick: snap.tick, players: [p1in, ...aiFrame.players] };
+        const events = sim.step(frame);
+        match.consume(events, sim.snapshot() as never);
+        reArm();
+        acc -= SIM_H;
+        steps++;
       }
-      world = makeWorld();
-      simTick = 0;
-      trail.clear();
-      loopGlow = 0;
-    }
-  },
-  () => post.render(),
-);
-runtime.start();
-console.info('RIG v2 P2 — deterministic sim + money-shot Loop. ω=%s', REG.omega);
+
+      const s = sim.snapshot();
+      bellMesh.position.set(s.bell.p.x, s.bell.p.y, s.bell.p.z);
+      const ch = s.bell.chime;
+      (bellMesh.material as THREE.MeshStandardMaterial).emissiveIntensity = 0.3 + ch * 1.6;
+      trail.push(s.bell.p.x, s.bell.p.y, s.bell.p.z, ch);
+      trail.setLoopMode(s.loopTier === 'loop');
+      post.setLoopGlow(s.loopTier === 'loop' ? 1 : s.loopTier === 'curl' ? 0.4 : 0);
+      riggers.sync(s.players, 'P1');
+      riglines.sync(s.players);
+      audio.setBell(ch, Math.hypot(s.bell.w.x, s.bell.w.y, s.bell.w.z),
+        Math.max(-1, Math.min(1, s.bell.p.z / REG.R)), s.bell.heldBy === null);
+      audio.setHush(s.loopTier === 'loop' ? 1 : 0);
+
+      // Chase cam: track the bell from inside the calm, side-on.
+      const bp = s.bell.p;
+      camera.position.set(bp.x - 34, bp.y * 0.35 + 26, 72);
+      camera.lookAt(bp.x + 8, bp.y * 0.45, 0);
+      camera.updateProjectionMatrix();
+
+      hud.render(s as never, match.state as never, input.view);
+    },
+    () => post.render(),
+  );
+  runtime.start();
+  addEventListener('pointerdown', () => { audio.start(); input.requestPointerLock(); });
+  console.info('RIG v2 P3 — playable. %s vs %s', homeFr.name, awayFr.name);
+}
+
+start().catch((e) => {
+  console.error('RIG boot failed', e);
+  if (boot) boot.textContent = 'RIG — boot failed (see console)';
+});
