@@ -756,7 +756,7 @@ AX.Render = {};
     ctx.fillStyle = wGrad;
     ctx.shadowColor = C.cyan;
     ctx.shadowBlur = Math.round(h * 0.04);
-    ctx.fillText('AXBALL', w / 2, h * 0.34);
+    ctx.fillText('RIG', w / 2, h * 0.34);
     ctx.restore();
 
     // Tagline
@@ -766,7 +766,7 @@ AX.Render = {};
     ctx.textAlign = 'center';
     ctx.textBaseline = 'top';
     ctx.letterSpacing = '0.25em';
-    ctx.fillText('THE GAME AT THE CENTER OF THE WORLD', w / 2, h * 0.48);
+    ctx.fillText('THE GAME PLAYED IN THE CALM', w / 2, h * 0.48);
     ctx.restore();
 
     // Controls box
