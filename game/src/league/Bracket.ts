@@ -94,6 +94,33 @@ export class Bracket {
     return { ...next };
   }
 
+  /** Peek the next playable game (both participants known) WITHOUT playing
+   *  it — so the caller can decide to play it interactively vs. simulate. */
+  nextGame(): BracketGame | null {
+    if (this._champion !== null) return null;
+    this._populateParticipants();
+    const next = this._games.find(
+      (g) => g.result === null && g.home !== null && g.away !== null,
+    );
+    return next ? { ...next } : null;
+  }
+
+  /** Report a player-PLAYED result for the next game (instead of simming
+   *  it). Mirrors advance()'s champion bookkeeping. */
+  playNext(result: MatchResult): BracketGame | null {
+    if (this._champion !== null) return null;
+    this._populateParticipants();
+    const next = this._games.find(
+      (g) => g.result === null && g.home !== null && g.away !== null,
+    );
+    if (!next) return null;
+    next.result = result;
+    if (next.round === 4) {
+      this._champion = result.winner === 'home' ? next.home! : next.away!;
+    }
+    return { ...next };
+  }
+
   /**
    * Play all remaining unplayed games to completion.
    * Returns the champion.
