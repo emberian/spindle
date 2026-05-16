@@ -64,7 +64,10 @@ var AX = window.AX || {};
     gateRadius:    10,
     deeplineX:     170,
     midline:       0,
-    omega:         0.22,
+    omega:         0.06,  // retuned: 0.22 made the 500m lane untraversable
+                          // (Stone skinned in ~2.5s). 0.06 keeps the Coriolis
+                          // asymmetry/curve visible while letting a skilled,
+                          // lead-compensated throw cross ~150-200m and score.
     thrumblerCap:  2.0,
     stoneRadius:   0.4,
     playerRadius:  0.8,
@@ -148,36 +151,38 @@ var AX = window.AX || {};
     s.stone.untouchedSinceThrow = false;
     s.stone.spinTrue            = false;
 
-    // Default two players
+    // ── Full roster: 4 per side. Human controls home runner 'P1'. ──────────
+    // Home attacks the +x gate; Away attacks the -x gate.
+    function mk(id, team, role, x, y, vx, contact) {
+      return {
+        id: id, team: team, role: role,
+        x: x, y: y, vx: vx || 0, vy: 0,
+        tether: null, dvBudget: cfg.thrumblerCap,
+        onSkin: false, contact: !!contact,
+      };
+    }
+    // Push-off: both teams off the Midline on opposite sides; the runners
+    // (P1 / A1) launch inward to race for the Stone at center; anchors and
+    // launches start anchored on the skin.
     s.players = [
-      {
-        id: 'p0', team: 'home', role: 'runner',
-        x: -30, y: R, vx: 0, vy: 0,
-        tether:   null,
-        dvBudget: cfg.thrumblerCap,
-        onSkin:   false,
-        contact:  true,
-      },
-      {
-        id: 'p1', team: 'away', role: 'runner',
-        x:  30, y: R, vx: 0, vy: 0,
-        tether:   null,
-        dvBudget: cfg.thrumblerCap,
-        onSkin:   false,
-        contact:  true,
-      },
+      mk('P1', 'home', 'runner', -15, 0,  6, false), // the human
+      mk('P4', 'home', 'rover',  -26, 0,  4, false),
+      mk('P2', 'home', 'anchor', -34,  R, 0, true),
+      mk('P3', 'home', 'launch', -50, -R, 0, true),
+      mk('A1', 'away', 'runner',  15, 0, -6, false),
+      mk('A4', 'away', 'rover',   26, 0, -4, false),
+      mk('A2', 'away', 'anchor',  34,  R, 0, true),
+      mk('A3', 'away', 'launch',  50, -R, 0, true),
     ];
 
     if (scenario === 'thrown-test') {
-      // Home player on +y skin near midline, stone thrown free
-      s.players[0].x = 0;  s.players[0].y = R;
-      s.players[1].x = 0;  s.players[1].y = -R;
-
-      // Stone given a spinward-diagonal throw from player 0
+      // Diagnostic only (used by _engine_test.html): a free thrown Stone.
+      s.players[0].x = 0;  s.players[0].y = R - 2; s.players[0].vx = 0;
+      s.players[0].contact = true;
       s.stone.x  = 0;  s.stone.y  = R - 2;
       s.stone.vx = 15; s.stone.vy = -20;  // spinward + radially inward
       s.stone.heldBy              = null;
-      s.stone.lastThrownBy        = 'p0';
+      s.stone.lastThrownBy        = 'P1';
       s.stone.untouchedSinceThrow = true;
     }
 
@@ -449,7 +454,9 @@ var AX = window.AX || {};
     var p  = this._findPlayer(playerId);
     var st = this.state.stone;
     if (!p || st.heldBy !== null) return;
-    var threshold = this._cfg.playerRadius + this._cfg.stoneRadius;
+    // Arcade-forgiving catch radius (geometric radii are sub-metre; a 1.2 m
+    // catch makes possession effectively impossible in a fast zero-g game).
+    var threshold = this._cfg.playerRadius + this._cfg.stoneRadius + 5;
     var dx = p.x - st.x;
     var dy = p.y - st.y;
     if (Math.sqrt(dx*dx + dy*dy) <= threshold) {

@@ -1,3 +1,6 @@
 pdf/page-*.png
 *.DS_Store
 web/node_modules/
+web/_smoke.html
+web/_engine_test.html
+*.png

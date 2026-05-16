@@ -1,12 +1,14 @@
 # RIG vs AXBALL — Comparison
 
-**Status, stated plainly:** Kanzo's *AXBALL: The Sourcebook* is the GM's
-own realization, marked "provisional canon pending ratification." It is
-**canon**. *RIG* (this repo) is an independent sibling derivation built
-in parallel without sight of AXBALL. This document compares them and
-recommends how RIG should serve AXBALL — not compete with it. (Per
-standing player doctrine: don't crowd the GM; lead with analysis; offer,
-don't argue.)
+**Status, corrected:** *AXBALL: The Sourcebook* is **not** Kanzo's
+hand-authored canon — it is a parallel Sonnet pass at the same brief
+(the "provisional canon pending ratification" stamp is the model's, not
+the GM's). So this is not "canon vs. sibling." It is **two independent
+AI derivations from the same lore + physics**, and the right outcome is
+to *keep both*: the playable game ships **both rulesets, RIG as the
+default**, and the dossier stays. The convergence below is the
+interesting finding; the divergences are genuine design options, not a
+hierarchy.
 
 ---
 
@@ -104,15 +106,17 @@ it as a "house-rules / pickup AXBALL" sibling, not a proposal.
 
 ## 4. Decisions taken from this comparison
 
-- **The playable game now implements AXBALL canon**, not RIG: the Lane,
-  the Stone, Gates, Frames + High Frames + Free Spin, push-off +
-  thrumblers, Long Launch scoring, 7 (arcade-reduced) roles. The
-  physics is identical in both, so nothing in the engine is wasted.
-  The swarm was briefed on AXBALL canon.
-- **The RIG dossier stays** as the sibling artifact + the carrier of the
-  four contributions above. It is explicitly *not* presented to Kanzo as
-  a rival sourcebook.
-- **Recommended package to Kanzo:** (a) "independent convergence — your
-  AXBALL is on the attractor, here's the proof"; (b) the four additive
-  proposals in §3, framed as steal-if-useful, especially #1 and #2;
-  (c) the playable AXBALL match as a toy that makes his canon tangible.
+- **The playable game ships BOTH rulesets on one shared engine**,
+  selectable on the title screen, **RIG as the default**. The physics
+  (rotating-frame Coriolis + gradient) is identical, so one engine
+  serves both: RIG = no clock / 9 innings / Fall 2·Rise 5·Loop 7·Ground
+  1 / asymmetric Faith+Free gates; AXBALL = 6 frames + High Frame +
+  Free Spin / thrown 1·carry 2·Long Launch 3. Nothing was thrown away.
+- **The RIG dossier stays** (PDF + design + league), full-strength, as
+  a peer artifact — not demoted.
+- **Recommended package to Kanzo:** (a) the independent-convergence
+  finding — two AIs, same lore, same sport, that's a real signal;
+  (b) the four ideas in §3 that exist in one version and not the other
+  (especially RIG's structural goal asymmetry and the Concordat-keeper),
+  as steal-if-useful options for whichever direction he ratifies;
+  (c) the playable match — pick a mode, it's the same world either way.

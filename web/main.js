@@ -10,9 +10,42 @@ window.AX = window.AX || {};
   AX.Render.init(canvas);
   AX.Input.init(canvas);
 
+  const overlayCtx = canvas.getContext('2d'); // for the title mode picker
+
   // ── screen FSM ───────────────────────────────────────────────────────────
   // 'loading' | 'title' | 'game' | 'end'
   let screen = 'title';
+  let selectedMode = 'rig'; // 'rig' (default) | 'axball'
+
+  // Mode picker: 1 = RIG, 2 = AXBALL (only on the title screen)
+  window.addEventListener('keydown', function (e) {
+    if (screen !== 'title') return;
+    if (e.key === '1') selectedMode = 'rig';
+    else if (e.key === '2') selectedMode = 'axball';
+  });
+
+  function drawModePicker() {
+    if (!overlayCtx) return;
+    const W = canvas.width, H = canvas.height;
+    overlayCtx.save();
+    overlayCtx.textAlign = 'center';
+    overlayCtx.textBaseline = 'middle';
+    const big = Math.round(H * 0.028), small = Math.round(H * 0.018);
+    const rig = selectedMode === 'rig';
+    overlayCtx.font = `bold ${big}px -apple-system,Arial,sans-serif`;
+    const y = H * 0.085;
+    overlayCtx.fillStyle = rig ? '#1aa6b7' : '#6b7079';
+    overlayCtx.fillText((rig ? '▶ ' : '   ') + 'RIG  [1]', W * 0.38, y);
+    overlayCtx.fillStyle = !rig ? '#d4602a' : '#6b7079';
+    overlayCtx.fillText((!rig ? '▶ ' : '   ') + 'AXBALL  [2]', W * 0.62, y);
+    overlayCtx.font = `${small}px -apple-system,Arial,sans-serif`;
+    overlayCtx.fillStyle = '#9aa0a8';
+    overlayCtx.fillText(
+      rig ? 'RIG  ·  no clock  ·  9 innings  ·  Fall 2 / Rise 5 / Loop 7 / Ground 1'
+          : 'AXBALL  ·  6 frames + High Frame  ·  thrown 1 / carry 2 / Long Launch 3',
+      W / 2, y + H * 0.045);
+    overlayCtx.restore();
+  }
 
   // Buttons returned by draw functions (hit-test on click)
   let titleBtn = null;
@@ -29,7 +62,7 @@ window.AX = window.AX || {};
   function createGameInstances() {
     try {
       engine = new AX.Engine();
-      game   = new AX.Game(engine);
+      game   = new AX.Game(engine, selectedMode);
       return true;
     } catch (e) {
       console.error('AX: failed to create Engine/Game instances', e);
@@ -184,6 +217,7 @@ window.AX = window.AX || {};
         // Check if engine/game loaded while on title
         if (modulesAvailable()) {
           titleBtn = AX.Render.drawTitleScreen();
+          drawModePicker();
         } else {
           AX.Render.drawLoadingScreen();
         }

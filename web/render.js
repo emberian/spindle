@@ -3,7 +3,8 @@
 // Canvas maps world to screen via camera transform.
 window.AX = window.AX || {};
 
-AX.Render = (function () {
+AX.Render = {};
+(function () {
   'use strict';
 
   // ── palette ──────────────────────────────────────────────────────────────
@@ -594,9 +595,12 @@ AX.Render = (function () {
     ctx.fillStyle = '#f4f1ea';
     ctx.textAlign = 'left';
     ctx.textBaseline = 'middle';
-    const frameStr = `FRAME ${gs.frame || 1}/6`;
+    const isRig = gs.mode === 'rig';
+    const frameStr = isRig
+      ? `RIG · INNING ${gs.frame || 1}/9`
+      : `FRAME ${gs.frame || 1}/6`;
     ctx.fillText(frameStr, pad, cy);
-    if (gs.highFrame) {
+    if (!isRig && gs.highFrame) {
       ctx.fillStyle = '#ffcc00';
       ctx.fillText('  ★ HIGH', pad + ctx.measureText(frameStr).width, cy);
     }
@@ -609,8 +613,13 @@ AX.Render = (function () {
     ctx.textAlign = 'right';
     ctx.textBaseline = 'middle';
     const fc = gs.frameClock != null ? gs.frameClock : 0;
-    const mins = Math.floor(fc / 60), secs = Math.floor(fc % 60);
-    ctx.fillText(`${String(mins).padStart(2,'0')}:${String(secs).padStart(2,'0')}`, W - pad, cy);
+    if (gs.mode === 'rig' || fc < 0) {
+      ctx.fillStyle = C.cyan;
+      ctx.fillText('NO CLOCK', W - pad, cy);
+    } else {
+      const mins = Math.floor(fc / 60), secs = Math.floor(fc % 60);
+      ctx.fillText(`${String(mins).padStart(2,'0')}:${String(secs).padStart(2,'0')}`, W - pad, cy);
+    }
     ctx.restore();
 
     // Shot clock + possession (bottom-right corner)
@@ -921,5 +930,6 @@ AX.Render = (function () {
     ctx.restore();
   };
 
-  return { init, draw };
+  AX.Render.init = init;
+  AX.Render.draw = draw;
 }());

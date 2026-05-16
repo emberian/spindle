@@ -65,19 +65,26 @@
 
   // ─── AX.Game ──────────────────────────────────────────────────────────────
 
-  function Game(engine) {
+  // RIG ruleset: no clock, 9 innings, asymmetric gates (Faith +x / Free -x),
+  // Fall 2 / Rise 5 / Loop 7 / Ground 1. AXBALL ruleset: frames + High Frame.
+  var RIG_INNINGS = 9;
+
+  function Game(engine, mode) {
     this._engine = engine;
+    this.mode = (mode === 'axball') ? 'axball' : 'rig';  // RIG is the default
+    var rig = this.mode === 'rig';
 
     // Public state (read by render/main)
     this.state = {
-      frame:      1,
-      frameClock: FRAME_DURATION,
+      mode:       this.mode,
+      frame:      1,                        // RIG: this is the INNING (1..9)
+      frameClock: rig ? -1 : FRAME_DURATION, // RIG: -1 == NO CLOCK
       highFrame:  false,
       score:      { home: 0, away: 0 },
       possession: 'home',
       phase:      'pushoff',  // 'pushoff'|'live'|'score'|'turnover'|'freespin'|'over'
       shotClock:  SHOT_CLOCK_MAX,
-      message:    'AXBALL — Get ready!',
+      message:    rig ? 'RIG — rig up!' : 'AXBALL — Get ready!',
       winner:     null
     };
 
@@ -183,7 +190,12 @@
     if (st.phase === 'score' || st.phase === 'turnover') {
       this._phaseTimer -= dt;
       if (this._phaseTimer <= 0) {
-        this._beginLive();
+        if (this.mode === 'rig' && this._rigAdvance) {
+          this._rigAdvance = false;
+          this._rigNextInning();
+        } else {
+          this._beginLive();
+        }
       }
       return; // skip rest of rule logic during pause
     }
@@ -193,14 +205,22 @@
       return;
     }
 
-    // ── Frame clock ───────────────────────────────────────────────────────
-    if (st.phase === 'live' || st.phase === 'pushoff') {
+    // ── Frame clock (AXBALL only — RIG has NO CLOCK) ──────────────────────
+    if (this.mode !== 'rig' && (st.phase === 'live' || st.phase === 'pushoff')) {
       st.frameClock -= dt;
       if (st.frameClock <= 0) {
         st.frameClock = 0;
         this._endFrame();
         return;
       }
+    }
+
+    // ── Push-off resolution: someone grabbed the Stone → go live ──────────
+    if (st.phase === 'pushoff' && eSt.stone && eSt.stone.heldBy) {
+      var grabber = this._findPlayer(eSt, eSt.stone.heldBy);
+      if (grabber) st.possession = grabber.team;
+      this._beginLive();
+      return;
     }
 
     // ── Shot clock (5s rule) ──────────────────────────────────────────────
@@ -290,23 +310,30 @@
     var st = this.state;
 
     if (ev.type === 'score') {
-      var pts = safe(ev.points, 1);
-      if (st.highFrame) pts *= 2;
-
-      if (ev.team === 'home') {
-        st.score.home += pts;
-      } else if (ev.team === 'away') {
-        st.score.away += pts;
+      var pts, methodLabel;
+      if (this.mode === 'rig') {
+        // Asymmetric gates: +x = Faith (Fall 2), -x = Free (Rise 5).
+        // A long, untouched, curving strike into the Free gate = Loop 7.
+        var sx   = safe(this._engine.state.stone.x);
+        var gate = sx > 0 ? 'faith' : 'free';
+        if (gate === 'faith')                       { pts = 2; methodLabel = 'FALL (+2)'; }
+        else if (ev.method === 'long')              { pts = 7; methodLabel = 'LOOP (+7)!'; }
+        else                                        { pts = 5; methodLabel = 'RISE (+5)'; }
+      } else {
+        pts = safe(ev.points, 1);
+        if (st.highFrame) pts *= 2;
+        if (ev.method === 'carry')      methodLabel = 'CARRY (+' + pts + ')';
+        else if (ev.method === 'long')  methodLabel = 'LONG LAUNCH (+' + pts + ')';
+        else                            methodLabel = 'GOAL (+' + pts + ')';
       }
 
-      var methodLabel = '';
-      if (ev.method === 'carry')    methodLabel = 'CARRY (+' + pts + ')';
-      else if (ev.method === 'long') methodLabel = 'LONG LAUNCH (+' + pts + ')';
-      else                           methodLabel = 'GOAL (+' + pts + ')';
+      if (ev.team === 'home')      st.score.home += pts;
+      else if (ev.team === 'away') st.score.away += pts;
 
       st.message = (ev.team === 'home' ? 'HOME' : 'AWAY') + ' — ' + methodLabel;
       st.phase   = 'score';
-      this._phaseTimer = 2.5; // 2.5s pause before restart
+      this._phaseTimer = 2.5; // pause before restart
+      this._rigAdvance = true; // RIG: a score ends the inning
 
       // In freespin, any score ends the game
       if (st.phase === 'freespin' || this._wasFreespin) {
@@ -327,21 +354,37 @@
       this._triggerTurnover(this._engine.state);
 
     } else if (ev.type === 'skin') {
-      // Player hit the skin — informational
-      st.message = 'Ouch! Skin contact (Player ' + ev.playerId + ')';
+      if (this.mode === 'rig' && ev.playerId &&
+          this._engine.state.stone.heldBy === ev.playerId) {
+        // RIG: a carrier driven into the skin = GROUND, 1 to the defense.
+        var carrier = this._findPlayer(this._engine.state, ev.playerId);
+        if (carrier) {
+          var def = carrier.team === 'home' ? 'away' : 'home';
+          if (def === 'home') st.score.home += 1; else st.score.away += 1;
+          st.message = (def === 'home' ? 'HOME' : 'AWAY') + ' — GROUND (+1)';
+          st.phase = 'score';
+          this._phaseTimer = 2.0;
+          this._rigAdvance = true;
+        }
+      } else {
+        st.message = 'Skin contact (' + (ev.playerId || 'stone') + ')';
+      }
     }
   };
 
   // ─── Phase transitions ────────────────────────────────────────────────────
 
   Game.prototype._startFrame = function (frameNum, firstPossession) {
-    var st = this.state;
+    var st  = this.state;
+    var rig = this.mode === 'rig';
     st.frame      = frameNum;
-    st.frameClock = FRAME_DURATION;
-    st.highFrame  = frameNum >= HIGH_FRAME_START;
+    st.frameClock = rig ? -1 : FRAME_DURATION;
+    st.highFrame  = !rig && frameNum >= HIGH_FRAME_START;
     st.possession = firstPossession;
     st.shotClock  = SHOT_CLOCK_MAX;
-    st.message    = 'FRAME ' + frameNum + (st.highFrame ? ' — HIGH FRAME!' : '') + ' — PUSH OFF!';
+    st.message    = rig
+      ? 'INNING ' + frameNum + ' OF ' + RIG_INNINGS + ' — RIG UP!'
+      : 'FRAME ' + frameNum + (st.highFrame ? ' — HIGH FRAME!' : '') + ' — PUSH OFF!';
     st.phase      = 'pushoff';
     this._shotHolder  = null;
     this._shotElapsed = 0;
@@ -378,6 +421,35 @@
     this._shotHolder  = null;
     this._shotElapsed = 0;
     st.shotClock  = SHOT_CLOCK_MAX;
+    if (this.mode === 'rig') this._rigAdvance = true; // turnover ends the inning
+  };
+
+  // RIG: advance the inning after a score or a turnover-and-clear.
+  Game.prototype._rigNextInning = function () {
+    var st = this.state;
+    if (this._wasFreespin || st.phase === 'freespin') {
+      // Spine (sudden death) already running: next score handled in _handleEvent.
+      this._beginLive();
+      return;
+    }
+    var next = st.frame + 1;
+    if (next > RIG_INNINGS) {
+      if (st.score.home === st.score.away) {
+        st.phase          = 'freespin';   // "the spine" — sudden death
+        this._wasFreespin = true;
+        st.message        = 'TIED — THE SPINE! Next score wins.';
+        try { this._engine.reset('pushoff'); } catch (e) {}
+        try { this._engine.newPossession('home'); } catch (e) {}
+      } else {
+        st.winner  = st.score.home > st.score.away ? 'home' : 'away';
+        st.phase   = 'over';
+        st.message = (st.winner === 'home' ? 'HOME' : 'AWAY') + ' WINS THE RIG!';
+      }
+      return;
+    }
+    var nextPoss = this._frameStartPossession === 'home' ? 'away' : 'home';
+    this._frameStartPossession = nextPoss;
+    this._startFrame(next, nextPoss);
   };
 
   Game.prototype._endFrame = function () {
