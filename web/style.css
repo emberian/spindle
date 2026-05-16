@@ -1,0 +1,43 @@
+*, *::before, *::after {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+:root {
+  --bg:       #11131a;
+  --cyan:     #1aa6b7;
+  --orange:   #d4602a;
+  --paper:    #f4f1ea;
+  --dim:      #6b7079;
+  --font: -apple-system, 'Helvetica Neue', Arial, 'Liberation Sans', sans-serif;
+}
+
+html, body {
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  background: var(--bg);
+  color: var(--paper);
+  font-family: var(--font);
+}
+
+#axball-canvas {
+  display: block;
+  width: 100%;
+  height: 100%;
+  cursor: crosshair;
+}
+
+#overlay {
+  position: fixed;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  pointer-events: none;
+}
+
+#overlay.hidden {
+  display: none;
+}
