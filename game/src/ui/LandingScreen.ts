@@ -31,10 +31,15 @@ const CSS = `
 #rig-landing .ctl{display:flex;flex-wrap:wrap;gap:10px 26px;justify-content:center;
   color:${PAL.dimCss};font-size:12.5px;letter-spacing:.06em;margin:1.6em 0 2.6em;}
 #rig-landing .ctl b{color:${PAL.paperCss};}
-#rig-landing .play{display:block;margin:0 auto;padding:18px 64px;font:inherit;
+#rig-landing .acts{display:flex;flex-wrap:wrap;gap:14px 18px;justify-content:center;align-items:center;}
+#rig-landing .play{display:block;padding:18px 64px;font:inherit;
   font-size:20px;font-weight:800;letter-spacing:.28em;color:${PAL.bgCss};cursor:pointer;
   border:none;border-radius:6px;background:linear-gradient(90deg,${PAL.cyanCss},${PAL.orangeCss});}
 #rig-landing .play:hover{filter:brightness(1.12);}
+#rig-landing .watch{display:block;padding:17px 40px;font:inherit;font-size:14px;
+  font-weight:700;letter-spacing:.24em;text-transform:uppercase;color:${PAL.cyanCss};
+  cursor:pointer;border:1px solid ${PAL.cyanCss}88;border-radius:6px;background:transparent;}
+#rig-landing .watch:hover{background:${PAL.cyanCss}1a;border-color:${PAL.cyanCss};}
 #rig-landing .links{text-align:center;margin-top:2.4em;font-size:12px;color:${PAL.dimCss};}
 #rig-landing .links a{color:${PAL.cyanCss};text-decoration:none;margin:0 12px;}
 #rig-landing .foot{text-align:center;margin-top:3em;color:${PAL.dimCss};
@@ -51,6 +56,7 @@ const CARDS: [string, string][] = [
 export class LandingScreen {
   private el: HTMLElement;
   private onPlay: (() => void) | null = null;
+  private onSpectate: (() => void) | null = null;
 
   constructor(root: HTMLElement) {
     if (!document.getElementById('rig-landing-css')) {
@@ -83,7 +89,10 @@ export class LandingScreen {
           <span><b>HOLD</b> charge a throw</span>
           <span><b>SPIN</b> bend the bell</span>
         </div>
-        <button class="play" id="rig-play-btn">PLAY</button>
+        <div class="acts">
+          <button class="play" id="rig-play-btn">PLAY</button>
+          <button class="watch" id="rig-watch-btn">Watch a match</button>
+        </div>
         <p class="links">
           <a href="classic/">Classic (the 2D original)</a> ·
           <a href="https://github.com/emberian/spindle" target="_blank" rel="noopener">Source &amp; the dossier</a>
@@ -97,10 +106,16 @@ export class LandingScreen {
       this.hide();
       cb?.();
     });
+    this.el.querySelector<HTMLButtonElement>('#rig-watch-btn')!.addEventListener('click', () => {
+      const cb = this.onSpectate;
+      this.hide();
+      cb?.();
+    });
   }
 
-  show(onPlay: () => void): void {
+  show(onPlay: () => void, onSpectate?: () => void): void {
     this.onPlay = onPlay;
+    this.onSpectate = onSpectate ?? null;
     this.el.style.display = 'block';
     this.el.scrollTop = 0;
   }
@@ -108,5 +123,6 @@ export class LandingScreen {
   hide(): void {
     this.el.style.display = 'none';
     this.onPlay = null;
+    this.onSpectate = null;
   }
 }

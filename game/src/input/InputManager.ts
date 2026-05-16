@@ -1,14 +1,20 @@
 // InputManager — attaches to a canvas; produces P1's PlayerInput each tick.
 //
-// Design goals (rewrite):
-//   • Forgiving aim: wide snap cone, no pixel-perfect required.
-//   • Works WITHOUT pointer-lock (falls back to free-mouse via cursor NDC).
-//     Pointer-lock is optional — requested on canvas click only when available.
+// Design goals (FEEL pass):
+//   • Forgiving aim: wide sticky snap cone, no pixel-perfect required.
+//   • Works WITHOUT pointer-lock (free-mouse via cursor NDC), and the two
+//     modes feel identical. Pointer-lock is OWNED here (single source of
+//     truth — main.ts no longer requests it). It's acquired on a deliberate
+//     gesture, rejection is swallowed, and free-mouse is a first-class path.
 //   • Ghost arc always visible once bell is held (not just when charging),
-//     biased toward the Faith ring to teach the Coriolis curve.
+//     biased toward the Faith ring to teach the Coriolis curve; length &
+//     fidelity scale with charge so the curve is learnable.
 //   • Throw aim-assist: gentle pull toward the attacking ring.
-//   • Clean charge feel: smooth ramp, orange overflow pulse at max.
+//   • Clean charge feel: ease-out ramp so taps = short passes, holds = bombs.
+//   • Spin self-centres with a detent so neutral is easy to find.
 //   • Reticle states: free / anchor-lock / charging — conveyed via InputView.
+//   • View agency: exposes lookIntent for GameCamera.setLook (orchestrator
+//     wires it) so the player can glance around the chase cam.
 //   • All keys debounced; sensible WASD + scroll defaults.
 //
 // Device bindings:
@@ -34,8 +40,10 @@ export type { ReticleState } from './AimModel';
 
 // ── Config ────────────────────────────────────────────────────────────────────
 
-/** Throw charge: full charge in ~0.75 s. */
-const CHARGE_RATE     = 1.33;
+/** Throw charge: full charge in ~0.7 s of linear time, but the *curve* is
+ *  ease-out (see below) so a quick tap already gives a usable short pass and
+ *  the top end takes deliberate commitment — far more readable than linear. */
+const CHARGE_RATE     = 1.45;
 
 /** Throw speed range (m/s). Min throw is still useful for short passes. */
 const THROW_SPEED_MIN =  5.0;
@@ -44,15 +52,21 @@ const THROW_SPEED_MAX = 30.0;
 /** Scroll wheel → spin sensitivity. */
 const SPIN_SCROLL_K   = 0.004;
 
-/** A/D key ramp per tick (when held). */
-const SPIN_KEY_RATE   = 0.05;
+/** A/D spin ramp (units per second — frame-rate independent now). */
+const SPIN_KEY_RATE   = 2.6;
 
-/** Spin decay per tick when no input. */
-const SPIN_DECAY      = 0.88;
+/** Spin self-centring rate per second when no input (pulls toward 0). */
+const SPIN_RETURN     = 7.0;
 
-/** Ghost arc: sample count and step size (seconds). More steps = longer trail. */
-const GHOST_STEPS = 32;
-const GHOST_H     = 0.045;
+/** Spin detent: snap tiny residual spin to exactly 0 so neutral is findable. */
+const SPIN_DETENT     = 0.04;
+
+/** Ghost arc: sample count and step size (seconds). Length grows with charge
+ *  so a soft toss shows a short near arc and a full bomb shows the whole
+ *  Coriolis sweep — the curve becomes learnable by watching it change. */
+const GHOST_STEPS_MIN = 22;
+const GHOST_STEPS_MAX = 46;
+const GHOST_H         = 0.045;
 
 /** Minimum ghost arc charge level — show arc as soon as bell is held. */
 const GHOST_MIN_CHARGE = 0.0;
@@ -103,8 +117,11 @@ export class InputManager {
   private spars: Vec3[] = [];
 
   // ── Charge state ─────────────────────────────────────────────────────────
-  private _charge   = 0;
-  private charging  = false;
+  // _chargeRaw = linear hold time [0,1]; _charge = ease-out shaped value the
+  // sim/HUD see (so the same dwell maps to a more controllable speed band).
+  private _chargeRaw = 0;
+  private _charge    = 0;
+  private charging   = false;
 
   // ── Computed per-tick ────────────────────────────────────────────────────
   private _reticle:   AnchorResult | null = null;
@@ -143,8 +160,8 @@ export class InputManager {
    * dtSec = seconds elapsed this step.
    */
   get(dtSec: number): PlayerInput {
-    // 1. Integrate pointer-lock mouse movement
-    this.aim.update(this.mouseDX, this.mouseDY);
+    // 1. Integrate pointer-lock mouse movement (dt-aware smoothing).
+    this.aim.update(this.mouseDX, this.mouseDY, dtSec);
     this.mouseDX = 0;
     this.mouseDY = 0;
 
@@ -156,12 +173,16 @@ export class InputManager {
     // 3. Anchor snapping (always, for reticle feedback)
     this._reticle = this.aim.anchorTarget(this.spars, this.camera, this.playerPos);
 
-    // 4. Charge logic: only while LMB held AND holding bell
+    // 4. Charge logic: only while LMB held AND holding bell.
+    //    Linear dwell → ease-out shaped charge: charge = 1-(1-r)^1.7. A
+    //    short tap already yields a controllable medium pass; the top of
+    //    the band needs a deliberate hold, which reads far better.
     let throwReleased = false;
     if (this.lmbDown && this.holdingBell) {
-      this.charging = true;
-      this._charge  = Math.min(1.0, this._charge + CHARGE_RATE * dtSec);
+      this.charging   = true;
+      this._chargeRaw = Math.min(1.0, this._chargeRaw + CHARGE_RATE * dtSec);
     }
+    this._charge = 1 - Math.pow(1 - this._chargeRaw, 1.7);
     if (this.lmbReleased && this.charging) {
       if (this._charge >= THROW_MIN_CHARGE) {
         throwReleased = true;
@@ -170,16 +191,24 @@ export class InputManager {
     }
     // Reset charge when bell leaves hand
     if (!this.holdingBell) {
-      this._charge  = 0;
-      this.charging = false;
+      this._chargeRaw = 0;
+      this._charge    = 0;
+      this.charging   = false;
     }
 
-    // 5. Throw spin from A/D or scroll
+    // 5. Throw spin from A/D or scroll. Frame-rate-independent ramp; when no
+    //    key is held it eases back to 0 (self-centring) and a small detent
+    //    snaps the last sliver to exactly neutral so 0 is easy to hit.
     const keySpinL = this.keys.has('KeyA') || this.keys.has('ArrowLeft');
     const keySpinR = this.keys.has('KeyD') || this.keys.has('ArrowRight');
-    if (keySpinL)              this.scrollSpin = Math.max(-1, this.scrollSpin - SPIN_KEY_RATE);
-    else if (keySpinR)         this.scrollSpin = Math.min( 1, this.scrollSpin + SPIN_KEY_RATE);
-    else                       this.scrollSpin *= SPIN_DECAY;
+    if (keySpinL) {
+      this.scrollSpin = Math.max(-1, this.scrollSpin - SPIN_KEY_RATE * dtSec);
+    } else if (keySpinR) {
+      this.scrollSpin = Math.min(1, this.scrollSpin + SPIN_KEY_RATE * dtSec);
+    } else {
+      this.scrollSpin *= Math.exp(-SPIN_RETURN * dtSec);
+      if (Math.abs(this.scrollSpin) < SPIN_DETENT) this.scrollSpin = 0;
+    }
     const throwSpin = Math.max(-1, Math.min(1, this.scrollSpin));
 
     // 6. Reel
@@ -215,7 +244,12 @@ export class InputManager {
         y: this.playerVel.y + aimDir.y * speed,
         z: this.playerVel.z + aimDir.z * speed,
       };
-      this._ghostArc = predictPath(this.playerPos, v0, REG.omega, GHOST_H, GHOST_STEPS);
+      // Trail length tracks charge so the player *sees* the Coriolis sweep
+      // grow as they wind up — that change is what makes the curve learnable.
+      const steps = Math.round(
+        GHOST_STEPS_MIN + (GHOST_STEPS_MAX - GHOST_STEPS_MIN) * charge,
+      );
+      this._ghostArc = predictPath(this.playerPos, v0, REG.omega, GHOST_H, steps);
     } else {
       this._ghostArc = [];
     }
@@ -266,10 +300,52 @@ export class InputManager {
     };
   }
 
+  // ── Camera view-agency hook ───────────────────────────────────────────────
+
+  /**
+   * Normalised player look intent for GameCamera.setLook(). The orchestrator
+   * should call `cam.setLook(li.yaw, li.pitch, li.active)` each frame with
+   * this (PLAY mode only). Additive to the frozen contract — purely a
+   * read; safe to ignore if unwired (camera just won't have view agency).
+   */
+  get lookIntent(): { yaw: number; pitch: number; active: boolean } {
+    return this.aim.lookIntent();
+  }
+
   // ── Pointer lock ──────────────────────────────────────────────────────────
 
+  /**
+   * Public, idempotent pointer-lock request. Single source of truth — main.ts
+   * must NOT request lock itself (the orchestrator removes that). Rejection
+   * (no user gesture / browser refusal) is swallowed; free-mouse keeps working.
+   */
   requestPointerLock(): void {
-    this.canvas.requestPointerLock?.();
+    this._tryLock();
+  }
+
+  private _lockPending = false;
+
+  private _tryLock(): void {
+    if (this.pointerLocked || this._lockPending) return;
+    const fn = this.canvas.requestPointerLock;
+    if (!fn) return; // unsupported → free-mouse path, no error
+    this._lockPending = true;
+    try {
+      // Some browsers return a promise; swallow rejection silently.
+      const r = fn.call(this.canvas) as unknown as Promise<void> | undefined;
+      if (r && typeof r.then === 'function') {
+        r.then(
+          () => { this._lockPending = false; },
+          () => { this._lockPending = false; },
+        );
+      } else {
+        // No promise API — clear the guard shortly after; pointerlockchange
+        // will confirm success either way.
+        setTimeout(() => { this._lockPending = false; }, 250);
+      }
+    } catch {
+      this._lockPending = false; // refused — stay in free-mouse, no jank
+    }
   }
 
   // ── Dispose ───────────────────────────────────────────────────────────────
@@ -312,8 +388,19 @@ export class InputManager {
       if (e.button === 0) {
         this.lmbDown    = true;
         this.lmbPressed = true;
-        if (!this.pointerLocked) this.canvas.requestPointerLock?.();
+        // A click is a deliberate gesture → acquire lock (idempotent, and
+        // the *sole* requester now that main.ts no longer does it). The
+        // game still fires/charges this same tick — free-mouse aim is used
+        // until lock actually engages, so nothing feels gated on the lock.
+        this._tryLock();
       }
+    });
+
+    // Right-click intentionally releases lock for menu/UI access without
+    // feeling trapped; the cursor reappears and free-mouse takes over.
+    on(this.canvas, 'contextmenu', (e: MouseEvent) => {
+      e.preventDefault();
+      if (this.pointerLocked) document.exitPointerLock?.();
     });
 
     on(this.canvas, 'mouseup', (e: MouseEvent) => {
@@ -348,15 +435,22 @@ export class InputManager {
 
     // ── Pointer-lock state ────────────────────────────────────────────────
     on(document, 'pointerlockchange', () => {
+      const wasLocked = this.pointerLocked;
       this.pointerLocked = document.pointerLockElement === this.canvas;
-      if (!this.pointerLocked) {
-        // Exited lock — reset pointer-lock aim; free-mouse takes over on next move
+      this._lockPending = false;
+      this.mouseDX = 0;
+      this.mouseDY = 0;
+      if (!this.pointerLocked && wasLocked) {
+        // Exited lock. DON'T reset aim — that would snap the view. Seed the
+        // free-mouse cursor to screen-centre so the aim direction is
+        // continuous (centre ≈ forward, matching the just-held lock aim).
         this.aim.reset();
-        this.aim.clearFreeMouse();
-        this.mouseDX = 0;
-        this.mouseDY = 0;
-      } else {
-        // Entered lock — suppress free-mouse
+        this.aim.setFreeMouse(0, 0);
+      } else if (this.pointerLocked && !wasLocked) {
+        // Entered lock — drop free-mouse, start the yaw/pitch accumulator
+        // at neutral. Centre-screen free-mouse ≈ forward, and neutral
+        // pointer-lock ≈ forward too, so the handoff is visually seamless.
+        this.aim.reset();
         this.aim.clearFreeMouse();
       }
     });

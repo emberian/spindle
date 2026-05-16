@@ -62,6 +62,66 @@ export interface GrapplePlan {
 }
 
 /**
+ * Defender-aware swing simulation: like simulateGrappleSwing but also returns
+ * the closest the swung path comes to any opponent (so the planner can avoid
+ * stranding the player on top of a defender or swinging through coverage).
+ */
+function simulateGrappleSwingDef(
+  pos: Vec3,
+  vel: Vec3,
+  anchorPos: Vec3,
+  omega: number,
+  reel: -1 | 0,
+  target: Vec3,
+  steps: number,
+  h: number,
+  opponents: { x: number; y: number; z: number }[],
+): { closestDist: number; minOppDist: number } {
+  let p = { ...pos };
+  let v = { ...vel };
+  let restLen = vlen(vsub(p, anchorPos));
+  let closestDist = vlen(vsub(p, target));
+  let minOppDist = Infinity;
+
+  for (let i = 0; i < steps; i++) {
+    const s: PointState = rk4Step({ p, v }, omega, h);
+    p = s.p;
+    v = s.v;
+
+    const d = vsub(p, anchorPos);
+    const len = vlen(d);
+    if (len > 1e-6) {
+      const n = vscale(d, 1 / len);
+      const vRad = vdot(v, n);
+      if (len >= restLen && vRad > 0) v = vsub(v, vscale(n, vRad));
+      if (reel === -1 && len >= TETHER_MIN) {
+        const target_len = Math.max(TETHER_MIN, restLen - REEL_RATE * h);
+        if (target_len < restLen) {
+          const vRadCurrent = vdot(v, n);
+          const scale = restLen > 1e-6 ? restLen / target_len : 1;
+          const vTan = vsub(v, vscale(n, vRadCurrent));
+          v = vadd(vscale(vTan, scale), vscale(n, vRadCurrent));
+          restLen = target_len;
+        }
+      }
+    }
+
+    const dist = vlen(vsub(p, target));
+    if (dist < closestDist) closestDist = dist;
+
+    // Sample opponent proximity every few steps (cheap).
+    if ((i & 3) === 0) {
+      for (const o of opponents) {
+        const od = vlen(vsub(p, o));
+        if (od < minOppDist) minOppDist = od;
+      }
+    }
+  }
+
+  return { closestDist, minOppDist };
+}
+
+/**
  * Simulate one player grapple cycle: fire line at anchor, reel in, return
  * the closest distance to `target` achieved over `steps` ticks.
  */
@@ -126,6 +186,7 @@ export function planGrapple(
   player: PlayerSim,
   target: Vec3,
   state: SimState,
+  avoidDefenders = true,
 ): GrapplePlan | null {
   const pos = player.p;
   const vel = player.v;
@@ -135,7 +196,36 @@ export function planGrapple(
   const directDist = vlen(vsub(pos, target));
   if (directDist < 3.0) return null;
 
-  const candidates: GrapplePlan[] = [];
+  // Opponent positions for defender-aware path scoring. We avoid swings whose
+  // path strands us inside DEFENDER_DANGER of an opponent.
+  const opponents: Vec3[] = avoidDefenders
+    ? state.players.filter(p => p.team !== player.team).map(p => p.p)
+    : [];
+  const DEFENDER_DANGER = 6; // m — within this is "swung into coverage"
+
+  // Cost wrapper: projected distance to target + penalty for grazing a
+  // defender. Keeps the planner from sailing the player into a mark.
+  const scorePlan = (
+    anchor: Vec3,
+    reel: -1 | 0,
+  ): { projectedDist: number; cost: number } => {
+    if (opponents.length === 0) {
+      const d = simulateGrappleSwing(
+        pos, vel, anchor, omega, reel, target, PLAN_STEPS, PLAN_H,
+      );
+      return { projectedDist: d, cost: d };
+    }
+    const r = simulateGrappleSwingDef(
+      pos, vel, anchor, omega, reel, target, PLAN_STEPS, PLAN_H, opponents,
+    );
+    const danger =
+      r.minOppDist < DEFENDER_DANGER
+        ? (DEFENDER_DANGER - r.minOppDist) * 3.5
+        : 0;
+    return { projectedDist: r.closestDist, cost: r.closestDist + danger };
+  };
+
+  const candidates: (GrapplePlan & { cost: number })[] = [];
 
   // ── Candidate 1: Spar anchors ──────────────────────────────────────────────
   for (const spar of SPARS) {
@@ -148,8 +238,8 @@ export function planGrapple(
     const toTarget = vnorm(vsub(target, pos));
     if (vdot(toSpar, toTarget) < -0.7) continue;
 
-    const projDist = simulateGrappleSwing(pos, vel, spar, omega, -1, target, PLAN_STEPS, PLAN_H);
-    candidates.push({ anchorPos: spar, reel: -1, projectedDist: projDist, isSpar: true });
+    const sc = scorePlan(spar, -1);
+    candidates.push({ anchorPos: spar, reel: -1, projectedDist: sc.projectedDist, isSpar: true, cost: sc.cost });
   }
 
   // ── Candidate 2: Skin anchor ───────────────────────────────────────────────
@@ -167,8 +257,8 @@ export function planGrapple(
       y: (pos.y / yzLen) * REG.R,
       z: (pos.z / yzLen) * REG.R,
     };
-    const projDist = simulateGrappleSwing(pos, vel, skinPoint, omega, 0, target, PLAN_STEPS, PLAN_H);
-    candidates.push({ anchorPos: skinPoint, reel: 0, projectedDist: projDist, isSpar: false });
+    const sc = scorePlan(skinPoint, 0);
+    candidates.push({ anchorPos: skinPoint, reel: 0, projectedDist: sc.projectedDist, isSpar: false, cost: sc.cost });
   }
 
   // ── Candidate 3: Teammate anchors ─────────────────────────────────────────
@@ -182,8 +272,8 @@ export function planGrapple(
     const toTarget = vnorm(vsub(target, pos));
     if (vdot(toTm, toTarget) < -0.5) continue;
 
-    const projDist = simulateGrappleSwing(pos, vel, p.p, omega, -1, target, PLAN_STEPS, PLAN_H);
-    candidates.push({ anchorPos: p.p, reel: -1, projectedDist: projDist, isSpar: false });
+    const sc = scorePlan(p.p, -1);
+    candidates.push({ anchorPos: p.p, reel: -1, projectedDist: sc.projectedDist, isSpar: false, cost: sc.cost });
   }
 
   if (candidates.length === 0) {
@@ -197,9 +287,21 @@ export function planGrapple(
     return { anchorPos: nearestSpar, reel: -1, projectedDist: directDist, isSpar: true };
   }
 
-  // Pick candidate with smallest projected distance to target.
-  candidates.sort((a, b) => a.projectedDist - b.projectedDist);
-  return candidates[0];
+  // Pick the candidate with the smallest *cost* (projected distance plus a
+  // penalty for swinging through / stranding near a defender). Tie-break on
+  // raw projected distance, then anchor x for full determinism.
+  candidates.sort((a, b) => {
+    if (a.cost !== b.cost) return a.cost - b.cost;
+    if (a.projectedDist !== b.projectedDist) return a.projectedDist - b.projectedDist;
+    return a.anchorPos.x - b.anchorPos.x;
+  });
+  const best = candidates[0];
+  return {
+    anchorPos: best.anchorPos,
+    reel: best.reel,
+    projectedDist: best.projectedDist,
+    isSpar: best.isSpar,
+  };
 }
 
 /**

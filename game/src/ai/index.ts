@@ -11,7 +11,11 @@ import type { SimState, MatchState, InputFrame, PlayerInput } from '../sim/types
 import type { TeamProfile } from '../league/teams';
 import { runDirector, DIRECTOR_TICK_INTERVAL } from './Director';
 import type { DirectorState } from './Director';
-import { computePlayerInput, type Difficulty } from './RiggerAI';
+import {
+  computePlayerInput,
+  type Difficulty,
+  type PlayerCommitCache,
+} from './RiggerAI';
 
 // ── Seeded RNG (sfc32 — same algorithm as sim/rng.ts, inlined to avoid state) ──
 
@@ -69,6 +73,15 @@ interface DirectorCache {
 
 export class AiSystem {
   private directorCaches = new Map<string, DirectorCache>();
+  /**
+   * Per-player decision-commitment cache. This is the heart of visible
+   * competence: instead of re-rolling intent every 240 Hz tick (which made
+   * players spastic), each player's discrete decisions (which target, throw
+   * yes/no, posture) are committed and only re-evaluated at the Director
+   * cadence (or when a hard trigger fires — see RiggerAI). Between refreshes
+   * the player smoothly *executes* the committed plan.
+   */
+  private commitCache = new Map<string, PlayerCommitCache>();
 
   /**
    * Produce an InputFrame for all AI-controlled players for this tick.
@@ -84,6 +97,10 @@ export class AiSystem {
     const tick = simState.tick;
     const inputs: PlayerInput[] = [];
 
+    // 'P1' is the human-controlled player ONLY when such a player exists in
+    // the roster. In a fully-AI (spectate) match there is no P1 and EVERY
+    // player must be AI-driven — so we filter by id !== 'P1' which naturally
+    // includes all players when P1 is absent.
     for (let ci = 0; ci < configs.length; ci++) {
       const cfg = configs[ci];
       const teamPlayers = simState.players.filter(
@@ -107,11 +124,20 @@ export class AiSystem {
 
       const director = dirCache!.state;
 
+      const directorRefreshed = needsDirectorUpdate;
+
       // Per-player decisions.
       for (let pi = 0; pi < teamPlayers.length; pi++) {
         const player = teamPlayers[pi];
         // Each player gets its own fully independent rng stream: seed × tick × ci × pi.
         const playerRng = makeRng(seed, tick, ci * 100 + pi);
+
+        const commitKey = `${cfg.side}-${ci}-${player.id}`;
+        let commit = this.commitCache.get(commitKey);
+        if (!commit) {
+          commit = { value: null, decidedTick: -1 };
+          this.commitCache.set(commitKey, commit);
+        }
 
         const input = computePlayerInput(
           player,
@@ -121,6 +147,9 @@ export class AiSystem {
           director,
           cfg.difficulty,
           playerRng,
+          commit,
+          directorRefreshed,
+          DIRECTOR_TICK_INTERVAL,
         );
         inputs.push(input);
       }
@@ -129,12 +158,13 @@ export class AiSystem {
     return { tick, players: inputs };
   }
 
-  /** Reset director caches (e.g., on a new inning). */
+  /** Reset director + commitment caches (e.g., on a new inning). */
   reset(): void {
     this.directorCaches.clear();
+    this.commitCache.clear();
   }
 }
 
 // Re-export key types for convenience.
-export type { Difficulty } from './RiggerAI';
-export type { DirectorState } from './Director';
+export type { Difficulty, PlayerCommit, PlayerCommitCache } from './RiggerAI';
+export type { DirectorState, PlayerAssignment } from './Director';

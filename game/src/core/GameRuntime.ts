@@ -20,6 +20,11 @@ export class GameRuntime {
     this.rAF = requestAnimationFrame((t) => this.loop(t));
   }
 
+  /** Slow-mo / fast-forward without touching the sim's fixed step. */
+  setTimeScale(s: number): void {
+    this.timeScale = s > 0 ? s : 1;
+  }
+
   stop(): void {
     this.running = false;
     if (this.rAF !== null) cancelAnimationFrame(this.rAF);

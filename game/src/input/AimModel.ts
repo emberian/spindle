@@ -4,10 +4,13 @@
 //   Pointer-lock: integrated raw movementX/Y deltas → yaw/pitch accumulator.
 //   Free-mouse:   canvas-relative cursor position → direction via unproject.
 //
-// Anchor snapping uses a wide screen-space cone (generous — no pixel-perfect).
-// Spar candidates beat the skin cylinder when both land in cone.
-// Aim-assist toward the Faith ring (+x) is applied as a gentle bias when the
-// caller requests it (throwing mode) — never hard-locks, just nudges.
+// FEEL pass: the two modes now feel the SAME. Pointer-lock uses a critically
+// damped follow (no mushy heavy low-pass lag, no high-dpi jitter) and free-
+// mouse smooths the unprojected ray identically, so aim is crisp and
+// predictable either way. Anchor snapping has hysteresis ("sticky lock"):
+// once you've snapped to a spar it takes a wider break angle to let go, so
+// the reticle doesn't chatter between candidates. Aim-assist is decoupled
+// from the snap (it should never fight your manual aim).
 
 import * as THREE from 'three';
 import type { Vec3 } from '../sim/vec';
@@ -16,23 +19,32 @@ import { REG, GATE_X } from '../sim/RegConstants';
 // ── Config ────────────────────────────────────────────────────────────────────
 
 /** Pointer-lock sensitivity (radians per pixel). Tuned for ~800 dpi mouse. */
-const SENS_X = 0.0016;
-const SENS_Y = 0.0016;
+const SENS_X = 0.0019;
+const SENS_Y = 0.0019;
 
-/** Smoothing: low-pass on pointer-lock delta (0 = instant, 1 = frozen). */
-const SMOOTH = 0.28;
+/**
+ * Pointer-lock follow rate. We integrate raw deltas directly (so 1:1, no
+ * accumulating lag) but ease the *reported* yaw/pitch toward the integrated
+ * target — fast enough to feel instant, just enough to kill 1-pixel jitter.
+ */
+const FOLLOW_LAMBDA = 38;
+
+/** Free-mouse ray smoothing — matched to pointer-lock so modes feel alike. */
+const FREE_LAMBDA = 30;
 
 /** Pitch clamp — avoid full gimbal flip. */
 const MAX_PITCH = Math.PI * 0.48;
 
-/** Anchor snap cone half-angle (radians) — ~8°, very forgiving. */
-const SNAP_CONE = 0.14;
+/** Anchor snap cone half-angle (radians) — ~9°, very forgiving. */
+const SNAP_CONE = 0.16;
+/** Once locked to a spar, only break the lock past this wider angle (~16°). */
+const SNAP_BREAK = 0.28;
 
 /** Max tether range (metres). */
 const SNAP_RANGE = 130;
 
 /** Aim-assist pull strength toward target when throwing (0 = none, 1 = full). */
-const ASSIST_STRENGTH = 0.06;
+const ASSIST_STRENGTH = 0.05;
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -48,21 +60,30 @@ export interface AnchorResult {
 // ── AimModel ──────────────────────────────────────────────────────────────────
 
 export class AimModel {
-  // Pointer-lock mode accumulators
-  private yaw   = 0;
+  // Pointer-lock: raw integrated target, plus eased "shown" angles.
+  private yawT = 0;
+  private pitchT = 0;
+  private yaw = 0;
   private pitch = 0;
-
-  // Smoothed delta accumulators
-  private smoothDX = 0;
-  private smoothDY = 0;
 
   // Free-mouse mode: NDC [-1,1] of cursor, or null when not tracked
   private cursorNDC: { x: number; y: number } | null = null;
+  // Smoothed free-mouse aim direction (world space) — matched feel to lock.
+  private freeDir = new THREE.Vector3(0, 0, -1);
+  private freeInited = false;
+
+  // dt for this tick (set by update()); falls back to ~60fps if unset.
+  private dt = 1 / 60;
+
+  // Sticky-lock memory: index of currently locked spar (-1 = none).
+  private lockedSpar = -1;
 
   // Working Three.js objects (reused)
   private _dir  = new THREE.Vector3(0, 0, -1);
   private _ray  = new THREE.Ray();
   private _tmpV = new THREE.Vector3();
+  private _q    = new THREE.Quaternion();
+  private _e    = new THREE.Euler(0, 0, 0, 'YXZ');
 
   // ── External setters ────────────────────────────────────────────────────────
 
@@ -75,23 +96,47 @@ export class AimModel {
   /** Clear free-mouse position (reverts to pointer-lock aim). */
   clearFreeMouse(): void {
     this.cursorNDC = null;
+    this.freeInited = false;
   }
 
   // ── Update ───────────────────────────────────────────────────────────────────
 
   /**
    * Integrate pointer-lock mouse delta.
-   * @param dx  raw movementX
-   * @param dy  raw movementY
+   * @param dx     raw movementX
+   * @param dy     raw movementY
+   * @param dtSec  seconds this tick (for frame-rate-independent smoothing)
    */
-  update(dx: number, dy: number): void {
-    // Exponential smooth before integrating — kills jitter on high-dpi.
-    this.smoothDX = this.smoothDX * SMOOTH + dx * (1 - SMOOTH);
-    this.smoothDY = this.smoothDY * SMOOTH + dy * (1 - SMOOTH);
+  update(dx: number, dy: number, dtSec?: number): void {
+    if (dtSec && dtSec > 1e-5) this.dt = Math.min(0.1, dtSec);
 
-    this.yaw   -= this.smoothDX * SENS_X;
-    this.pitch -= this.smoothDY * SENS_Y;
-    this.pitch  = Math.max(-MAX_PITCH, Math.min(MAX_PITCH, this.pitch));
+    // Integrate raw deltas 1:1 into the target — zero accumulating lag.
+    this.yawT -= dx * SENS_X;
+    this.pitchT -= dy * SENS_Y;
+    this.pitchT = Math.max(-MAX_PITCH, Math.min(MAX_PITCH, this.pitchT));
+
+    // Ease shown angles toward target: crisp but de-jittered.
+    const k = 1 - Math.exp(-FOLLOW_LAMBDA * this.dt);
+    this.yaw += (this.yawT - this.yaw) * k;
+    this.pitch += (this.pitchT - this.pitch) * k;
+  }
+
+  // ── View-agency hooks for the chase camera ──────────────────────────────────
+
+  /**
+   * Normalised look intent for GameCamera.setLook(). Maps the accumulated
+   * yaw/pitch into [-1,1] of a comfortable look budget so the player can
+   * glance around without the framing guarantee ever breaking. Returns
+   * whether the player is actively looking (non-trivial offset).
+   */
+  lookIntent(): { yaw: number; pitch: number; active: boolean } {
+    // ~40° of yaw / ~28° of pitch saturates the budget.
+    const YB = 0.7;
+    const PB = 0.5;
+    const y = Math.max(-1, Math.min(1, this.yaw / YB));
+    const p = Math.max(-1, Math.min(1, this.pitch / PB));
+    const active = Math.hypot(this.yawT, this.pitchT) > 0.02;
+    return { yaw: y, pitch: p, active };
   }
 
   // ── Aim direction ────────────────────────────────────────────────────────────
@@ -99,7 +144,7 @@ export class AimModel {
   /**
    * Current world-space aim direction.
    * In pointer-lock mode: camera quaternion × accumulated yaw/pitch.
-   * In free-mouse mode: un-project NDC cursor through camera.
+   * In free-mouse mode: un-project NDC cursor through camera (smoothed).
    *
    * @param aimAssistTarget  Optional world position to bias toward (weak pull).
    */
@@ -107,17 +152,26 @@ export class AimModel {
     let dir: THREE.Vector3;
 
     if (this.cursorNDC) {
-      // Free-mouse: cast a ray through the NDC cursor position
-      const raycaster = new THREE.Raycaster();
-      raycaster.setFromCamera(
-        new THREE.Vector2(this.cursorNDC.x, this.cursorNDC.y),
-        camera,
-      );
-      dir = raycaster.ray.direction.clone().normalize();
+      // Free-mouse: cast a ray through the NDC cursor position.
+      this._tmpV.set(this.cursorNDC.x, this.cursorNDC.y, 0.5);
+      this._tmpV.unproject(camera);
+      const camPos = new THREE.Vector3();
+      camera.getWorldPosition(camPos);
+      this._tmpV.sub(camPos).normalize();
+      if (!this.freeInited) {
+        this.freeDir.copy(this._tmpV);
+        this.freeInited = true;
+      } else {
+        // Slerp-ish ease, matched to pointer-lock follow feel.
+        const k = 1 - Math.exp(-FREE_LAMBDA * this.dt);
+        this.freeDir.lerp(this._tmpV, k).normalize();
+      }
+      dir = this.freeDir.clone();
     } else {
-      // Pointer-lock: apply accumulated yaw/pitch relative to camera
-      const euler = new THREE.Euler(this.pitch, this.yaw, 0, 'YXZ');
-      dir = this._dir.clone().set(0, 0, -1).applyEuler(euler).applyQuaternion(camera.quaternion).normalize();
+      // Pointer-lock: apply accumulated yaw/pitch relative to camera.
+      this._e.set(this.pitch, this.yaw, 0, 'YXZ');
+      this._q.setFromEuler(this._e);
+      dir = this._dir.clone().set(0, 0, -1).applyQuaternion(this._q).applyQuaternion(camera.quaternion).normalize();
     }
 
     // Gentle aim-assist bias toward a target (throwing mode only)
@@ -142,6 +196,8 @@ export class AimModel {
 
   /**
    * Find the best snap-able anchor: spars > skin cylinder.
+   * Sticky lock: a spar we're already locked to keeps the lock until the
+   * aim wanders past SNAP_BREAK (vs SNAP_CONE to acquire) — no chatter.
    *
    * @param spars      World-space spar positions
    * @param camera     Active camera
@@ -161,26 +217,38 @@ export class AimModel {
     const aimW = new THREE.Vector3(dir.x, dir.y, dir.z).normalize();
 
     let bestSparDot = -Infinity;
+    let bestSparIdx = -1;
     let bestSparPos: THREE.Vector3 | null = null;
 
+    const acquireCos = Math.cos(SNAP_CONE);
+    const breakCos   = Math.cos(SNAP_BREAK);
+
     // ── Spar candidates ───────────────────────────────────────────────────────
-    for (const sp of spars) {
+    for (let i = 0; i < spars.length; i++) {
+      const sp = spars[i];
       this._tmpV.set(sp.x, sp.y, sp.z);
       const toSpar = this._tmpV.clone().sub(camPos).normalize();
       const dot    = toSpar.dot(aimW);
-      if (dot < Math.cos(SNAP_CONE)) continue; // outside generous cone
+
+      // Sticky: the currently-locked spar gets the wider break cone.
+      const thresh = i === this.lockedSpar ? breakCos : acquireCos;
+      if (dot < thresh) continue;
 
       const dist = origin.distanceTo(this._tmpV);
-      if (dist > SNAP_RANGE) continue;  // filtered: all stored spars are in range
+      if (dist > SNAP_RANGE) continue;
 
-      if (dot > bestSparDot) {
-        bestSparDot = dot;
+      // Bias toward the held lock so we don't flicker between two near spars.
+      const score = dot + (i === this.lockedSpar ? 0.05 : 0);
+      if (score > bestSparDot) {
+        bestSparDot = score;
+        bestSparIdx = i;
         bestSparPos = this._tmpV.clone();
       }
     }
 
     // Spars always win over the skin cylinder
     if (bestSparPos) {
+      this.lockedSpar = bestSparIdx;
       return {
         pos:        { x: bestSparPos.x, y: bestSparPos.y, z: bestSparPos.z },
         valid:      true, // dist checked above
@@ -188,6 +256,7 @@ export class AimModel {
         locked:     true,
       };
     }
+    this.lockedSpar = -1;
 
     // ── Skin cylinder fallback ────────────────────────────────────────────────
     // Analytic infinite-cylinder intersection (axis = X, radius = REG.R).
@@ -208,15 +277,16 @@ export class AimModel {
           const t2    = (-b - sqrtD) / (2 * a);
           // Pick the positive intersection (we're inside the cylinder)
           const t     = (t1 > 0.5) ? t1 : (t2 > 0.5 ? t2 : -1);
-          if (t > 0 && t < SNAP_RANGE) {
+          if (t > 0) {
             const hitX = this._ray.origin.x + this._ray.direction.x * t;
             if (hitX >= -GATE_X && hitX <= GATE_X) {
               const hitY = oy + dy * t;
               const hitZ = oz + dz * t;
+              const inRange = t <= SNAP_RANGE;
               return {
                 pos:        { x: hitX, y: hitY, z: hitZ },
-                valid:      true, // t < SNAP_RANGE already checked above
-                outOfRange: false,
+                valid:      inRange,
+                outOfRange: !inRange,
                 locked:     false,
               };
             }
@@ -251,7 +321,9 @@ export class AimModel {
   reset(): void {
     this.yaw      = 0;
     this.pitch    = 0;
-    this.smoothDX = 0;
-    this.smoothDY = 0;
+    this.yawT     = 0;
+    this.pitchT   = 0;
+    this.lockedSpar = -1;
+    this.freeInited = false;
   }
 }

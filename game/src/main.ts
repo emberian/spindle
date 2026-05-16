@@ -17,12 +17,14 @@ import { Onboarding } from './ui/Onboarding';
 import { LandingScreen } from './ui/LandingScreen';
 import { TitleScreen } from './ui/TitleScreen';
 import { BracketScreen } from './ui/BracketScreen';
+import { SpectateScreen } from './ui/SpectateScreen';
+import { SpectateControls } from './ui/SpectateControls';
 import { InputManager } from './input/InputManager';
 import { AiSystem, type TeamConfig } from './ai/index';
 import { MatchStateMachine } from './match/MatchStateMachine';
 import { createWasmSim, type WasmSim } from './sim/wasm';
 import { REG, GATE_X } from './sim/RegConstants';
-import { styleToProfile, type Franchise } from './league/teams';
+import { styleToProfile, TEAMS, type Franchise } from './league/teams';
 import { Bracket } from './league/Bracket';
 import type { MatchResult, BoxScore } from './league/SimMatch';
 import * as Persist from './league/Persistence';
@@ -51,6 +53,8 @@ const onboarding = new Onboarding(app);
 const landing = new LandingScreen(app);
 const title = new TitleScreen(app);
 const bracketUI = new BracketScreen(app);
+const spectate = new SpectateScreen(app);
+const spectateControls = new SpectateControls(app);
 const input = new InputManager(renderer.domElement, camera);
 const ai = new AiSystem();
 let shownOnboarding = false;
@@ -189,6 +193,8 @@ async function runMatch(
       if (isLoop && !prevLoop) audio.event('loop_building');
       prevLoop = isLoop;
       const p1r = s.players.find((pp) => pp.id === 'P1');
+      const li = input.lookIntent; // gentle player view agency (Feel pass)
+      gcam.setLook(li.yaw, li.pitch, li.active);
       gcam.update(s.bell.p, p1r ? p1r.p : s.bell.p, GATE_X, lg, REG.R, Math.min(dt, 1 / 30));
       hud.render(s as never, match.state as never, input.view);
 
@@ -258,16 +264,186 @@ function enterJump(f: Franchise): void {
   bracketUI.show(bracket.state as never, f.id, proceed);
 }
 
-// Pointer-lock only on a genuine in-canvas click (a valid user gesture);
-// swallow the promise rejection browsers throw when it can't lock.
-renderer.domElement.addEventListener('click', () => {
-  try {
-    const r = (input.requestPointerLock?.() as unknown) as Promise<unknown> | undefined;
-    if (r && typeof r.catch === 'function') r.catch(() => {});
-  } catch {
-    /* pointer lock unavailable — fine, free-mouse aim still works */
-  }
-});
+// Pointer-lock is owned solely by InputManager now (it requests on a
+// deliberate mousedown gesture and swallows refusal); no orchestrator hook.
 
-landing.show(() => title.show(enterJump));
-console.info('RIG v2 P5 — full shell. master seed %s', masterSeed);
+// ── Spectate: watch a fully AI-vs-AI match (no human P1) ─────────────────────
+// Same roster as ROSTER but every rigger is AI-controlled — id 'H1' replaces
+// 'P1' so AiSystem (which skips id==='P1') drives all eight.
+const WATCH_ROSTER: { id: string; team: TeamSide; role: RiggerRole; x: number }[] =
+  ROSTER.map((r) => (r.id === 'P1' ? { ...r, id: 'H1' } : { ...r }));
+
+let watching = false;
+
+async function runWatch(
+  homeFr: Franchise,
+  awayFr: Franchise,
+  gameSeed: number,
+  onEnd: (winner: TeamSide, scoreHome: number, scoreAway: number) => void,
+): Promise<void> {
+  const sim: WasmSim = await createWasmSim(gameSeed);
+  for (const r of WATCH_ROSTER) {
+    const k = WATCH_ROSTER.indexOf(r);
+    const ang = (k / WATCH_ROSTER.length) * Math.PI * 2;
+    sim.addPlayer(r.id, r.team, r.role, { x: r.x, y: Math.cos(ang) * 8, z: Math.sin(ang) * 8 });
+  }
+  sim.setBellHeld('H1');
+  const match = new MatchStateMachine('+x', 'home');
+  match.consume([{ type: 'foul_garrote', by: '__start__' }], sim.snapshot());
+  const cfgs: TeamConfig[] = [
+    { side: 'home', profile: styleToProfile(homeFr.styleTag, homeFr.cylinderClass), difficulty: 'pro' },
+    { side: 'away', profile: styleToProfile(awayFr.styleTag, awayFr.cylinderClass), difficulty: 'pro' },
+  ];
+  trail.clear();
+  gcam.reset();
+  ai.reset();
+  let acc = 0;
+  let ended = false;
+  let prevLoop = false;
+
+  const reArm = (): void => {
+    if (match.state.winner !== null || match.state.phase === 'live') return;
+    const poss = match.state.possession;
+    sim.setBellHeld(WATCH_ROSTER.find((r) => r.team === poss)!.id);
+    match.consume([{ type: 'foul_garrote', by: '__resume__' }], sim.snapshot());
+  };
+
+  runtime?.stop();
+  watching = true;
+  runtime = new GameRuntime(
+    (dt) => {
+      calm.update(dt);
+      acc += dt;
+      let steps = 0;
+      while (acc >= SIM_H && steps < 64 && match.state.winner === null) {
+        const snap = sim.snapshot();
+        const aiFrame = ai.tick(snap, match.state as never, cfgs, gameSeed);
+        const evs = sim.step({ tick: snap.tick, players: aiFrame.players });
+        const upd = match.consume(evs, sim.snapshot() as never);
+        for (const e of evs) {
+          if (e.type === 'bell_caught') audio.event('catch');
+          else if (e.type === 'bell_clatter' || e.type === 'bell_bobble') audio.event('clatter');
+        }
+        if (upd && upd.scored) {
+          const kd = upd.scored.kind;
+          audio.event(
+            kd === 'loop' ? 'score_loop' : kd === 'rise' || kd === 'curl' ? 'score_rise'
+              : kd === 'ground' ? 'score_ground' : 'score_fall',
+          );
+        } else if (upd && upd.turnover) {
+          audio.event('turnover');
+        }
+        reArm();
+        acc -= SIM_H;
+        steps++;
+      }
+      const s = sim.snapshot();
+      const lg = s.loopTier === 'loop' ? 1 : s.loopTier === 'curl' ? 0.4 : 0;
+      const isLoop = s.loopTier === 'loop';
+      bellMesh.position.set(s.bell.p.x, s.bell.p.y, s.bell.p.z);
+      (bellMesh.material as THREE.MeshStandardMaterial).emissiveIntensity = bellGlow(s.bell.chime);
+      trail.push(s.bell.p.x, s.bell.p.y, s.bell.p.z, s.bell.chime);
+      trail.setLoopMode(isLoop);
+      post.setLoopGlow(lg);
+      riggers.sync(s.players, '');
+      riglines.sync(s.players);
+      audio.setBell(s.bell.chime, Math.hypot(s.bell.w.x, s.bell.w.y, s.bell.w.z),
+        Math.max(-1, Math.min(1, s.bell.p.z / REG.R)), s.bell.heldBy === null);
+      audio.setHush(lg);
+      if (isLoop && !prevLoop) audio.event('loop_building');
+      prevLoop = isLoop;
+      const atkX = match.state.possession === 'home' ? GATE_X : -GATE_X;
+      const cinePlayers = s.players.map((pp) => ({ id: pp.id, p: pp.p, team: pp.team }));
+      gcam.cinematic(s.bell.p, cinePlayers, atkX, lg, REG.R, Math.min(dt, 1 / 30));
+      hud.render(s as never, match.state as never, input.view);
+
+      if (!ended && match.state.winner !== null) {
+        ended = true;
+        watching = false;
+        runtime?.stop();
+        onEnd(match.state.winner, match.state.scoreHome, match.state.scoreAway);
+      }
+    },
+    () => post.render(),
+  );
+  runtime.start();
+}
+
+function openSpectate(): void {
+  spectate.show(TEAMS, {
+    onWatch: (h, a) => startWatch(h, a),
+    onWatchBracket: () => startWatchBracket(),
+    onBack: () => landing.show(() => title.show(enterJump), openSpectate),
+  });
+}
+
+function exitWatch(): void {
+  watching = false;
+  runtime?.stop();
+  spectateControls.hide();
+  openSpectate();
+}
+
+function bindWatchControls(): void {
+  spectateControls.show({
+    onSpeed: (m) => {
+      runtime?.setTimeScale(m);
+      spectateControls.setSpeed(m);
+    },
+    onCycleCam: () => gcam.cycleCinematicAngle(),
+    onExit: exitWatch,
+  });
+}
+
+function startWatch(home: Franchise, away: Franchise): void {
+  bindWatchControls();
+  const seed = (Math.random() * 0xffffffff) >>> 0;
+  void runWatch(home, away, seed, () => {
+    if (!watching && spectateControls) {
+      // single-match: surface the result briefly, then back to the menu
+      spectateControls.hide();
+      openSpectate();
+    }
+  });
+}
+
+function startWatchBracket(): void {
+  const wb = new Bracket((Math.random() * 0xffffffff) >>> 0);
+  let aborted = false;
+  spectateControls.show({
+    onSpeed: (m) => {
+      runtime?.setTimeScale(m);
+      spectateControls.setSpeed(m);
+    },
+    onCycleCam: () => gcam.cycleCinematicAngle(),
+    onExit: () => {
+      aborted = true;
+      exitWatch();
+    },
+  });
+  const playNextGame = (): void => {
+    if (aborted) return;
+    const g = wb.nextGame();
+    if (!g || !g.home || !g.away) {
+      runtime?.stop();
+      spectateControls.hide();
+      bracketUI.show(wb.state as never, '', openSpectate);
+      return;
+    }
+    const home = g.home;
+    const away = g.away;
+    void runWatch(home, away, g.gameSeed, (w, sh, sa) => {
+      const result: MatchResult = {
+        home, away, scoreHome: sh, scoreAway: sa, winner: w,
+        box: { home: ZBOX(), away: ZBOX() }, events: [],
+      };
+      wb.playNext(result);
+      // chain into the next game unless the user bailed out
+      if (!aborted) playNextGame();
+    });
+  };
+  playNextGame();
+}
+
+landing.show(() => title.show(enterJump), openSpectate);
+console.info('RIG v2 P7 — full shell + spectate. master seed %s', masterSeed);
