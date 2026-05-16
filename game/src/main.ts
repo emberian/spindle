@@ -1,14 +1,18 @@
-// P1 boot: the real calm + a live bell tracing the Coriolis roulette so the
-// curve/loop is visible in 3D. Render-side demo loop uses the verified sim
-// (stepBell + skinBounce); the deterministic fixed-step SimWorld lands in P2.
+// P2 boot: the deterministic SimWorld driving the calm, the chime-driven
+// money-shot trail, bloom, and the Loop moment — slow-mo + scene-dim + a
+// down-the-spine loop-cam + the crowd hush. A scripted rigger fires a
+// canonical Loop on a cycle so the signature play is always on screen.
 
 import * as THREE from 'three';
 import { GameRuntime } from './core/GameRuntime';
-import { EventBus } from './core/EventBus';
-import { REG, GATE_X } from './sim/RegConstants';
+import { FixedStepDriver, SIM_H } from './core/FixedStepDriver';
 import { Calm } from './render/Calm';
-import { stepBell, chime, type BellBody } from './sim/Bell';
-import { skinBounce } from './sim/Collision';
+import { BellTrail } from './render/BellTrail';
+import { PostFX } from './render/PostFX';
+import { AudioEngine } from './audio/AudioEngine';
+import { SimWorld } from './sim/SimWorld';
+import { REG } from './sim/RegConstants';
+import type { InputFrame } from './sim/types';
 
 const app = document.getElementById('app')!;
 document.getElementById('boot')?.remove();
@@ -16,90 +20,127 @@ document.getElementById('boot')?.remove();
 const renderer = new THREE.WebGLRenderer({ antialias: true });
 renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
 renderer.setClearColor(0x11131a, 1);
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
 app.appendChild(renderer.domElement);
 
 const scene = new THREE.Scene();
 const calm = new Calm(scene);
-const camera = new THREE.PerspectiveCamera(60, 1, 0.1, 4000);
-const events = new EventBus();
+const camera = new THREE.PerspectiveCamera(58, 1, 0.1, 4000);
+const trail = new BellTrail(scene);
+let post = new PostFX(renderer, scene, camera);
+const audio = new AudioEngine();
+addEventListener('pointerdown', () => audio.start(), { once: true });
+addEventListener('keydown', () => audio.start(), { once: true });
+
+const bellMesh = new THREE.Mesh(
+  new THREE.SphereGeometry(0.95, 24, 16),
+  new THREE.MeshStandardMaterial({ color: 0xe8e0c8, emissive: 0x1aa6b7, emissiveIntensity: 1 }),
+);
+scene.add(bellMesh);
 
 function resize(): void {
   renderer.setSize(innerWidth, innerHeight);
   camera.aspect = innerWidth / innerHeight;
   camera.updateProjectionMatrix();
-  events.emit('resize', { width: innerWidth, height: innerHeight });
+  post.setSize(innerWidth, innerHeight);
 }
 addEventListener('resize', resize);
 resize();
 
-// The bell.
-const bellMesh = new THREE.Mesh(
-  new THREE.SphereGeometry(0.9, 24, 16),
-  new THREE.MeshStandardMaterial({ color: 0xe8e0c8, emissive: 0x1aa6b7, emissiveIntensity: 1 }),
-);
-scene.add(bellMesh);
-
-// P1 trail: a coloured polyline (the gorgeous ribbon is P2's money shot).
-const TRAIL = 600;
-const trailPos = new Float32Array(TRAIL * 3);
-const trailGeo = new THREE.BufferGeometry();
-trailGeo.setAttribute('position', new THREE.BufferAttribute(trailPos, 3));
-const trail = new THREE.Line(
-  trailGeo,
-  new THREE.LineBasicMaterial({ color: 0x1aa6b7, transparent: true, opacity: 0.85 }),
-);
-trail.frustumCulled = false;
-scene.add(trail);
-
-function freshBell(): BellBody {
-  // Launch near the axis, up-and-antispinward → a long Coriolis roulette.
+// ── Scripted demo: P1 holds, fires a canonical Loop, recycle ──────────────
+const REL = { x: -50, y: 2, z: 0 };
+function makeWorld(): SimWorld {
+  const w = new SimWorld(1);
+  w.addPlayer('P1', 'home', 'spinner', { ...REL });
+  w.addPlayer('A1', 'away', 'reach', { x: 305, y: 0, z: 0 });
+  w.bellHeldBy = 'P1';
+  return w;
+}
+let world = makeWorld();
+let simTick = 0;
+const THROW_TICK = 60; // ~0.25 s after spawn
+function frameFor(tick: number): InputFrame {
   return {
-    p: { x: -GATE_X * 0.55, y: 3, z: 0 },
-    v: { x: 14, y: 7.5, z: -9 },
-    q: { x: 0, y: 0, z: 0, w: 1 },
-    w: { x: 26, y: 0, z: 0 },
+    tick,
+    players: [
+      {
+        id: 'P1',
+        aim: { x: 0.30, y: 0.62, z: -0.72 }, // up-and-antispinward Coriolis sweep
+        fireLineAt: null,
+        reel: 0,
+        release: false,
+        pushoff: false,
+        throwCharge: 0.55,
+        throwReleased: tick === THROW_TICK,
+        throwSpin: 0,
+        thrumbler: { x: 0, y: 0, z: 0 },
+      },
+    ],
   };
 }
-let bell = freshBell();
-let trailN = 0;
-function pushTrail(): void {
-  const i = (trailN % TRAIL) * 3;
-  trailPos[i] = bell.p.x;
-  trailPos[i + 1] = bell.p.y;
-  trailPos[i + 2] = bell.p.z;
-  trailN++;
-  trailGeo.setDrawRange(0, Math.min(trailN, TRAIL));
-  trailGeo.attributes.position.needsUpdate = true;
-}
 
-const H = 1 / 240;
-let acc = 0;
-let life = 0;
+const driver = new FixedStepDriver(
+  () => {
+    world.step(frameFor(simTick), SIM_H);
+    simTick++;
+  },
+  () => world.snapshot(),
+);
 
+let loopGlow = 0;
+let scoreFlash = 0;
 const runtime = new GameRuntime(
   (dt) => {
     calm.update(dt);
-    acc += dt;
-    life += dt;
-    while (acc >= H) {
-      bell = stepBell(bell, REG.omega, H);
-      skinBounce(bell);
-      acc -= H;
+    driver.advance(dt);
+
+    const a = driver.alpha;
+    const b0 = driver.prev.bell;
+    const b1 = driver.cur.bell;
+    const bx = b0.p.x + (b1.p.x - b0.p.x) * a;
+    const by = b0.p.y + (b1.p.y - b0.p.y) * a;
+    const bz = b0.p.z + (b1.p.z - b0.p.z) * a;
+    const ch = b1.chime;
+    bellMesh.position.set(bx, by, bz);
+    (bellMesh.material as THREE.MeshStandardMaterial).emissiveIntensity = 0.3 + ch * 1.6;
+    trail.push(bx, by, bz, ch);
+
+    // Loop state → glow / slow-mo / hush / cam.
+    const li = world.loopInfo();
+    const looping = li.free && li.untouched && li.turn > 0.6;
+    const target = looping ? Math.min(1, (li.turn - 0.6) / (Math.PI * 0.9)) : 0;
+    loopGlow += (target - loopGlow) * Math.min(1, dt * 6);
+    trail.setLoopMode(loopGlow > 0.15);
+    post.setLoopGlow(loopGlow);
+    runtime.timeScale = 1 - 0.28 * loopGlow; // gentle slow-mo (don't stall the arc)
+    audio.setHush(Math.max(loopGlow, 0));
+    const sp = Math.hypot(b1.w.x, b1.w.y, b1.w.z);
+    audio.setBell(ch, sp, Math.max(-1, Math.min(1, bz / REG.R)), li.free);
+
+    if (scoreFlash > 0) scoreFlash = Math.max(0, scoreFlash - dt);
+
+    // Camera: normally a broadside down the calm; during a Loop, swing to a
+    // down-the-spine shot so the closed Coriolis arc reads as a loop.
+    // Side-on chase: track the bell from inside the calm so the Coriolis
+    // curve fills the frame (loopGlow adds a touch of push-in).
+    camera.position.set(bx - 34, by * 0.35 + 26, 72 - loopGlow * 14);
+    camera.lookAt(bx + 8, by * 0.45, 0);
+    camera.fov = 56 + loopGlow * 8;
+    camera.updateProjectionMatrix();
+
+    // Recycle: bell left the field or long flight done.
+    if (Math.abs(b1.p.x) > REG.L / 2 + 5 || simTick > 240 * 17) {
+      if (Math.abs(b1.p.x) > REG.L / 2) {
+        audio.erupt(0.8);
+        scoreFlash = 1;
+      }
+      world = makeWorld();
+      simTick = 0;
+      trail.clear();
+      loopGlow = 0;
     }
-    pushTrail();
-    if (Math.abs(bell.p.x) > GATE_X || life > 26) {
-      bell = freshBell();
-      trailN = 0;
-      life = 0;
-    }
-    // Broadcast-ish view: off to the side, down the spine, framing the arc.
-    bellMesh.position.set(bell.p.x, bell.p.y, bell.p.z);
-    const ch = chime(bell.w);
-    (bellMesh.material as THREE.MeshStandardMaterial).emissiveIntensity = 0.3 + ch * 1.4;
-    camera.position.set(REG.R * 1.15, REG.R * 0.35, bell.p.x * 0.4 + REG.L * 0.42);
-    camera.lookAt(bell.p.x * 0.5, 0, 0);
   },
-  () => renderer.render(scene, camera),
+  () => post.render(),
 );
 runtime.start();
-console.info('RIG v2 P1 — the calm + live Coriolis bell. ω=%s', REG.omega);
+console.info('RIG v2 P2 — deterministic sim + money-shot Loop. ω=%s', REG.omega);

@@ -135,9 +135,18 @@ export class SimWorld {
       }
       this.loop.update(this.bell.v);
 
-      // Catch / contest by proximity.
+      // Catch / contest by proximity. A just-released bell ignores ALL
+      // contact briefly, and ignores its thrower until it has clearly
+      // separated — you cannot bobble your own throw.
+      const sinceRelease = this.tick - this.releaseTick;
       for (const w of this.players) {
         if (w.body.grounded) continue;
+        if (sinceRelease < 8) continue;
+        if (
+          w.id === this.bellThrownBy &&
+          vlen(vsub(this.bell.p, w.body.p)) < 4
+        )
+          continue;
         const r = tryCatch(this.bell.p, this.bell.v, w.body.p, w.body.v);
         if (r === 'caught') {
           this.bellHeldBy = w.id;
@@ -171,6 +180,15 @@ export class SimWorld {
 
     this.tick++;
     return this.events;
+  }
+
+  /** Live loop status for the loop-cam / audio hush (render-only read). */
+  loopInfo(): { free: boolean; untouched: boolean; turn: number } {
+    return {
+      free: this.bellHeldBy === null,
+      untouched: this.loop.untouched,
+      turn: this.loop.turn,
+    };
   }
 
   private teamOf(id: string): 'home' | 'away' | null {
