@@ -21,6 +21,9 @@ mod grapple;
 mod loop_detector;
 mod player;
 mod analysis;
+// Increment 3 (swarm): the deterministic world + the wasm-bindgen facade.
+mod sim_world;
+mod wasm;
 
 use wasm_bindgen::prelude::*;
 
