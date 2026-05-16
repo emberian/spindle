@@ -1,14 +1,17 @@
-// P0 boot: prove the full pipeline (Vite + TS + three.js + the loop) with a
-// minimal but genuinely-3D placeholder of the calm. P1 replaces this with the
-// real Scene/Calm. Sim modules are intentionally NOT imported by render yet.
+// P1 boot: the real calm + a live bell tracing the Coriolis roulette so the
+// curve/loop is visible in 3D. Render-side demo loop uses the verified sim
+// (stepBell + skinBounce); the deterministic fixed-step SimWorld lands in P2.
 
 import * as THREE from 'three';
 import { GameRuntime } from './core/GameRuntime';
 import { EventBus } from './core/EventBus';
-import { REG } from './sim/RegConstants';
+import { REG, GATE_X } from './sim/RegConstants';
+import { Calm } from './render/Calm';
+import { stepBell, chime, type BellBody } from './sim/Bell';
+import { skinBounce } from './sim/Collision';
 
 const app = document.getElementById('app')!;
-const boot = document.getElementById('boot');
+document.getElementById('boot')?.remove();
 
 const renderer = new THREE.WebGLRenderer({ antialias: true });
 renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
@@ -16,59 +19,87 @@ renderer.setClearColor(0x11131a, 1);
 app.appendChild(renderer.domElement);
 
 const scene = new THREE.Scene();
-scene.fog = new THREE.Fog(0x11131a, REG.L * 0.4, REG.L * 1.2);
-
-const camera = new THREE.PerspectiveCamera(62, 1, 0.1, 4000);
-camera.position.set(REG.R * 0.9, REG.R * 0.5, REG.L * 0.55);
-camera.lookAt(0, 0, 0);
-
-// Placeholder calm: a wireframe cylinder along +X (the spin axis / 640 m),
-// two ring glows at the Faith (+x, cyan) and Free (−x, orange) ends.
-const skin = new THREE.Mesh(
-  new THREE.CylinderGeometry(REG.R, REG.R, REG.L, 64, 1, true),
-  new THREE.MeshBasicMaterial({ color: 0x2a2d38, wireframe: true, side: THREE.BackSide }),
-);
-skin.rotation.z = Math.PI / 2; // cylinder length -> world X
-scene.add(skin);
-
-const ring = (x: number, color: number) => {
-  const m = new THREE.Mesh(
-    new THREE.TorusGeometry(REG.gateRadius, 0.6, 12, 48),
-    new THREE.MeshBasicMaterial({ color }),
-  );
-  m.position.x = x;
-  m.rotation.y = Math.PI / 2;
-  scene.add(m);
-  return m;
-};
-ring(REG.L / 2, 0x1aa6b7); // Faith
-ring(-REG.L / 2, 0xd4602a); // Free
-
+const calm = new Calm(scene);
+const camera = new THREE.PerspectiveCamera(60, 1, 0.1, 4000);
 const events = new EventBus();
-window.addEventListener('resize', () => {
+
+function resize(): void {
   renderer.setSize(innerWidth, innerHeight);
   camera.aspect = innerWidth / innerHeight;
   camera.updateProjectionMatrix();
   events.emit('resize', { width: innerWidth, height: innerHeight });
-});
-renderer.setSize(innerWidth, innerHeight);
-camera.aspect = innerWidth / innerHeight;
-camera.updateProjectionMatrix();
+}
+addEventListener('resize', resize);
+resize();
 
-let t = 0;
+// The bell.
+const bellMesh = new THREE.Mesh(
+  new THREE.SphereGeometry(0.9, 24, 16),
+  new THREE.MeshStandardMaterial({ color: 0xe8e0c8, emissive: 0x1aa6b7, emissiveIntensity: 1 }),
+);
+scene.add(bellMesh);
+
+// P1 trail: a coloured polyline (the gorgeous ribbon is P2's money shot).
+const TRAIL = 600;
+const trailPos = new Float32Array(TRAIL * 3);
+const trailGeo = new THREE.BufferGeometry();
+trailGeo.setAttribute('position', new THREE.BufferAttribute(trailPos, 3));
+const trail = new THREE.Line(
+  trailGeo,
+  new THREE.LineBasicMaterial({ color: 0x1aa6b7, transparent: true, opacity: 0.85 }),
+);
+trail.frustumCulled = false;
+scene.add(trail);
+
+function freshBell(): BellBody {
+  // Launch near the axis, up-and-antispinward → a long Coriolis roulette.
+  return {
+    p: { x: -GATE_X * 0.55, y: 3, z: 0 },
+    v: { x: 14, y: 7.5, z: -9 },
+    q: { x: 0, y: 0, z: 0, w: 1 },
+    w: { x: 26, y: 0, z: 0 },
+  };
+}
+let bell = freshBell();
+let trailN = 0;
+function pushTrail(): void {
+  const i = (trailN % TRAIL) * 3;
+  trailPos[i] = bell.p.x;
+  trailPos[i + 1] = bell.p.y;
+  trailPos[i + 2] = bell.p.z;
+  trailN++;
+  trailGeo.setDrawRange(0, Math.min(trailN, TRAIL));
+  trailGeo.attributes.position.needsUpdate = true;
+}
+
+const H = 1 / 240;
+let acc = 0;
+let life = 0;
+
 const runtime = new GameRuntime(
   (dt) => {
-    t += dt;
-    // slow orbit so the 3D-ness is unmistakable in the P0 placeholder
-    camera.position.x = Math.cos(t * 0.15) * REG.R * 1.1;
-    camera.position.z = Math.sin(t * 0.15) * REG.L * 0.55 + REG.L * 0.2;
-    camera.position.y = REG.R * 0.45;
-    camera.lookAt(0, 0, 0);
-    skin.rotation.x += dt * REG.omega; // sells the spin (P1: scrolling texture)
+    calm.update(dt);
+    acc += dt;
+    life += dt;
+    while (acc >= H) {
+      bell = stepBell(bell, REG.omega, H);
+      skinBounce(bell);
+      acc -= H;
+    }
+    pushTrail();
+    if (Math.abs(bell.p.x) > GATE_X || life > 26) {
+      bell = freshBell();
+      trailN = 0;
+      life = 0;
+    }
+    // Broadcast-ish view: off to the side, down the spine, framing the arc.
+    bellMesh.position.set(bell.p.x, bell.p.y, bell.p.z);
+    const ch = chime(bell.w);
+    (bellMesh.material as THREE.MeshStandardMaterial).emissiveIntensity = 0.3 + ch * 1.4;
+    camera.position.set(REG.R * 1.15, REG.R * 0.35, bell.p.x * 0.4 + REG.L * 0.42);
+    camera.lookAt(bell.p.x * 0.5, 0, 0);
   },
   () => renderer.render(scene, camera),
 );
 runtime.start();
-
-if (boot) boot.remove();
-console.info('RIG v2 P0 — pipeline up. ω=%s R=%s L=%s', REG.omega, REG.R, REG.L);
+console.info('RIG v2 P1 — the calm + live Coriolis bell. ω=%s', REG.omega);
