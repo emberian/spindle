@@ -1,15 +1,20 @@
-// Seeded RNG with NAMED SUBSTREAMS. There is deliberately no global instance
-// (frisqueendom's global `Random` is a determinism hazard we do not port).
-// Each consumer takes an explicit substream; the draw cursor is serialisable
-// so a replay re-seeds to the exact state.
+// Seeded RNG with NAMED SUBSTREAMS. No global instance (a determinism
+// hazard). The cursor is serialisable so a replay re-seeds exactly.
+//
+// Generator: sfc32 (Small Fast Counting, 32-bit) — passes PractRand to
+// multi-TB, ~2^128 state, far better equidistribution/period than an LCG.
+// Seeded via splitmix32 so even nearby seeds decorrelate fully. All math is
+// 32-bit (Math.imul / >>>0) so results are bit-identical across machines.
 
-function hash2(a: number, b: number): number {
-  // splitmix-ish 32-bit mix of (seed, name-hash)
-  let h = (a ^ 0x9e3779b9) >>> 0;
-  h = Math.imul(h ^ (h >>> 16), 0x85ebca6b) >>> 0;
-  h = (h + (b >>> 0)) >>> 0;
-  h = Math.imul(h ^ (h >>> 13), 0xc2b2ae35) >>> 0;
-  return (h ^ (h >>> 16)) >>> 0;
+function splitmix32(seed: number): () => number {
+  let a = seed >>> 0;
+  return () => {
+    a = (a + 0x9e3779b9) >>> 0;
+    let t = a;
+    t = Math.imul(t ^ (t >>> 16), 0x21f0aaad) >>> 0;
+    t = Math.imul(t ^ (t >>> 15), 0x735a2d97) >>> 0;
+    return (t ^ (t >>> 15)) >>> 0;
+  };
 }
 
 function nameHash(name: string): number {
@@ -22,16 +27,40 @@ function nameHash(name: string): number {
 }
 
 export class Substream {
-  private state: number;
+  private a: number;
+  private b: number;
+  private c: number;
+  private d: number;
   public draws = 0;
+
   constructor(seed: number) {
-    this.state = (Math.abs(seed | 0) || 1) >>> 0;
+    // Mix the seed into four 32-bit words of sfc32 state.
+    const sm = splitmix32((seed >>> 0) || 1);
+    this.a = sm();
+    this.b = sm();
+    this.c = sm();
+    this.d = sm();
+    // Warm up to wash out seeding structure.
+    for (let i = 0; i < 16; i++) this.u32();
   }
+
+  private u32(): number {
+    // sfc32 core.
+    const t = (((this.a + this.b) >>> 0) + this.d) >>> 0;
+    this.d = (this.d + 1) >>> 0;
+    this.a = (this.b ^ (this.b >>> 9)) >>> 0;
+    this.b = (this.c + (this.c << 3)) >>> 0;
+    this.c = ((this.c << 21) | (this.c >>> 11)) >>> 0;
+    this.c = (this.c + t) >>> 0;
+    return t >>> 0;
+  }
+
+  /** Uniform float in [0,1). 53-bit mantissa from two 32-bit draws. */
   next(): number {
-    // LCG (Numerical Recipes constants); deterministic across machines.
-    this.state = (Math.imul(this.state, 1664525) + 1013904223) >>> 0;
     this.draws++;
-    return this.state / 4294967296;
+    const hi = this.u32() >>> 5; // 27 bits
+    const lo = this.u32() >>> 6; // 26 bits
+    return (hi * 67108864 + lo) / 9007199254740992; // / 2^53
   }
   range(min: number, max: number): number {
     return min + this.next() * (max - min);
@@ -42,6 +71,14 @@ export class Substream {
   chance(p: number): boolean {
     return this.next() < p;
   }
+}
+
+function hash2(a: number, b: number): number {
+  let h = (a ^ 0x9e3779b9) >>> 0;
+  h = Math.imul(h ^ (h >>> 16), 0x85ebca6b) >>> 0;
+  h = (h + (b >>> 0)) >>> 0;
+  h = Math.imul(h ^ (h >>> 13), 0xc2b2ae35) >>> 0;
+  return (h ^ (h >>> 16)) >>> 0;
 }
 
 export class Rng {
