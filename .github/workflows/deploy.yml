@@ -47,6 +47,19 @@ jobs:
       - name: Build
         run: npx vite build
         working-directory: game
+      - name: Install Playwright Chromium
+        run: npx playwright install --with-deps chromium
+        working-directory: game
+      - name: Progression gate (AI-vs-AI watch — must pass before deploy)
+        run: npm run test:progression
+        working-directory: game
+      - name: Upload Playwright report on gate failure
+        uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: playwright-report-deploy
+          path: game/playwright-report/
+          retention-days: 7
       - name: Stage v0.1 as /classic
         run: |
           mkdir -p game/dist/classic

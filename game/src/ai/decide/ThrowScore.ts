@@ -10,6 +10,7 @@ import type { PlayerSim, MatchState } from '../../sim/types';
 import type { TeamProfile } from '../../league/teams';
 import { computeScoreEV } from './ScoreEV';
 import { REG, GATE_X } from '../../sim/RegConstants';
+import { attackSign, attackRingX } from '../Orientation';
 
 export interface ThrowCandidate {
   receiver: PlayerSim;
@@ -50,22 +51,22 @@ export function scoreThrow(
 ): ThrowScoreResult {
   const { aimPos, openness, flightTime, receiverRadius } = candidate;
 
-  // Determine which ring is the attack target.
-  const attackFaith = match.possession === 'home'
-    ? match.faithEnd === '+x'
-    : match.faithEnd === '-x';
-
+  // ORIENTATION-CORRECT: the attacking ring is fixed by the THROWER's team
+  // (home → +X, away → -X), independent of faithEnd. faithEnd only labels
+  // which physical ring scores as Faith (2) vs Free (5).
+  const sgn = attackSign(thrower.team);
+  const ourRingX = attackRingX(thrower.team);
   const faithX = match.faithEnd === '+x' ? GATE_X : -GATE_X;
-  const freeX  = match.faithEnd === '+x' ? -GATE_X : GATE_X;
+  // Is OUR attacking ring the Faith (2-pt) ring?
+  const attackFaith = Math.sign(ourRingX) === Math.sign(faithX);
 
+  // Distances to the physical Faith / Free rings (for EV classification).
   const distToFaithRing = Math.abs(aimPos.x - faithX);
-  const distToFreeRing  = Math.abs(aimPos.x - freeX);
+  const distToFreeRing  = Math.abs(aimPos.x - -faithX);
 
-  // Axial progress toward the team's preferred end.
+  // Axial progress toward OUR attacking ring (orientation-correct).
   const throwerX = thrower.p.x;
-  const axialGain = attackFaith
-    ? (faithX > 0 ? aimPos.x - throwerX : throwerX - aimPos.x)
-    : (freeX  > 0 ? aimPos.x - throwerX : throwerX - aimPos.x);
+  const axialGain = sgn * (aimPos.x - throwerX);
 
   const normalizedGain = Math.max(-0.5, Math.min(1.5, axialGain / (REG.L * 0.25)));
 

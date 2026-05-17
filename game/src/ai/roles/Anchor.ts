@@ -10,8 +10,9 @@
 import type { Vec3 } from '../../sim/vec';
 import type { PlayerSim, SimState, MatchState } from '../../sim/types';
 import type { TeamProfile } from '../../league/teams';
-import { REG, GATE_X } from '../../sim/RegConstants';
+import { REG } from '../../sim/RegConstants';
 import { planGrapple, type GrapplePlan } from '../nav/GrapplePlanner';
+import { attackRingX, defendRingX } from '../Orientation';
 
 // The Anchor wants to be at ~70% skin radius: deep but not skinned.
 const ANCHOR_TARGET_RADIUS = REG.R * 0.72;
@@ -38,11 +39,14 @@ export function anchorPolicy(
     state.players.find(p => p.id === bell.heldBy)?.team === player.team;
   const possession = match.possession === player.team;
 
-  const faithX = match.faithEnd === '+x' ? GATE_X : -GATE_X;
+  // ORIENTATION-CORRECT: position relative to the ring THIS team attacks /
+  // defends (home → +X attack, away → -X attack), never faithEnd.
+  const atkX = attackRingX(player.team);
+  const defX = defendRingX(player.team);
 
   if (possession || onOffense) {
-    // Offense: stay deep near the Faith end to receive passes or contest loops.
-    const deepX = faithX + (faithX > 0 ? -80 : 80); // 80 m from the ring
+    // Offense: stay deep near OUR attacking ring to receive / contest loops.
+    const deepX = atkX + (atkX > 0 ? -80 : 80); // 80 m short of the ring
     const angle = Math.PI * (0.4 + rng() * 0.2);
     const targetY = ANCHOR_TARGET_RADIUS * Math.cos(angle);
     const targetZ = ANCHOR_TARGET_RADIUS * Math.sin(angle);
@@ -51,8 +55,8 @@ export function anchorPolicy(
       intent: 'deep-receive',
     };
   } else {
-    // Defense: guard the Faith end goal ring.
-    const guardX = faithX + (faithX > 0 ? -25 : 25);
+    // Defense: guard OUR OWN ring.
+    const guardX = defX + (defX > 0 ? -25 : 25);
     const guardY = ANCHOR_TARGET_RADIUS * 0.6;
     return {
       targetPos: { x: guardX, y: guardY, z: 0 },

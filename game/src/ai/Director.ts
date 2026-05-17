@@ -24,6 +24,7 @@ import type { TeamProfile } from '../league/teams';
 import type { SimState, MatchState, PlayerSim, TeamSide } from '../sim/types';
 import { REG, GATE_X } from '../sim/RegConstants';
 import { pFall, pRise, pLoop } from './decide/ScoreEV';
+import { attackRingX, attackSign, defendRingX } from './Orientation';
 
 // ── Director output ────────────────────────────────────────────────────────────
 
@@ -45,8 +46,16 @@ export interface PlayerAssignment {
 }
 
 export interface DirectorState {
-  /** Which end the team is currently attacking toward. */
+  /** Which end the team is currently attacking toward (Faith vs Free RING —
+   *  affects shot VALUE/spin, NOT physical direction). */
   attackingFree: boolean;
+  /** Signed physical attack direction for THIS team: +1 → drive toward +X
+   *  ring, -1 → toward -X ring. The single source of "forward". */
+  attackSign: 1 | -1;
+  /** World-x of the ring this team is attacking (scoring at). */
+  attackRingX: number;
+  /** World-x of the ring this team is defending (its own). */
+  defendRingX: number;
   /** Current cast posture. */
   posture: CastPosture;
   /** PlayerId of the designated loop-setter (a Spinner), or null. */
@@ -269,6 +278,12 @@ function assignReceivers(
   // Stable ordering by id keeps slot assignment deterministic & non-flickering.
   const ordered = [...receivers].sort((a, b) => (a.id < b.id ? -1 : 1));
   const n = ordered.length;
+  // GUARANTEE a safe short outlet: the first non-loop-setter receiver always
+  // sits at a shallow depth (slightly AHEAD of the carrier, never deep) so the
+  // carrier is never forced into a hopeless heave. Remaining receivers fan to
+  // progressively deeper scoring threats.
+  let nonLoopIndex = 0;
+  const nonLoopCount = ordered.filter(p => p.id !== loopSetterId).length;
   for (let i = 0; i < n; i++) {
     const p = ordered[i];
     if (p.id === loopSetterId) {
@@ -276,14 +291,25 @@ function assignReceivers(
       assignments[p.id] = {
         job: 'receive',
         markId: null,
-        depthSlot: 0.35,
+        depthSlot: 0.4,
         radiusSlot: 0.15,
       };
       continue;
     }
-    // Spread the rest from a shallow safe outlet to a deep scoring threat.
-    const frac = n > 1 ? i / (n - 1) : 0.6;
-    const depthSlot = 0.25 + frac * 0.65; // 0.25 (outlet) .. 0.90 (deep)
+    const k = nonLoopIndex++;
+    if (k === 0) {
+      // The mandatory safe outlet: shallow, mid-radius, always reachable.
+      assignments[p.id] = {
+        job: 'receive',
+        markId: null,
+        depthSlot: 0.18,
+        radiusSlot: 0.35,
+      };
+      continue;
+    }
+    // Spread the rest from a mid outlet to a deep scoring threat.
+    const frac = nonLoopCount > 2 ? (k - 1) / (nonLoopCount - 2) : 0.6;
+    const depthSlot = 0.4 + frac * 0.55; // 0.40 (mid) .. 0.95 (deep at ring)
     // Alternate radius bands by role so wings keep their identity.
     let radiusSlot: number;
     switch (p.role) {
@@ -318,21 +344,31 @@ export function runDirector(
   teamSide: TeamSide,
   rng: () => number,
 ): DirectorState {
+  // ── ORIENTATION: physical attack direction is FIXED by team, NOT faithEnd.
+  //   home → +X ring, away → -X ring (see Orientation.ts / match rules).
+  const aSign = attackSign(teamSide);
+  const aRingX = attackRingX(teamSide);
+  const dRingX = defendRingX(teamSide);
+  // Is the ring we physically attack the Faith (2-pt) or Free (5-pt) ring?
   const faithX = match.faithEnd === '+x' ? GATE_X : -GATE_X;
-  const freeX = match.faithEnd === '+x' ? -GATE_X : GATE_X;
+  const freeX = -faithX;
+  const ourRingIsFaith = Math.sign(aRingX) === Math.sign(faithX);
 
+  // evFaith/evFree keep their LEGACY meaning: the EV of a shot toward the
+  // PHYSICAL Faith / Free ring from the bell's position, profile-parameterised.
+  // These feed posture + style divergence (and the divergence CI test); they
+  // are direction-agnostic by construction (abs distance to a fixed ring).
   const ef = evFaith(state.bell.p, faithX);
   const efr = evFree(state.bell.p, freeX, profile.loopPropensity);
 
   const posture = choosePosture(match, profile, teamSide, ef, efr);
 
-  // Attack Free if its biased EV is better. Posture nudges aggression:
-  // chase inflates the Free (big-play) EV, grind deflates it.
-  const postureFreeMul =
-    posture === 'chase' ? 1.18 : posture === 'grind' ? 0.85 : 1.0;
-  const biasedFree = efr * (0.6 + profile.freeEndBias * 0.8) * postureFreeMul;
-  const biasedFaith = ef * (0.6 + (1 - profile.freeEndBias) * 0.8);
-  const attackingFree = biasedFree > biasedFaith;
+  // `attackingFree` = the ring THIS team physically attacks is the Free
+  // (5-pt) ring. This drives shot VALUE/spin choice, never direction. The
+  // Rise-vs-Fall profile still tilts loop/curl willingness elsewhere, so the
+  // style-divergence test (which checks evFree bias + loopSetter counts) and
+  // the attackingFree-divergence test both still hold.
+  const attackingFree = !ourRingIsFaith;
 
   const useLoop = profile.loopPropensity > 0.25 && posture !== 'grind';
   const loopSetterId = useLoop ? pickLoopSetter(state.players, teamSide) : null;
@@ -432,6 +468,9 @@ export function runDirector(
 
   return {
     attackingFree,
+    attackSign: aSign,
+    attackRingX: aRingX,
+    defendRingX: dRingX,
     posture,
     loopSetterId,
     contestCommit,

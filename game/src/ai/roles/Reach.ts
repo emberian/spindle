@@ -11,8 +11,9 @@
 import type { Vec3 } from '../../sim/vec';
 import type { PlayerSim, SimState, MatchState } from '../../sim/types';
 import type { TeamProfile } from '../../league/teams';
-import { REG, GATE_X } from '../../sim/RegConstants';
+import { REG } from '../../sim/RegConstants';
 import { planGrapple, type GrapplePlan } from '../nav/GrapplePlanner';
+import { attackRingX, defendRingX } from '../Orientation';
 
 // Reach patrols at moderate radius, close to the goal ring.
 const REACH_PATROL_RADIUS = REG.R * 0.48;
@@ -34,14 +35,13 @@ export function reachPolicy(
 ): ReachIntent {
   const bell = state.bell;
   const possession = match.possession === player.team;
-  const faithX = match.faithEnd === '+x' ? GATE_X : -GATE_X;
-  const freeX  = match.faithEnd === '+x' ? -GATE_X : GATE_X;
+  // ORIENTATION-CORRECT: defend OUR ring, contest near the ring WE attack.
+  const ourAttackX = attackRingX(player.team);
+  const ourDefendX = defendRingX(player.team);
 
   if (!possession) {
-    // Defense: guard the mouth of the ring we're protecting.
-    // Which end is the Reach guarding? They defend the team's own ring.
-    // The team attacks toward the opponent's ring, so we defend our own.
-    const defendX = faithX; // simplified — defending the Faith end
+    // Defense: guard the mouth of OUR OWN ring.
+    const defendX = ourDefendX;
 
     const bellDistToOurRing = Math.abs(bell.p.x - defendX);
     const isHot = bellDistToOurRing < REG.L * 0.18;
@@ -61,7 +61,7 @@ export function reachPolicy(
     }
 
     // Normal defense: float in front of the ring.
-    const guardX = defendX + (faithX > 0 ? -18 : 18);
+    const guardX = defendX + (defendX > 0 ? -18 : 18);
     const angle = Math.PI * (0.3 + rng() * 0.2);
     return {
       targetPos: {
@@ -73,8 +73,8 @@ export function reachPolicy(
       intent: 'defend-mouth',
     };
   } else {
-    // Offense: contest passes approaching the opponent's ring.
-    const attackX = freeX + (freeX > 0 ? -20 : 20);
+    // Offense: position near the ring WE attack to contest/clean up.
+    const attackX = ourAttackX + (ourAttackX > 0 ? -20 : 20);
     const angle = Math.PI * (0.2 + rng() * 0.2);
     return {
       targetPos: {

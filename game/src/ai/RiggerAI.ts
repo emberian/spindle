@@ -38,6 +38,8 @@ import { reachPolicy } from './roles/Reach';
 import { solveLeadVelocity } from './decide/LeadPredict';
 import { scoreThrow } from './decide/ThrowScore';
 import type { ThrowCandidate } from './decide/ThrowScore';
+import { solveGateThrow } from './decide/GateSolve';
+import { attackSign, attackRingX, defendRingX, forwardProgress } from './Orientation';
 
 export type Difficulty = 'rookie' | 'pro' | 'legend';
 
@@ -228,12 +230,25 @@ export function computePlayerInput(
       const lagWindows = scaling.reactionDelay * 2; // up to ~2 director windows
       const lagTicks = Math.round(lagWindows * directorInterval * (0.5 + rng()));
       commit.reactGateUntilTick = tick + lagTicks;
+      // CRITICAL: consume the trigger by snapshotting the situation NOW, the
+      // moment we ARM the gate — NOT only when we later act. Otherwise the
+      // snapshot stays stale for the whole gated window, hardTrigger() keeps
+      // returning true every tick, and the gate re-arms forever the instant
+      // it expires → the player is perpetually gated and NEVER decides. (This
+      // is the home/away asymmetry: H1 holds the bell from frame 0 so it hits
+      // the firstEver bypass and skips gate-arming; A1 only gains the bell
+      // mid-match, arms the gate, and then starved its own throw/carry
+      // decision forever — hence "away stalls, never throws".)
+      commit.sawHeldBy = state.bell.heldBy;
+      commit.sawContest = match.contest !== null;
+      commit.sawHadBell = state.bell.heldBy === player.id;
     }
 
     const gated = tick < commit.reactGateUntilTick;
 
     if (!gated) {
-      // Refresh the situation snapshot now that we are acting on it.
+      // Refresh the situation snapshot now that we are acting on it (also
+      // covers the firstEver / Director-refresh paths that don't arm a gate).
       commit.sawHeldBy = state.bell.heldBy;
       commit.sawContest = match.contest !== null;
       commit.sawHadBell = state.bell.heldBy === player.id;
@@ -373,15 +388,44 @@ function decideNavTarget(
     };
   }
 
-  // Man-marking: sit between the marked opponent and our defended ring.
+  // CARRIER: actively gain ground toward OUR attacking ring. Drive a target a
+  // good chunk down-axis from the carrier (capped at the ring), pulled toward
+  // the axis so we end up in a scoring lane rather than skinned at the rim.
+  //
+  // SYMMETRY FIX (the away-stall bug): the de-facto carrier each cast is
+  // whoever the harness grips the bell to (the SPINNER H1/A1), which is NOT
+  // always the Director's `carry` assignee — the Director runs at 2 Hz and
+  // may lag a re-grip, and a spinner's own role policy only nudges ~40 m and
+  // sits at mid-radius, so the real holder would dawdle / heave instead of
+  // driving to the ring. Key the carrier-advance off ACTUAL possession
+  // (state.bell.heldBy === player.id) so home AND away drive identically.
+  if (assignment.job === 'carry' || state.bell.heldBy === player.id) {
+    const sgn = attackSign(player.team);
+    const ringX = attackRingX(player.team);
+    const distToRing = Math.abs(ringX - player.p.x);
+    // Advance hard down-axis toward OUR ring (never past it).
+    const step = Math.min(110, distToRing);
+    const aheadX = player.p.x + sgn * step;
+    const r = axisRadius(player.p);
+    // Aggressively ease toward the axis so a real (rho≤8) gate solution
+    // exists ASAP — the closed-form gate throw needs us near-axial.
+    const targetR = Math.min(r, 6);
+    const yzLen = r > 1e-6 ? r : 1;
+    return {
+      x: aheadX,
+      y: (player.p.y / yzLen) * targetR,
+      z: (player.p.z / yzLen) * targetR,
+    };
+  }
+
+  // Man-marking: sit between the marked opponent and OUR defended ring
+  // (orientation-correct: home defends -X, away defends +X).
   if (assignment.job === 'mark' && assignment.markId) {
     const mark = state.players.find(p => p.id === assignment.markId);
     if (mark) {
-      const faithX = match.faithEnd === '+x' ? 320 : -320;
-      // Defended ring ≈ the Faith end for the defending side (canon default).
-      const tRing = { x: faithX, y: 0, z: 0 };
+      const tRing = { x: defendRingX(player.team), y: 0, z: 0 };
       const toRing = vnorm(vsub(tRing, mark.p));
-      // 6 m goal-side of the mark, biased toward the bell's lane.
+      // 6 m goal-side of the mark (between mark and the ring we defend).
       return vadd(mark.p, vscale(toRing, 6));
     }
   }
@@ -431,19 +475,24 @@ function roleTarget(
   }
 
   // If we're an offensive receiver, override radius & axial depth from the
-  // Director slot so receivers fan out instead of stacking.
-  if (assignment.job === 'receive') {
+  // Director slot so receivers fan out AHEAD of the carrier toward OUR
+  // attacking ring (orientation-correct: uses director.attackRingX, never
+  // faithEnd). depthSlot interpolates carrier → ring, so receivers always
+  // lead into space the carrier is driving toward.
+  if (assignment.job === 'receive' || assignment.job === 'support') {
     const carrier = director.carrierId
       ? state.players.find(p => p.id === director.carrierId)
       : null;
-    const faithX = match.faithEnd === '+x' ? 320 : -320;
-    const freeX = match.faithEnd === '+x' ? -320 : 320;
-    const targetRingX = director.attackingFree ? freeX : faithX;
+    const targetRingX = director.attackRingX;
     const fromX = carrier ? carrier.p.x : state.bell.p.x;
-    const depthX = fromX + (targetRingX - fromX) * assignment.depthSlot;
+    // Always at least a little ahead of the carrier toward the ring.
+    const minLead = director.attackSign * 14;
+    let depthX = fromX + (targetRingX - fromX) * assignment.depthSlot;
+    if (director.attackSign > 0) depthX = Math.max(depthX, fromX + minLead);
+    else depthX = Math.min(depthX, fromX + minLead);
     // Place at the slotted axis-radius; keep an angular spread from styleNoise.
     const R = 45;
-    const r = R * (0.12 + assignment.radiusSlot * 0.75);
+    const r = R * (0.12 + assignment.radiusSlot * 0.7);
     const ang =
       Math.PI *
       (0.15 +
@@ -489,23 +538,86 @@ function decideThrow(
   );
   const opponents = state.players.filter(p => p.team !== player.team);
 
+  const ringX = attackRingX(player.team);
+  const distToRing = Math.abs(ringX - player.p.x);
+
   // Posture shapes throw speed/aggression.
   const postureMul =
     director.posture === 'chase' ? 1.12 : director.posture === 'grind' ? 0.92 : 1;
   const throwSpeed = (18 + profile.aggression * 12) * postureMul;
 
+  // ── PRIORITY 1: a REAL scoring throw through OUR ring. ────────────────────
+  // The Coriolis gate solver returns a CLOSED-FORM launch that threads
+  // rho ≈ 0 at x = ringX (or null if no skin-safe, dead-ball-safe, throwable
+  // solution exists from here). It already enforces flight-time and
+  // release-speed limits, so we attempt it from anywhere on the field rather
+  // than gating on an arbitrary distance — the solver itself is the gate.
+  if (distToRing > 6) {
+    const gate = solveGateThrow(
+      player.p,
+      player.team,
+      state.omega,
+      throwSpeed,
+      profile.loopPropensity,
+      player.v, // sim ADDS thrower velocity — solver cancels it
+    );
+    if (gate) {
+      // Aim along the REQUIRED throw vector (sim adds player.v back to it);
+      // charge so the sim's release speed equals |throwVec| exactly. This
+      // makes the realised free-bell velocity match the solved v0, so the
+      // rho≈0 thread holds in the live sim.
+      //
+      // A ring shot is a PRECISION throw: the gate is only 8 m across at the
+      // end of a multi-second Coriolis arc, so even a fraction of a degree of
+      // aim noise sails it wide. Use a heavily-attenuated variance (kept
+      // nonzero so the seed still reaches output and skill still separates)
+      // instead of the full pass-grade cone.
+      const dir = perturbDirection(
+        vnorm(gate.throwVec),
+        scaling.throwVariance * 0.04,
+        rng,
+      );
+      // Spin: loop/curl ride needs spin; a flat Fall/Rise wants modest spin.
+      const throwSpin = director.attackingFree
+        ? -(0.3 + profile.loopPropensity * 0.7)
+        : 0.2 + (1 - profile.freeEndBias) * 0.3;
+      commit.throwGo = true;
+      commit.throwTargetId = null; // direct ring shot, no receiver
+      commit.throwDir = dir;
+      commit.throwSpin = Math.max(-1, Math.min(1, throwSpin));
+      // Sim: speed = THROW_MIN + charge·(THROW_MAX − THROW_MIN). Invert it so
+      // the release speed equals the solver's required releaseSpeed exactly.
+      const THROW_MIN = 9.0;
+      const THROW_MAX = 34.0;
+      commit.throwCharge = Math.max(
+        0,
+        Math.min(
+          1,
+          (gate.releaseSpeed - THROW_MIN) / (THROW_MAX - THROW_MIN),
+        ),
+      );
+      return;
+    }
+  }
+
+  // ── PRIORITY 2: a ground-gaining pass to an OPEN, ADVANCING receiver. ─────
+  // We only pass if it meaningfully advances the bell toward OUR ring (or is
+  // the mandatory safe outlet). Never a hopeless heave with no receiver.
   let bestScore = -Infinity;
   let bestTm: PlayerSim | null = null;
   let bestV0: Vec3 | null = null;
-  let heldScore = -Infinity; // score of the currently-committed target
+  let heldScore = -Infinity;
 
   for (const tm of teammates) {
     if (rng() < scaling.missOpenChance) continue;
 
-    // Lead the receiver into the SPACE they're moving toward (curved arc),
-    // solved by the improved LeadPredict (Coriolis-aware receiver model).
     const lead = solveLeadVelocity(player.p, throwSpeed, tm.p, tm.v, state.omega);
     if (!lead) continue;
+
+    // Forward gain toward OUR ring at the intercept (orientation-correct).
+    const gain =
+      forwardProgress(player.team, lead.intercept.x) -
+      forwardProgress(player.team, player.p.x);
 
     const openness = estimateOpenness(player, tm, opponents);
 
@@ -520,17 +632,21 @@ function decideThrow(
     const noise = (rng() - 0.5) * (1 - scaling.readQuality) * 0.3;
     const result = scoreThrow(player, candidate, match, profile, noise);
 
-    if (tm.id === commit.throwTargetId) heldScore = result.score;
+    // Reward forward progress strongly so the team always works down-axis;
+    // a backward pass is only acceptable as a pressure-release safety valve.
+    const gainNorm = Math.max(-1, Math.min(1.5, gain / 90));
+    const score = result.score + gainNorm * 0.35;
 
-    if (result.score > bestScore) {
-      bestScore = result.score;
+    if (tm.id === commit.throwTargetId) heldScore = score;
+
+    if (score > bestScore) {
+      bestScore = score;
       bestTm = tm;
       bestV0 = lead.v0;
     }
   }
 
-  // Hysteresis: only switch off the committed target if the new best beats it
-  // by a clear margin (prevents dithering between two similar receivers).
+  // Hysteresis: keep the committed target unless clearly beaten.
   const SWITCH_MARGIN = 0.12;
   if (
     commit.throwTargetId &&
@@ -539,7 +655,6 @@ function decideThrow(
     bestTm.id !== commit.throwTargetId &&
     bestScore < heldScore + SWITCH_MARGIN
   ) {
-    // Keep the held target: re-solve its lead for a fresh direction.
     const held = teammates.find(p => p.id === commit.throwTargetId);
     if (held) {
       const lead = solveLeadVelocity(player.p, throwSpeed, held.p, held.v, state.omega);
@@ -551,23 +666,52 @@ function decideThrow(
     }
   }
 
-  // No safe throw: HOLD and keep advancing (never deadlock). The carrier
-  // always has a progressing option: if no good pass, run the bell yourself.
-  if (!bestTm || !bestV0 || bestScore < -0.05) {
+  // Decide WHETHER to pass at all. Compute the best forward gain available.
+  let bestGain = -Infinity;
+  if (bestTm) {
+    bestGain =
+      forwardProgress(player.team, bestTm.p.x) -
+      forwardProgress(player.team, player.p.x);
+  }
+
+  // HOLD & keep advancing (never deadlock, never heave) UNLESS the pass is
+  // both reasonably safe AND gains ground (or is a safe near-lateral outlet
+  // when we're pressured). The carrier's own nav advances the bell otherwise.
+  const opp = nearestOpponentDist(player, opponents);
+  const pressured = opp < 14;
+  const passGainsGround = bestGain > 18;
+  const safeOutlet = bestScore > 0.2 && bestGain > -25;
+  const acceptable =
+    bestTm != null &&
+    bestV0 != null &&
+    bestScore > -0.02 &&
+    (passGainsGround || (pressured && safeOutlet));
+
+  if (!acceptable) {
     commit.throwGo = false;
     commit.throwTargetId = null;
     commit.throwDir = null;
     return;
   }
 
-  const noisyDir = perturbDirection(vnorm(bestV0), scaling.throwVariance, rng);
+  const noisyDir = perturbDirection(vnorm(bestV0!), scaling.throwVariance, rng);
   const throwSpin = director.attackingFree
     ? -(0.3 + profile.loopPropensity * 0.7)
     : 0.2 + (1 - profile.freeEndBias) * 0.3;
 
   commit.throwGo = true;
-  commit.throwTargetId = bestTm.id;
+  commit.throwTargetId = bestTm!.id;
   commit.throwDir = noisyDir;
-  commit.throwSpin = throwSpin;
+  commit.throwSpin = Math.max(-1, Math.min(1, throwSpin));
   commit.throwCharge = Math.min(1, 0.7 + rng() * 0.3);
+}
+
+/** Distance from a player to the nearest opponent. */
+function nearestOpponentDist(player: PlayerSim, opponents: PlayerSim[]): number {
+  let best = Infinity;
+  for (const o of opponents) {
+    const d = vlen(vsub(o.p, player.p));
+    if (d < best) best = d;
+  }
+  return best;
 }

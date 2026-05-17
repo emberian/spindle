@@ -12,6 +12,7 @@
     "test": "tsc --noEmit && vitest run",
     "test:watch": "vitest",
     "test:e2e": "playwright test",
+    "test:progression": "playwright test e2e/progression.spec.ts",
     "preview": "vite preview"
   },
   "dependencies": {

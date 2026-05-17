@@ -11,8 +11,9 @@
 import type { Vec3 } from '../../sim/vec';
 import type { PlayerSim, SimState, MatchState } from '../../sim/types';
 import type { TeamProfile } from '../../league/teams';
-import { REG, GATE_X } from '../../sim/RegConstants';
+import { REG } from '../../sim/RegConstants';
 import { planGrapple, type GrapplePlan } from '../nav/GrapplePlanner';
+import { attackRingX, defendRingX } from '../Orientation';
 
 // Freewings operate HIGH — near the axis to exploit Coriolis curves.
 const FREEWING_ATTACK_RADIUS = REG.R * 0.22;
@@ -33,7 +34,10 @@ export function freewingPolicy(
 ): FreewingIntent {
   const bell = state.bell;
   const possession = match.possession === player.team;
-  const freeX = match.faithEnd === '+x' ? -GATE_X : GATE_X;
+  // ORIENTATION-CORRECT: the Freewing still plays HIGH/near-axis for the Free
+  // (5-pt) curve game, but its DIRECTION is the ring THIS team attacks.
+  const freeX = attackRingX(player.team);
+  const defX = defendRingX(player.team);
 
   if (possession) {
     const bellDistToFree = Math.abs(bell.p.x - freeX);
@@ -87,8 +91,8 @@ export function freewingPolicy(
     // Defense: cross-spin contest position — force the thrower to go Faith-side.
     const oppHolder = state.players.find(p => p.id === bell.heldBy);
     if (oppHolder) {
-      // Position on the Free side of the holder, near axis.
-      const freeOffset = freeX > 0 ? 15 : -15;
+      // Position between the holder and OUR defended ring, near axis.
+      const freeOffset = defX > 0 ? 15 : -15;
       return {
         targetPos: {
           x: oppHolder.p.x + freeOffset,
@@ -100,8 +104,8 @@ export function freewingPolicy(
       };
     }
 
-    // Guard Free end.
-    const guardX = freeX + (freeX > 0 ? -30 : 30);
+    // Guard OUR OWN ring.
+    const guardX = defX + (defX > 0 ? -30 : 30);
     return {
       targetPos: { x: guardX, y: FREEWING_HOLD_RADIUS, z: 0 },
       intent: 'cross-contest',

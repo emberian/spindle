@@ -10,8 +10,9 @@
 import type { Vec3 } from '../../sim/vec';
 import type { PlayerSim, SimState, MatchState } from '../../sim/types';
 import type { TeamProfile } from '../../league/teams';
-import { REG, GATE_X } from '../../sim/RegConstants';
+import { REG } from '../../sim/RegConstants';
 import { planGrapple, type GrapplePlan } from '../nav/GrapplePlanner';
+import { attackRingX, defendRingX } from '../Orientation';
 
 const FAITHWING_RADIUS = REG.R * 0.55;
 
@@ -29,10 +30,12 @@ export function faithwingPolicy(
 ): FaithwingIntent {
   const bell = state.bell;
   const possession = match.possession === player.team;
-  const faithX = match.faithEnd === '+x' ? GATE_X : -GATE_X;
+  // ORIENTATION-CORRECT: attack/defend rings relative to THIS team.
+  const faithX = attackRingX(player.team); // the ring we attack
+  const defX = defendRingX(player.team); // the ring we defend
 
   if (possession) {
-    // Check if the bell is close to the Faith ring.
+    // Check if the bell is close to OUR attacking ring.
     const bellDistToFaith = Math.abs(bell.p.x - faithX);
     if (bellDistToFaith < REG.L * 0.3) {
       // Attack mode: sprint into position to receive a scoring pass.
@@ -61,8 +64,8 @@ export function faithwingPolicy(
       p => p.team !== player.team && p.role === 'freewing',
     );
     if (opponentFreewing) {
-      // Position between the Freewing and the Faith ring.
-      const shadowX = (opponentFreewing.p.x + faithX) / 2;
+      // Position between the Freewing and OUR defended ring.
+      const shadowX = (opponentFreewing.p.x + defX) / 2;
       return {
         targetPos: {
           x: shadowX,
@@ -73,8 +76,8 @@ export function faithwingPolicy(
       };
     }
 
-    // Fall back to guarding the Faith end.
-    const guardX = faithX + (faithX > 0 ? -40 : 40);
+    // Fall back to guarding OUR OWN ring.
+    const guardX = defX + (defX > 0 ? -40 : 40);
     return {
       targetPos: { x: guardX, y: FAITHWING_RADIUS * 0.7, z: 0 },
       intent: 'shadow-freewing',

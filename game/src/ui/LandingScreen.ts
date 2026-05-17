@@ -57,6 +57,7 @@ export class LandingScreen {
   private el: HTMLElement;
   private onPlay: (() => void) | null = null;
   private onSpectate: (() => void) | null = null;
+  private onReplay: (() => void) | null = null;
 
   constructor(root: HTMLElement) {
     if (!document.getElementById('rig-landing-css')) {
@@ -92,6 +93,7 @@ export class LandingScreen {
         <div class="acts">
           <button class="play" id="rig-play-btn">PLAY</button>
           <button class="watch" id="rig-watch-btn">Watch a match</button>
+          <button class="watch" id="rig-recall-btn">Re-calls</button>
         </div>
         <p class="links">
           <a href="classic/">Classic (the 2D original)</a> ·
@@ -111,11 +113,17 @@ export class LandingScreen {
       this.hide();
       cb?.();
     });
+    this.el.querySelector<HTMLButtonElement>('#rig-recall-btn')!.addEventListener('click', () => {
+      const cb = this.onReplay;
+      this.hide();
+      cb?.();
+    });
   }
 
-  show(onPlay: () => void, onSpectate?: () => void): void {
+  show(onPlay: () => void, onSpectate?: () => void, onReplay?: () => void): void {
     this.onPlay = onPlay;
     this.onSpectate = onSpectate ?? null;
+    this.onReplay = onReplay ?? null;
     this.el.style.display = 'block';
     this.el.scrollTop = 0;
   }
@@ -124,5 +132,6 @@ export class LandingScreen {
     this.el.style.display = 'none';
     this.onPlay = null;
     this.onSpectate = null;
+    this.onReplay = null;
   }
 }

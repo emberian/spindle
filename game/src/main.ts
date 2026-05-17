@@ -19,6 +19,8 @@ import { TitleScreen } from './ui/TitleScreen';
 import { BracketScreen } from './ui/BracketScreen';
 import { SpectateScreen } from './ui/SpectateScreen';
 import { SpectateControls } from './ui/SpectateControls';
+import { ReplayScreen } from './ui/ReplayScreen';
+import { ReplayRecorder, ReplayStore, type ReplayData } from './league/Replay';
 import { InputManager } from './input/InputManager';
 import { AiSystem, type TeamConfig } from './ai/index';
 import { MatchStateMachine } from './match/MatchStateMachine';
@@ -37,6 +39,9 @@ const renderer = new THREE.WebGLRenderer({ antialias: true });
 renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
 renderer.setClearColor(0x11131a, 1);
 renderer.toneMapping = THREE.ACESFilmicToneMapping;
+// Pull exposure down: at some cinematic angles the axis sunline + bloom
+// blew out to near-white and hurt legibility.
+renderer.toneMappingExposure = 0.8;
 app.appendChild(renderer.domElement);
 
 const scene = new THREE.Scene();
@@ -55,6 +60,7 @@ const title = new TitleScreen(app);
 const bracketUI = new BracketScreen(app);
 const spectate = new SpectateScreen(app);
 const spectateControls = new SpectateControls(app);
+const replayScreen = new ReplayScreen(app);
 const input = new InputManager(renderer.domElement, camera);
 const ai = new AiSystem();
 let shownOnboarding = false;
@@ -122,6 +128,15 @@ async function runMatch(
     { side: 'home', profile: styleToProfile(homeFr.styleTag, homeFr.cylinderClass), difficulty: 'pro' },
     { side: 'away', profile: styleToProfile(awayFr.styleTag, awayFr.cylinderClass), difficulty: 'pro' },
   ];
+  const rec = new ReplayRecorder(
+    {
+      id: `r${Date.now().toString(36)}-${gameSeed >>> 0}`,
+      homeId: homeFr.id, awayId: awayFr.id, seed: gameSeed,
+      faithEnd: '+x', firstPossession: 'home',
+      label: `${homeFr.name} vs ${awayFr.name}`,
+    },
+    ROSTER.map((r) => ({ id: r.id, team: r.team, role: r.role, x: r.x })),
+  );
   trail.clear();
   gcam.reset();
   input.setFaithRingX?.(GATE_X); // player (home) attacks the +x Faith ring
@@ -154,6 +169,7 @@ async function runMatch(
         const p1in = input.get(SIM_H);
         const aiFrame = ai.tick(snap, match.state as never, cfgs, gameSeed);
         const frame: InputFrame = { tick: snap.tick, players: [p1in, ...aiFrame.players] };
+        rec.push(frame);
         const evs = sim.step(frame);
         const upd = match.consume(evs, sim.snapshot() as never);
         // Soul: drive the one-shot audio off real events.
@@ -201,6 +217,15 @@ async function runMatch(
       if (!ended && match.state.winner !== null) {
         ended = true;
         runtime?.stop();
+        try {
+          ReplayStore.save(
+            rec.finish({
+              scoreHome: match.state.scoreHome,
+              scoreAway: match.state.scoreAway,
+              winner: match.state.winner,
+            }),
+          );
+        } catch { /* replay storage is best-effort */ }
         onEnd(match.state.winner, match.state.scoreHome, match.state.scoreAway);
       }
     },
@@ -294,6 +319,15 @@ async function runWatch(
     { side: 'home', profile: styleToProfile(homeFr.styleTag, homeFr.cylinderClass), difficulty: 'pro' },
     { side: 'away', profile: styleToProfile(awayFr.styleTag, awayFr.cylinderClass), difficulty: 'pro' },
   ];
+  const rec = new ReplayRecorder(
+    {
+      id: `r${Date.now().toString(36)}-${gameSeed >>> 0}`,
+      homeId: homeFr.id, awayId: awayFr.id, seed: gameSeed,
+      faithEnd: '+x', firstPossession: 'home',
+      label: `${homeFr.name} vs ${awayFr.name} (watch)`,
+    },
+    WATCH_ROSTER.map((r) => ({ id: r.id, team: r.team, role: r.role, x: r.x })),
+  );
   trail.clear();
   gcam.reset();
   ai.reset();
@@ -318,7 +352,9 @@ async function runWatch(
       while (acc >= SIM_H && steps < 64 && match.state.winner === null) {
         const snap = sim.snapshot();
         const aiFrame = ai.tick(snap, match.state as never, cfgs, gameSeed);
-        const evs = sim.step({ tick: snap.tick, players: aiFrame.players });
+        const frame: InputFrame = { tick: snap.tick, players: aiFrame.players };
+        rec.push(frame);
+        const evs = sim.step(frame);
         const upd = match.consume(evs, sim.snapshot() as never);
         for (const e of evs) {
           if (e.type === 'bell_caught') audio.event('catch');
@@ -372,6 +408,15 @@ async function runWatch(
         ended = true;
         watching = false;
         runtime?.stop();
+        try {
+          ReplayStore.save(
+            rec.finish({
+              scoreHome: match.state.scoreHome,
+              scoreAway: match.state.scoreAway,
+              winner: match.state.winner,
+            }),
+          );
+        } catch { /* replay storage is best-effort */ }
         onEnd(match.state.winner, match.state.scoreHome, match.state.scoreAway);
       }
     },
@@ -384,7 +429,7 @@ function openSpectate(): void {
   spectate.show(TEAMS, {
     onWatch: (h, a) => startWatch(h, a),
     onWatchBracket: () => startWatchBracket(),
-    onBack: () => landing.show(() => title.show(enterJump), openSpectate),
+    onBack: () => landing.show(() => title.show(enterJump), openSpectate, openReplay),
   });
 }
 
@@ -456,5 +501,123 @@ function startWatchBracket(): void {
   playNextGame();
 }
 
-landing.show(() => title.show(enterJump), openSpectate);
-console.info('RIG v2 P7 — full shell + spectate. master seed %s', masterSeed);
+// ── The re-call: deterministically replay a recorded match ────────────────────
+async function runReplay(
+  data: ReplayData,
+  onEnd: () => void,
+): Promise<void> {
+  const sim: WasmSim = await createWasmSim(data.meta.seed);
+  const roster = data.roster;
+  for (let k = 0; k < roster.length; k++) {
+    const r = roster[k];
+    const ang = (k / roster.length) * Math.PI * 2;
+    sim.addPlayer(r.id, r.team, r.role, { x: r.x, y: Math.cos(ang) * 8, z: Math.sin(ang) * 8 });
+  }
+  const home0 = roster.find((r) => r.team === 'home') ?? roster[0];
+  sim.setBellHeld(home0.id);
+  const match = new MatchStateMachine(data.meta.faithEnd, data.meta.firstPossession);
+  match.consume([{ type: 'foul_garrote', by: '__start__' }], sim.snapshot());
+  trail.clear();
+  gcam.reset();
+  let acc = 0;
+  let fi = 0;
+  let ended = false;
+  let prevLoop = false;
+
+  const reArm = (): void => {
+    if (match.state.winner !== null || match.state.phase === 'live') return;
+    const poss = match.state.possession;
+    sim.setBellHeld((roster.find((r) => r.team === poss) ?? roster[0]).id);
+    match.resumeLive();
+  };
+
+  const finish = (): void => {
+    if (ended) return;
+    ended = true;
+    runtime?.stop();
+    onEnd();
+  };
+
+  runtime?.stop();
+  runtime = new GameRuntime(
+    (dt) => {
+      calm.update(dt);
+      acc += dt;
+      let steps = 0;
+      while (acc >= SIM_H && steps < 64 && match.state.winner === null && fi < data.frames.length) {
+        const frame = data.frames[fi++];
+        const evs = sim.step(frame);
+        const upd = match.consume(evs, sim.snapshot() as never);
+        for (const e of evs) {
+          if (e.type === 'bell_caught') audio.event('catch');
+          else if (e.type === 'bell_clatter' || e.type === 'bell_bobble') audio.event('clatter');
+        }
+        if (upd && upd.scored) {
+          const kd = upd.scored.kind;
+          audio.event(
+            kd === 'loop' ? 'score_loop' : kd === 'rise' || kd === 'curl' ? 'score_rise'
+              : kd === 'ground' ? 'score_ground' : 'score_fall',
+          );
+        } else if (upd && upd.turnover) {
+          audio.event('turnover');
+        }
+        reArm();
+        acc -= SIM_H;
+        steps++;
+      }
+      const s = sim.snapshot();
+      const lg = s.loopTier === 'loop' ? 1 : s.loopTier === 'curl' ? 0.4 : 0;
+      const isLoop = s.loopTier === 'loop';
+      bellMesh.position.set(s.bell.p.x, s.bell.p.y, s.bell.p.z);
+      (bellMesh.material as THREE.MeshStandardMaterial).emissiveIntensity = bellGlow(s.bell.chime);
+      trail.push(s.bell.p.x, s.bell.p.y, s.bell.p.z, s.bell.chime);
+      trail.setLoopMode(isLoop);
+      post.setLoopGlow(lg);
+      riggers.sync(s.players, '');
+      riglines.sync(s.players);
+      audio.setBell(s.bell.chime, Math.hypot(s.bell.w.x, s.bell.w.y, s.bell.w.z),
+        Math.max(-1, Math.min(1, s.bell.p.z / REG.R)), s.bell.heldBy === null);
+      audio.setHush(lg);
+      if (isLoop && !prevLoop) audio.event('loop_building');
+      prevLoop = isLoop;
+      const atkX = match.state.possession === 'home' ? GATE_X : -GATE_X;
+      const cinePlayers = s.players.map((pp) => ({ id: pp.id, p: pp.p, team: pp.team }));
+      gcam.cinematic(s.bell.p, cinePlayers, atkX, lg, REG.R, Math.min(dt, 1 / 30));
+      hud.render(s as never, match.state as never, input.view);
+
+      if (!ended && (match.state.winner !== null || fi >= data.frames.length)) {
+        finish();
+      }
+    },
+    () => post.render(),
+  );
+  runtime.start();
+}
+
+function openReplay(): void {
+  replayScreen.show({
+    onPlay: (data) => {
+      spectateControls.show({
+        onSpeed: (m) => {
+          runtime?.setTimeScale(m);
+          spectateControls.setSpeed(m);
+        },
+        onCycleCam: () => gcam.cycleCinematicAngle(),
+        onExit: () => {
+          runtime?.stop();
+          spectateControls.hide();
+          openReplay();
+        },
+      });
+      void runReplay(data, () => {
+        spectateControls.hide();
+        openReplay();
+      });
+    },
+    onDelete: () => { /* ReplayScreen removes from store + refreshes itself */ },
+    onBack: () => landing.show(() => title.show(enterJump), openSpectate, openReplay),
+  });
+}
+
+landing.show(() => title.show(enterJump), openSpectate, openReplay);
+console.info('RIG v2 P7 — shell + spectate + re-call. master seed %s', masterSeed);
