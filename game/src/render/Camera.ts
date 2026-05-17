@@ -1,64 +1,97 @@
-// FULLY STATIC BROADCAST CAMERA.
+// PLAYER-CONTROLLED ORBIT CAMERA.
 //
-// Every motion model (follow/lead/cut/loop-cam, and even a slow rail
-// dolly) was reported as disorienting by real players. Since the assisted
-// shot now draws a bold arc to the ring and the HUD/marker carry the
-// feedback, the camera does NOT need to chase anything. So it is a single
-// constant pose: it never moves, rotates, zooms or cuts — ever. A wide
-// side vantage that comfortably shows the whole active span of the tube.
+// Every autonomous model failed ("moving around rapidly", "can't judge
+// distance"). Per Kanzo's explicit ask, the camera now has real controls
+// and NEVER moves on its own: the player orbits it (mouse), zooms it
+// (wheel) and switches its follow target (C = your rigger ↔ the bell).
+// It only tracks the focus *position* (smoothly, so the subject stays in
+// frame); the angle/zoom are entirely the player's and stay put until
+// they change them. Constant world-up so distance reads normally.
 //
-// The public API (update / cinematic / setLook / cycleCinematicAngle /
-// reset) is preserved so main.ts and the spectate path are unchanged;
-// every one is a no-op around the one constant pose.
+// Public API (update / cinematic / setLook / cycleCinematicAngle / reset)
+// is preserved; control comes via setControl(), called each frame from
+// InputManager.cameraState.
 
 import * as THREE from 'three';
 
 type V3 = { x: number; y: number; z: number };
 
-const CAM_POS = new THREE.Vector3(0, 110, -300); // constant, forever
-const CAM_LOOK = new THREE.Vector3(0, 0, 0);
-const CAM_FOV = 54;
-
 export class GameCamera {
+  private yaw = 0.5;
+  private pitch = 0.32;
+  private dist = 70;
+  private follow: 'player' | 'ball' = 'player';
+  private fx = 0;   // smoothed focus (so a moving target stays framed)
+  private fy = 0;
+  private fz = 0;
+  private inited = false;
+
   constructor(private cam: THREE.PerspectiveCamera) {
-    this._apply();
-  }
-
-  private _apply(): void {
-    this.cam.position.copy(CAM_POS);
+    this.cam.fov = 55;
     this.cam.up.set(0, 1, 0);
-    this.cam.lookAt(CAM_LOOK);
-    if (Math.abs(this.cam.fov - CAM_FOV) > 0.01) {
-      this.cam.fov = CAM_FOV;
-      this.cam.updateProjectionMatrix();
-    }
+    this.cam.updateProjectionMatrix();
   }
 
-  // ── Preserved API — all are the one constant pose / no-ops ────────────────
+  /** Player camera control (from InputManager.cameraState) each frame. */
+  setControl(c: { yaw: number; pitch: number; dist: number; follow: 'player' | 'ball' }): void {
+    this.yaw = c.yaw;
+    this.pitch = c.pitch;
+    this.dist = c.dist;
+    this.follow = c.follow;
+  }
+
+  private orbit(player: V3, ball: V3, dt: number): void {
+    const f = this.follow === 'ball' ? ball : player;
+    if (!this.inited) {
+      this.fx = f.x; this.fy = f.y; this.fz = f.z;
+      this.inited = true;
+    } else {
+      // Track the focus position only — smooth, never jerky; the ANGLE is
+      // the player's and is not touched here.
+      const k = 1 - Math.exp(-6 * Math.max(1 / 240, Math.min(dt, 1 / 15)));
+      this.fx += (f.x - this.fx) * k;
+      this.fy += (f.y - this.fy) * k;
+      this.fz += (f.z - this.fz) * k;
+    }
+    const cp = Math.cos(this.pitch), sp = Math.sin(this.pitch);
+    const sy = Math.sin(this.yaw), cy = Math.cos(this.yaw);
+    this.cam.position.set(
+      this.fx + cp * sy * this.dist,
+      this.fy + sp * this.dist,
+      this.fz + cp * cy * this.dist,
+    );
+    this.cam.up.set(0, 1, 0);
+    this.cam.lookAt(this.fx, this.fy, this.fz);
+  }
+
+  // ── Preserved API ─────────────────────────────────────────────────────────
   update(
-    _bell: V3, _p1: V3, _attackX: number,
-    _loopGlow: number, _skinR: number, _dt: number,
+    bell: V3, p1: V3, _attackX: number,
+    _loopGlow: number, _skinR: number, dt: number,
   ): void {
-    this._apply();
+    this.orbit(p1, bell, dt);
   }
 
   cinematic(
-    _bell: V3,
-    _players: { id: string; p: V3; team: 'home' | 'away' }[],
-    _attackX: number, _loopGlow: number, _skinR: number, _dt: number,
+    bell: V3,
+    players: { id: string; p: V3; team: 'home' | 'away' }[],
+    _attackX: number, _loopGlow: number, _skinR: number, dt: number,
   ): void {
-    this._apply();
+    // Spectate: no human rigger — follow the bell (or first player if
+    // the user toggled to 'player').
+    const p = players[0]?.p ?? bell;
+    this.orbit(p, bell, dt);
   }
 
   setLook(_yaw: number, _pitch: number, _active: boolean): void {
-    /* the camera does not move */
+    /* superseded by setControl() */
   }
 
   cycleCinematicAngle(): void {
-    /* nothing to cycle */
+    this.follow = this.follow === 'player' ? 'ball' : 'player';
   }
 
   reset(): void {
-    this._apply();
+    this.inited = false;
   }
 }

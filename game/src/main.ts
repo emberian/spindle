@@ -218,6 +218,9 @@ async function runMatch(
   let ended = false;
   let prevLoop = false;
   let prevFire = false;
+  // SET freeze: the ball must not move until YOU act this cast.
+  let armed = false;
+  let prevHeld: string | null = null;
 
   const reArm = (): void => {
     if (match.state.winner !== null || match.state.phase === 'live') return;
@@ -296,8 +299,14 @@ async function runMatch(
   runtime?.stop();
   runtime = new GameRuntime(
     (dt) => {
+      // SET freeze — ball stands still until you act this cast.
+      const pre = sim.snapshot();
+      if (pre.bell.heldBy === 'P1' && prevHeld !== 'P1') armed = false;
+      prevHeld = pre.bell.heldBy;
+      if (input.actedThisFrame) armed = true;
+      const frozen = !armed && pre.bell.heldBy === 'P1' && match.state.winner === null;
       calm.update(dt);
-      driver.advance(dt);
+      if (!frozen) driver.advance(dt);
       const s = renderState(driver.prev as RenderView, driver.cur as RenderView, driver.alpha);
       const lg = s.loopTier === 'loop' ? 1 : s.loopTier === 'curl' ? 0.4 : 0;
       const isLoop = s.loopTier === 'loop';
@@ -315,18 +324,24 @@ async function runMatch(
       if (isLoop && !prevLoop) audio.event('loop_building');
       prevLoop = isLoop;
       const p1r = s.players.find((pp) => pp.id === 'P1');
-      const li = input.lookIntent; // gentle player view agency (Feel pass)
-      gcam.setLook(li.yaw, li.pitch, li.active);
+      gcam.setControl(input.cameraState); // player-controlled orbit
       gcam.update(s.bell.p, p1r ? p1r.p : s.bell.p, GATE_X, lg, REG.R, Math.min(dt, 1 / 30));
       hud.render(s as never, match.state as never, input.view);
       // Assisted-shot feedback: when YOU hold the bell, either show the
       // bold arc threading the ring + "SHOT READY", or "no shot — go
       // closer". The ball never moves on its own; YOU launch it.
+      // Recompute the shown solution from the RENDERED P1 every frame so the
+      // arc + "SHOT READY" are correct even during the SET freeze (when the
+      // deterministic stepOnce that sets p1Sol isn't running).
+      const dispSol =
+        s.bell.heldBy === 'P1' && p1r && match.state.winner === null
+          ? solveGateThrow(p1r.p, 'home', s.omega, 22, 0.3, p1r.v)
+          : null;
       if (s.bell.heldBy === 'P1' && match.state.winner === null) {
-        if (p1Sol) {
+        if (dispSol) {
           setCastPrompt('ready');
-          const ah = Math.max(0.02, p1Sol.flightTime / 56);
-          showArc(predictPath(s.bell.p, p1Sol.v0, s.omega, ah, 56));
+          const ah = Math.max(0.02, dispSol.flightTime / 56);
+          showArc(predictPath(p1r ? p1r.p : s.bell.p, dispSol.v0, s.omega, ah, 56));
         } else {
           setCastPrompt('noshot');
           showArc(null);
@@ -529,6 +544,7 @@ async function runWatch(
       prevLoop = isLoop;
       const atkX = match.state.possession === 'home' ? GATE_X : -GATE_X;
       const cinePlayers = s.players.map((pp) => ({ id: pp.id, p: pp.p, team: pp.team }));
+      gcam.setControl(input.cameraState);
       gcam.cinematic(s.bell.p, cinePlayers, atkX, lg, REG.R, Math.min(dt, 1 / 30));
       hud.render(s as never, match.state as never, input.view);
       // Diagnostic hook (cheap; lets a harness observe real AI progression).
@@ -724,6 +740,7 @@ async function runReplay(
       prevLoop = isLoop;
       const atkX = match.state.possession === 'home' ? GATE_X : -GATE_X;
       const cinePlayers = s.players.map((pp) => ({ id: pp.id, p: pp.p, team: pp.team }));
+      gcam.setControl(input.cameraState);
       gcam.cinematic(s.bell.p, cinePlayers, atkX, lg, REG.R, Math.min(dt, 1 / 30));
       hud.render(s as never, match.state as never, input.view);
 

@@ -51,8 +51,7 @@ const CHARGE_RATE     = 1.45;
 const THROW_SPEED_MIN =  5.0;
 const THROW_SPEED_MAX = 30.0;
 
-/** Scroll wheel → spin sensitivity. */
-const SPIN_SCROLL_K   = 0.004;
+// (scroll wheel is the camera ZOOM now — spin is A/D only)
 
 /** A/D spin ramp (units per second — frame-rate independent now). */
 const SPIN_KEY_RATE   = 2.6;
@@ -106,10 +105,19 @@ export class InputManager {
   // immobile: grapple used to be gated on !holdingBell and LMB is throw).
   private rmbPressed  = false;   // edge → fire line
   private rmbReleased = false;   // edge → release line (slingshot off)
+  private rmbDown     = false;   // held (used by actedThisFrame / freeze)
   private scrollSpin  = 0;
   private mouseDX     = 0;
   private mouseDY     = 0;
   private pointerLocked = false;
+
+  // ── Player-controlled orbit camera (Kanzo: zoom / rotate / follow) ─────────
+  // Mouse move = orbit, wheel = zoom, C = toggle follow player↔ball. The
+  // camera ONLY moves when the player moves it — never autonomously.
+  private camYaw   = 0.5;        // rad, around the focus
+  private camPitch = 0.32;       // rad, above the focus (clamped)
+  private camDist  = 70;         // m from focus (zoom)
+  private camFollow: 'player' | 'ball' = 'player';
 
   // ── Player state (set by orchestrator each frame) ─────────────────────────
   private holdingBell = false;
@@ -327,6 +335,29 @@ export class InputManager {
     return this.keys.has('KeyG');
   }
 
+  /** User-controlled orbit camera state (mouse=rotate, wheel=zoom, C=follow).
+   *  The camera only ever moves because the player moved it. */
+  get cameraState(): { yaw: number; pitch: number; dist: number; follow: 'player' | 'ball' } {
+    return { yaw: this.camYaw, pitch: this.camPitch, dist: this.camDist, follow: this.camFollow };
+  }
+
+  /** Is the player actively doing anything this frame? Used by the SET
+   *  freeze: the sim does not advance during your cast until you act. */
+  get actedThisFrame(): boolean {
+    return (
+      this.lmbDown || this.rmbDown ||
+      this.keys.has('KeyG') || this.keys.has('KeyW') || this.keys.has('KeyS') ||
+      this.keys.has('ShiftLeft') || this.keys.has('ShiftRight') ||
+      this.keys.has('Space') || this.keys.has('KeyA') || this.keys.has('KeyD')
+    );
+  }
+
+  /** Accumulate an orbit drag (yaw/pitch), clamped. */
+  private _orbit(dx: number, dy: number): void {
+    this.camYaw -= dx * 0.0045;
+    this.camPitch = Math.max(-1.30, Math.min(1.45, this.camPitch - dy * 0.0045));
+  }
+
   // ── Pointer lock ──────────────────────────────────────────────────────────
 
   /**
@@ -385,6 +416,7 @@ export class InputManager {
       if (this.pointerLocked) {
         this.mouseDX += e.movementX;
         this.mouseDY += e.movementY;
+        this._orbit(e.movementX, e.movementY); // mouse = orbit the camera
       }
     });
 
@@ -395,6 +427,7 @@ export class InputManager {
         const nx = ((e.clientX - rect.left) / rect.width)  * 2 - 1;
         const ny = ((e.clientY - rect.top)  / rect.height) * -2 + 1;
         this.aim.setFreeMouse(nx, ny);
+        this._orbit(e.movementX, e.movementY); // mouse = orbit the camera
       }
     });
 
@@ -404,6 +437,7 @@ export class InputManager {
         this.lmbDown    = true;
       } else if (e.button === 2) {
         this.rmbPressed = true;
+        this.rmbDown    = true;
       }
       // Any deliberate click acquires pointer-lock (idempotent, sole
       // requester). Free-mouse aim is used until lock engages so nothing
@@ -423,25 +457,28 @@ export class InputManager {
         this.lmbReleased = true;
       } else if (e.button === 2) {
         this.rmbReleased = true;
+        this.rmbDown     = false;
       }
     });
 
-    // ── Scroll → throwSpin ────────────────────────────────────────────────
+    // ── Scroll → camera ZOOM ──────────────────────────────────────────────
     on(this.canvas, 'wheel', (e: WheelEvent) => {
       e.preventDefault();
-      this.scrollSpin = Math.max(-1, Math.min(1,
-        this.scrollSpin + e.deltaY * SPIN_SCROLL_K,
-      ));
+      this.camDist = Math.max(16, Math.min(240, this.camDist + e.deltaY * 0.06));
     }, { passive: false });
 
     // ── Keyboard ─────────────────────────────────────────────────────────
     // Only call preventDefault for game keys — don't swallow browser shortcuts.
     const GAME_KEYS = new Set([
-      'KeyW','KeyA','KeyS','KeyD','KeyG',
+      'KeyW','KeyA','KeyS','KeyD','KeyG','KeyC',
       'ArrowUp','ArrowDown','ArrowLeft','ArrowRight',
       'ShiftLeft','ShiftRight','Space',
     ]);
     on(window, 'keydown', (e: KeyboardEvent) => {
+      // C toggles camera follow target (player ↔ ball), on the press edge.
+      if (e.code === 'KeyC' && !this.keys.has('KeyC')) {
+        this.camFollow = this.camFollow === 'player' ? 'ball' : 'player';
+      }
       this.keys.add(e.code);
       if (GAME_KEYS.has(e.code)) e.preventDefault();
     });
