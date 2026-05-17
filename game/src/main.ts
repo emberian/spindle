@@ -23,7 +23,6 @@ import { SpectateControls } from './ui/SpectateControls';
 import { ReplayScreen } from './ui/ReplayScreen';
 import { ReplayRecorder, ReplayStore, type ReplayData } from './league/Replay';
 import { solveGateThrow, type GateSolution } from './ai/decide/GateSolve';
-import { planGrapple } from './ai/nav/GrapplePlanner';
 import { predictPath } from './sim/trajectory';
 import { InputManager } from './input/InputManager';
 import { AiSystem, type TeamConfig } from './ai/index';
@@ -268,15 +267,24 @@ async function runMatch(
     const drive = (md.x !== 0 || md.z !== 0);
     if (p1 && (drive || input.wantsAssistGrapple)) {
       const dir = drive ? md : { x: 1, y: 0, z: 0 }; // G ⇒ toward +x ring
-      const tgt = {
-        x: Math.max(-300, Math.min(300, p1.p.x + dir.x * 130)),
-        y: p1.p.y + dir.y * 90,
-        z: p1.p.z + dir.z * 90,
-      };
-      const plan = planGrapple(p1 as never, tgt, snap as never);
-      if (plan) {
-        if (!p1.line) p1in.fireLineAt = plan.anchorPos;
-        p1in.reel = plan.reel;
+      // Fire at the best VISIBLE spar in your heading and reel toward it —
+      // so the line goes to a structure you can SEE and the movement reads
+      // as real physics (the AI planner anchored to the invisible centre
+      // axis, which is why the line "always went to the centerpoint").
+      let best: { x: number; y: number; z: number } | null = null;
+      let bestScore = -Infinity;
+      for (const sp of SPARS) {
+        const vx = sp.x - p1.p.x, vy = sp.y - p1.p.y, vz = sp.z - p1.p.z;
+        const d = Math.hypot(vx, vy, vz);
+        if (d < 7 || d > 150) continue;
+        const align = (vx * dir.x + vy * dir.y + vz * dir.z) / d; // −1..1
+        if (align < 0.1) continue;                 // must be ~in our heading
+        const score = align - Math.abs(d - 55) * 0.004; // prefer ~55 m & aligned
+        if (score > bestScore) { bestScore = score; best = sp; }
+      }
+      if (best) {
+        if (!p1.line) p1in.fireLineAt = { x: best.x, y: best.y, z: best.z };
+        p1in.reel = -1; // haul in toward the spar → you move that way
       }
     }
     const aiFrame = ai.tick(snap, match.state as never, cfgs, gameSeed);
