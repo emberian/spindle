@@ -4,7 +4,8 @@
 
 import * as THREE from 'three';
 import { GameRuntime } from './core/GameRuntime';
-import { SIM_H } from './core/FixedStepDriver';
+import { FixedStepDriver, SIM_H } from './core/FixedStepDriver';
+import { renderState, type RenderView } from './render/RenderState';
 import { Calm } from './render/Calm';
 import { BellTrail, bellGlow } from './render/BellTrail';
 import { PostFX } from './render/PostFX';
@@ -144,7 +145,6 @@ async function runMatch(
     shownOnboarding = true;
     onboarding.show();
   }
-  let acc = 0;
   let ended = false;
   let prevLoop = false;
   let prevFire = false;
@@ -156,44 +156,46 @@ async function runMatch(
     match.resumeLive();
   };
 
+  // One deterministic sim tick: exactly the prior per-tick body. The driver
+  // calls this once per fixed 1/240 s tick; renderState() never feeds back in.
+  const stepOnce = (): void => {
+    if (match.state.winner !== null) return;
+    const snap = sim.snapshot();
+    const p1 = snap.players.find((p) => p.id === 'P1');
+    if (p1) input.setPlayerState(p1.p, p1.v, snap.bell.heldBy === 'P1');
+    const p1in = input.get(SIM_H);
+    const aiFrame = ai.tick(snap, match.state as never, cfgs, gameSeed);
+    const frame: InputFrame = { tick: snap.tick, players: [p1in, ...aiFrame.players] };
+    rec.push(frame);
+    const evs = sim.step(frame);
+    const upd = match.consume(evs, sim.snapshot() as never);
+    // Soul: drive the one-shot audio off real events.
+    for (const e of evs) {
+      if (e.type === 'bell_caught') audio.event('catch');
+      else if (e.type === 'bell_clatter' || e.type === 'bell_bobble') audio.event('clatter');
+    }
+    if (p1in.throwReleased) audio.event('throw');
+    if (!!p1in.fireLineAt && !prevFire) audio.event('grapple');
+    prevFire = !!p1in.fireLineAt;
+    if (upd && upd.scored) {
+      const k = upd.scored.kind;
+      audio.event(
+        k === 'loop' ? 'score_loop' : k === 'rise' || k === 'curl' ? 'score_rise'
+          : k === 'ground' ? 'score_ground' : 'score_fall',
+      );
+    } else if (upd && upd.turnover) {
+      audio.event('turnover');
+    }
+    reArm();
+  };
+  const driver = new FixedStepDriver(stepOnce, () => sim.snapshot());
+
   runtime?.stop();
   runtime = new GameRuntime(
     (dt) => {
       calm.update(dt);
-      acc += dt;
-      let steps = 0;
-      while (acc >= SIM_H && steps < 8 && match.state.winner === null) {
-        const snap = sim.snapshot();
-        const p1 = snap.players.find((p) => p.id === 'P1');
-        if (p1) input.setPlayerState(p1.p, p1.v, snap.bell.heldBy === 'P1');
-        const p1in = input.get(SIM_H);
-        const aiFrame = ai.tick(snap, match.state as never, cfgs, gameSeed);
-        const frame: InputFrame = { tick: snap.tick, players: [p1in, ...aiFrame.players] };
-        rec.push(frame);
-        const evs = sim.step(frame);
-        const upd = match.consume(evs, sim.snapshot() as never);
-        // Soul: drive the one-shot audio off real events.
-        for (const e of evs) {
-          if (e.type === 'bell_caught') audio.event('catch');
-          else if (e.type === 'bell_clatter' || e.type === 'bell_bobble') audio.event('clatter');
-        }
-        if (p1in.throwReleased) audio.event('throw');
-        if (!!p1in.fireLineAt && !prevFire) audio.event('grapple');
-        prevFire = !!p1in.fireLineAt;
-        if (upd && upd.scored) {
-          const k = upd.scored.kind;
-          audio.event(
-            k === 'loop' ? 'score_loop' : k === 'rise' || k === 'curl' ? 'score_rise'
-              : k === 'ground' ? 'score_ground' : 'score_fall',
-          );
-        } else if (upd && upd.turnover) {
-          audio.event('turnover');
-        }
-        reArm();
-        acc -= SIM_H;
-        steps++;
-      }
-      const s = sim.snapshot();
+      driver.advance(dt);
+      const s = renderState(driver.prev as RenderView, driver.cur as RenderView, driver.alpha);
       const lg = s.loopTier === 'loop' ? 1 : s.loopTier === 'curl' ? 0.4 : 0;
       const isLoop = s.loopTier === 'loop';
       bellMesh.position.set(s.bell.p.x, s.bell.p.y, s.bell.p.z);
@@ -332,7 +334,6 @@ async function runWatch(
   trail.clear();
   gcam.reset();
   ai.reset();
-  let acc = 0;
   let ended = false;
   let prevLoop = false;
 
@@ -343,38 +344,39 @@ async function runWatch(
     match.resumeLive();
   };
 
+  // One deterministic sim tick (AI-only): exactly the prior per-tick body.
+  const stepOnce = (): void => {
+    if (match.state.winner !== null) return;
+    const snap = sim.snapshot();
+    const aiFrame = ai.tick(snap, match.state as never, cfgs, gameSeed);
+    const frame: InputFrame = { tick: snap.tick, players: aiFrame.players };
+    rec.push(frame);
+    const evs = sim.step(frame);
+    const upd = match.consume(evs, sim.snapshot() as never);
+    for (const e of evs) {
+      if (e.type === 'bell_caught') audio.event('catch');
+      else if (e.type === 'bell_clatter' || e.type === 'bell_bobble') audio.event('clatter');
+    }
+    if (upd && upd.scored) {
+      const kd = upd.scored.kind;
+      audio.event(
+        kd === 'loop' ? 'score_loop' : kd === 'rise' || kd === 'curl' ? 'score_rise'
+          : kd === 'ground' ? 'score_ground' : 'score_fall',
+      );
+    } else if (upd && upd.turnover) {
+      audio.event('turnover');
+    }
+    reArm();
+  };
+  const driver = new FixedStepDriver(stepOnce, () => sim.snapshot());
+
   runtime?.stop();
   watching = true;
   runtime = new GameRuntime(
     (dt) => {
       calm.update(dt);
-      acc += dt;
-      let steps = 0;
-      while (acc >= SIM_H && steps < 64 && match.state.winner === null) {
-        const snap = sim.snapshot();
-        const aiFrame = ai.tick(snap, match.state as never, cfgs, gameSeed);
-        const frame: InputFrame = { tick: snap.tick, players: aiFrame.players };
-        rec.push(frame);
-        const evs = sim.step(frame);
-        const upd = match.consume(evs, sim.snapshot() as never);
-        for (const e of evs) {
-          if (e.type === 'bell_caught') audio.event('catch');
-          else if (e.type === 'bell_clatter' || e.type === 'bell_bobble') audio.event('clatter');
-        }
-        if (upd && upd.scored) {
-          const kd = upd.scored.kind;
-          audio.event(
-            kd === 'loop' ? 'score_loop' : kd === 'rise' || kd === 'curl' ? 'score_rise'
-              : kd === 'ground' ? 'score_ground' : 'score_fall',
-          );
-        } else if (upd && upd.turnover) {
-          audio.event('turnover');
-        }
-        reArm();
-        acc -= SIM_H;
-        steps++;
-      }
-      const s = sim.snapshot();
+      driver.advance(dt);
+      const s = renderState(driver.prev as RenderView, driver.cur as RenderView, driver.alpha);
       const lg = s.loopTier === 'loop' ? 1 : s.loopTier === 'curl' ? 0.4 : 0;
       const isLoop = s.loopTier === 'loop';
       bellMesh.position.set(s.bell.p.x, s.bell.p.y, s.bell.p.z);
@@ -521,7 +523,6 @@ async function runReplay(
   match.consume([{ type: 'foul_garrote', by: '__start__' }], sim.snapshot());
   trail.clear();
   gcam.reset();
-  let acc = 0;
   let fi = 0;
   let ended = false;
   let prevLoop = false;
@@ -540,34 +541,36 @@ async function runReplay(
     onEnd();
   };
 
+  // One deterministic sim tick (replay frame playback): exactly the prior
+  // per-tick body, with the frame-exhaustion / winner guards as early-returns.
+  const stepOnce = (): void => {
+    if (match.state.winner !== null || fi >= data.frames.length) return;
+    const frame = data.frames[fi++];
+    const evs = sim.step(frame);
+    const upd = match.consume(evs, sim.snapshot() as never);
+    for (const e of evs) {
+      if (e.type === 'bell_caught') audio.event('catch');
+      else if (e.type === 'bell_clatter' || e.type === 'bell_bobble') audio.event('clatter');
+    }
+    if (upd && upd.scored) {
+      const kd = upd.scored.kind;
+      audio.event(
+        kd === 'loop' ? 'score_loop' : kd === 'rise' || kd === 'curl' ? 'score_rise'
+          : kd === 'ground' ? 'score_ground' : 'score_fall',
+      );
+    } else if (upd && upd.turnover) {
+      audio.event('turnover');
+    }
+    reArm();
+  };
+  const driver = new FixedStepDriver(stepOnce, () => sim.snapshot());
+
   runtime?.stop();
   runtime = new GameRuntime(
     (dt) => {
       calm.update(dt);
-      acc += dt;
-      let steps = 0;
-      while (acc >= SIM_H && steps < 64 && match.state.winner === null && fi < data.frames.length) {
-        const frame = data.frames[fi++];
-        const evs = sim.step(frame);
-        const upd = match.consume(evs, sim.snapshot() as never);
-        for (const e of evs) {
-          if (e.type === 'bell_caught') audio.event('catch');
-          else if (e.type === 'bell_clatter' || e.type === 'bell_bobble') audio.event('clatter');
-        }
-        if (upd && upd.scored) {
-          const kd = upd.scored.kind;
-          audio.event(
-            kd === 'loop' ? 'score_loop' : kd === 'rise' || kd === 'curl' ? 'score_rise'
-              : kd === 'ground' ? 'score_ground' : 'score_fall',
-          );
-        } else if (upd && upd.turnover) {
-          audio.event('turnover');
-        }
-        reArm();
-        acc -= SIM_H;
-        steps++;
-      }
-      const s = sim.snapshot();
+      driver.advance(dt);
+      const s = renderState(driver.prev as RenderView, driver.cur as RenderView, driver.alpha);
       const lg = s.loopTier === 'loop' ? 1 : s.loopTier === 'curl' ? 0.4 : 0;
       const isLoop = s.loopTier === 'loop';
       bellMesh.position.set(s.bell.p.x, s.bell.p.y, s.bell.p.z);

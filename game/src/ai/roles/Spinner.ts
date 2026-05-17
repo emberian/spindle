@@ -25,6 +25,19 @@ export interface SpinnerIntent {
   isLoopSetter: boolean;
 }
 
+/** Stable per-commitment style draws (C2). When supplied by RiggerAI's
+ *  commitment cache the policy uses deterministic functions of these instead
+ *  of fresh inline rng() each Director window (which made the committed nav
+ *  target snap ~8×/s). When ABSENT (direct callers like spinnerNavigate and
+ *  the ai.test.ts planner tests) the policy falls back to the CURRENT inline
+ *  rng() behavior so those paths stay byte-identical. */
+export interface RoleStyle {
+  /** [0,1) stable replacement for the angle rng() draw. */
+  angle: number;
+  /** [0,1) stable replacement for the radius rng() draw. */
+  radius: number;
+}
+
 /**
  * Spinner decision policy.
  * Spinners alternate between midfield holding and aggressive line-setting.
@@ -36,7 +49,11 @@ export function spinnerPolicy(
   profile: TeamProfile,
   isLoopSetter: boolean,
   rng: () => number,
+  style?: RoleStyle,
 ): SpinnerIntent {
+  // Stable draws when committed (C2); inline rng() fallback otherwise.
+  const sAngle = () => (style ? style.angle : rng());
+  const sRadius = () => (style ? style.radius : rng());
   const bell = state.bell;
   const possession = match.possession === player.team;
   // ORIENTATION-CORRECT: advance toward the ring THIS team attacks.
@@ -48,7 +65,7 @@ export function spinnerPolicy(
       // Loop-setter: position near axis, ready to launch the loop.
       // Optimal position: mid-field, high (close to axis), with angle.
       const loopX = 0 + (rng() - 0.5) * 60;
-      const angle = Math.PI * (0.1 + rng() * 0.15);
+      const angle = Math.PI * (0.1 + sAngle() * 0.15);
       const targetY = SPINNER_HIGH_RADIUS * Math.cos(angle);
       const targetZ = SPINNER_HIGH_RADIUS * Math.sin(angle);
       return {
@@ -60,8 +77,8 @@ export function spinnerPolicy(
 
     // Normal offense: bridge AHEAD of self toward OUR attacking ring.
     const midX = player.p.x + sgn * 40 * (0.6 + profile.aggression);
-    const angle = Math.PI * (0.3 + rng() * 0.25);
-    const r = SPINNER_TARGET_RADIUS * (0.8 + rng() * 0.4);
+    const angle = Math.PI * (0.3 + sAngle() * 0.25);
+    const r = SPINNER_TARGET_RADIUS * (0.8 + sRadius() * 0.4);
     return {
       targetPos: { x: midX, y: r * Math.cos(angle), z: r * Math.sin(angle) },
       intent: 'midfield',

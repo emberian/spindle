@@ -21,13 +21,23 @@ export interface FaithwingIntent {
   intent: 'faith-attack' | 'receive' | 'shadow-freewing';
 }
 
+/** Stable per-commitment style draws (C2). Supplied → deterministic angle;
+ *  absent → CURRENT inline rng() behavior (byte-identical for direct callers
+ *  like faithwingNavigate and the planner tests). */
+export interface RoleStyle {
+  angle: number;
+  radius: number;
+}
+
 export function faithwingPolicy(
   player: PlayerSim,
   state: SimState,
   match: MatchState,
   profile: TeamProfile,
   rng: () => number,
+  style?: RoleStyle,
 ): FaithwingIntent {
+  const sAngle = () => (style ? style.angle : rng());
   const bell = state.bell;
   const possession = match.possession === player.team;
   // ORIENTATION-CORRECT: attack/defend rings relative to THIS team.
@@ -40,7 +50,7 @@ export function faithwingPolicy(
     if (bellDistToFaith < REG.L * 0.3) {
       // Attack mode: sprint into position to receive a scoring pass.
       const attackX = faithX + (faithX > 0 ? -15 : 15);
-      const angle = Math.PI * 0.35 * (rng() * 0.4 + 0.8);
+      const angle = Math.PI * 0.35 * (sAngle() * 0.4 + 0.8);
       return {
         targetPos: {
           x: attackX,
@@ -53,7 +63,7 @@ export function faithwingPolicy(
 
     // Midfield receiving position, biased toward the Faith side.
     const midX = bell.p.x + (faithX > 0 ? 50 * profile.aggression : -50 * profile.aggression);
-    const angle = Math.PI * (0.25 + rng() * 0.2);
+    const angle = Math.PI * (0.25 + sAngle() * 0.2);
     return {
       targetPos: { x: midX, y: FAITHWING_RADIUS * Math.cos(angle), z: FAITHWING_RADIUS * Math.sin(angle) },
       intent: 'receive',

@@ -43,6 +43,21 @@ import { attackSign, attackRingX, defendRingX, forwardProgress } from './Orienta
 
 export type Difficulty = 'rookie' | 'pro' | 'legend';
 
+// ── C3: athletic micro-control (deterministic geometry, ZERO rng) ─────────────
+// Within this radius of the committed target the player stops gross grappling
+// (planGrapple itself no-ops < 3 m) and uses the thrumbler to fine-settle:
+// close the residual gap + brake residual velocity. Above the grapple no-op so
+// the two never fight.
+const SETTLE_RADIUS = 6; // m
+// Conservative cap on the per-tick thrumbler delta-v magnitude. The sim
+// additionally caps thrumbler by the player's dvBudget, so this is a soft
+// athletic-feel knob the orchestrator can retune (or zero) if the physics
+// softening shifts the progression gate.
+const MICRO_DV_MAX = 2.0; // m/s
+// Cos of the max angle between (target − contact-normal-opposite) for a
+// pushoff to count as "initiating a swing roughly away from the surface".
+const PUSHOFF_ALIGN_COS = 0.35; // ~70° cone
+
 export interface DifficultyScaling {
   /** Mean committed reaction latency in Director-windows before acting on a
    *  new situation. Modeled as a *commitment* lag, not per-tick coin flips. */
@@ -105,6 +120,21 @@ export interface PlayerCommit {
   sawHadBell: boolean;
   /** Reaction gate: ticks remaining before we ACT on a freshly-seen change. */
   reactGateUntilTick: number;
+  /** C1 — last grapple anchor we committed to (for nav-anchor hysteresis).
+   *  Threaded into planGrapple's `sticky` param and rewritten each tick from
+   *  the chosen plan, so two near-equal anchors no longer flip frame-to-frame. */
+  lastAnchorPos: Vec3 | null;
+  lastAnchorReel: -1 | 0;
+  /** C2 — stable per-commitment style draws (angle + radius), drawn ONCE from
+   *  rng on the first decision and only re-drawn on a genuine role/job change.
+   *  Threaded into the role policies so a committed nav target stops snapping
+   *  ~8×/s as policies redrew fresh rng() every Director window. */
+  styleAngle: number;
+  styleRadius: number;
+  /** Snapshot of role/job for style-redraw detection (same pattern as
+   *  sawHeldBy). */
+  sawRole: string | null;
+  sawJob: string | null;
 }
 
 export interface PlayerCommitCache {
@@ -218,6 +248,12 @@ export function computePlayerInput(
         sawContest: match.contest !== null,
         sawHadBell: state.bell.heldBy === player.id,
         reactGateUntilTick: 0,
+        lastAnchorPos: null,
+        lastAnchorReel: -1,
+        styleAngle: 0,
+        styleRadius: 0,
+        sawRole: null,
+        sawJob: null,
       };
     }
 
@@ -260,6 +296,23 @@ export function computePlayerInput(
         radiusSlot: 0.45,
       };
 
+      // C2 — Commit role jitter ONCE. The role policies (roles/*.ts) draw a
+      // fresh rng() for their target angle/radius every Director window, so a
+      // committed nav target snapped ~8×/s. Draw a stable styleAngle/Radius
+      // ONCE on the first decision, and only re-draw on a GENUINE role/job
+      // change (detected via sawRole/sawJob, same pattern as sawHeldBy). The
+      // role policies consume these via an OPTIONAL param; absent → they fall
+      // back to inline rng() so direct callers / planner tests are unaffected.
+      if (
+        commit.sawRole !== player.role ||
+        commit.sawJob !== assignment.job
+      ) {
+        commit.styleAngle = rng();
+        commit.styleRadius = rng();
+        commit.sawRole = player.role;
+        commit.sawJob = assignment.job;
+      }
+
       if (state.bell.heldBy === player.id) {
         decideThrow(player, state, match, profile, director, scaling, commit, rng);
       } else {
@@ -278,6 +331,7 @@ export function computePlayerInput(
         assignment,
         scaling,
         rng,
+        { angle: commit.styleAngle, radius: commit.styleRadius },
       );
 
       // Skill-scaled receiver mistiming: a stable per-window positioning
@@ -345,8 +399,16 @@ export function computePlayerInput(
   const target = commit.navTarget
     ? vadd(commit.navTarget, commit.catchOffset)
     : player.p;
-  const partial = navigateTo(player, state, target);
+  const partial = navigateTo(player, state, target, commit);
   const navAim = vnorm(vadd(partial.aim ?? v3(1, 0, 0), commit.aimDither));
+
+  // C3 — athletic micro-control (pure geometry, no rng):
+  //  • pushoff to INITIATE a swing when solidly in contact and the target is
+  //    roughly along the surface's push direction;
+  //  • thrumbler to FINE-SETTLE within SETTLE_RADIUS (above planGrapple's 3 m
+  //    no-op, so they don't fight).
+  const pushoff = shouldPushoff(player, target);
+  const thrumbler = settleThrumbler(player, target);
 
   return {
     id: player.id,
@@ -354,11 +416,11 @@ export function computePlayerInput(
     fireLineAt: partial.fireLineAt ?? null,
     reel: partial.reel ?? 0,
     release: partial.release ?? false,
-    pushoff: partial.pushoff ?? false,
+    pushoff: (partial.pushoff ?? false) || pushoff,
     throwCharge: 0,
     throwReleased: false,
     throwSpin: 0,
-    thrumbler: partial.thrumbler ?? v3(),
+    thrumbler,
   };
 }
 
@@ -367,6 +429,14 @@ export function computePlayerInput(
  * they want to be; the Director assignment overrides job-level intent so the
  * team coordinates (carrier lane, receiver depth slots, marks, recovery).
  */
+/** Stable per-commitment style draws (C2). Optional everywhere so that direct
+ *  role-policy callers (spinnerNavigate, the ai.test.ts planner tests) keep
+ *  their CURRENT inline rng() behavior byte-for-byte. */
+export interface RoleStyle {
+  angle: number;
+  radius: number;
+}
+
 function decideNavTarget(
   player: PlayerSim,
   state: SimState,
@@ -376,6 +446,7 @@ function decideNavTarget(
   assignment: PlayerAssignment,
   _scaling: DifficultyScaling,
   rng: () => number,
+  style?: RoleStyle,
 ): Vec3 {
   // ROBUSTNESS: loose-bell recoverer always pursues the bell directly (lead
   // the bell slightly so the swing arrives where it's going).
@@ -432,7 +503,7 @@ function decideNavTarget(
 
   // Otherwise defer to the role policy for positional craft, but feed it the
   // Director assignment so receivers spread to distinct depth/radius slots.
-  return roleTarget(player, state, match, profile, director, assignment, rng);
+  return roleTarget(player, state, match, profile, director, assignment, rng, style);
 }
 
 /** Role-shaped target, modulated by the Director's depth/radius slot. */
@@ -444,6 +515,7 @@ function roleTarget(
   director: DirectorState,
   assignment: PlayerAssignment,
   rng: () => number,
+  style?: RoleStyle,
 ): Vec3 {
   // Use the role POLICY (the role's intended destination), not the grapple
   // anchor. This keeps each role's positional craft + profile-driven style
@@ -452,23 +524,23 @@ function roleTarget(
   let base: Vec3;
   switch (player.role) {
     case 'anchor':
-      base = { ...anchorPolicy(player, state, match, profile, rng).targetPos };
+      base = { ...anchorPolicy(player, state, match, profile, rng, style).targetPos };
       break;
     case 'spinner': {
       const isLoopSetter = director.loopSetterId === player.id;
       base = {
-        ...spinnerPolicy(player, state, match, profile, isLoopSetter, rng).targetPos,
+        ...spinnerPolicy(player, state, match, profile, isLoopSetter, rng, style).targetPos,
       };
       break;
     }
     case 'faithwing':
-      base = { ...faithwingPolicy(player, state, match, profile, rng).targetPos };
+      base = { ...faithwingPolicy(player, state, match, profile, rng, style).targetPos };
       break;
     case 'freewing':
-      base = { ...freewingPolicy(player, state, match, profile, rng).targetPos };
+      base = { ...freewingPolicy(player, state, match, profile, rng, style).targetPos };
       break;
     case 'reach':
-      base = { ...reachPolicy(player, state, match, profile, rng).targetPos };
+      base = { ...reachPolicy(player, state, match, profile, rng, style).targetPos };
       break;
     default:
       base = { ...player.p };
@@ -503,16 +575,95 @@ function roleTarget(
   return base;
 }
 
-/** Run the grappler toward a committed target (executed every tick). */
+/**
+ * C3 — pure-geometry pushoff test (NO rng). A pushoff is worthwhile when the
+ * player is in solid contact AND the committed target lies roughly in the
+ * direction the surface would propel them:
+ *   - grounded (skin contact): the surface normal points INWARD (toward the
+ *     spin axis), so a pushoff drives the player toward the axis.
+ *   - contactRef set (spar/ring/player): treat the spin-axis-radial OUTWARD
+ *     direction as the push direction (clipped to a spar on the axis, you
+ *     shove off it outward).
+ * Returns true only when the unit vector toward the target aligns with that
+ * push direction within the PUSHOFF_ALIGN_COS cone — i.e. a pushoff actually
+ * initiates the swing we want, not a wasted shove.
+ */
+function shouldPushoff(player: PlayerSim, target: Vec3): boolean {
+  const inContact = player.contactRef !== null || player.grounded;
+  if (!inContact) return false;
+
+  const r = Math.sqrt(player.p.y * player.p.y + player.p.z * player.p.z);
+  if (r < 1e-6) return false; // on the axis — radial direction undefined
+  const radialOut: Vec3 = { x: 0, y: player.p.y / r, z: player.p.z / r };
+  // Skin contact → push inward; spar/ring/player contact → push outward.
+  const pushDir = player.grounded
+    ? vscale(radialOut, -1)
+    : radialOut;
+
+  const toTarget = vsub(target, player.p);
+  const len = vlen(toTarget);
+  if (len < 1e-6) return false;
+  const align = vdot(vscale(toTarget, 1 / len), pushDir);
+  return align > PUSHOFF_ALIGN_COS;
+}
+
+/**
+ * C3 — fine-settle thrumbler (NO rng). When within SETTLE_RADIUS of the
+ * committed target, request a small delta-v that (a) closes the residual gap
+ * and (b) brakes residual velocity, so the rigger settles instead of
+ * over/under-shooting on grapple alone. Magnitude is clamped to MICRO_DV_MAX
+ * (the sim further clamps by dvBudget). Outside SETTLE_RADIUS returns zero so
+ * it never fights the gross grapple swing.
+ */
+function settleThrumbler(player: PlayerSim, target: Vec3): Vec3 {
+  const toTarget = vsub(target, player.p);
+  const dist = vlen(toTarget);
+  if (dist > SETTLE_RADIUS || dist < 1e-6) return v3();
+  // Approach term: stronger the further out within the band, eased near 0.
+  const approach = vscale(toTarget, 1 / dist); // unit toward target
+  const approachMag = Math.min(MICRO_DV_MAX, dist * 0.5);
+  // Braking term: oppose current velocity so we don't sail through.
+  const speed = vlen(player.v);
+  const brake =
+    speed > 1e-6 ? vscale(player.v, -Math.min(MICRO_DV_MAX, speed) / speed) : v3();
+  // Blend: closer in, weight braking more so it settles rather than orbits.
+  const closeness = 1 - dist / SETTLE_RADIUS; // 0 at edge → 1 at target
+  const dv = vadd(
+    vscale(approach, approachMag * (1 - 0.5 * closeness)),
+    vscale(brake, MICRO_DV_MAX * 0.6 * closeness),
+  );
+  // Hard clamp the combined request to MICRO_DV_MAX.
+  const m = vlen(dv);
+  return m > MICRO_DV_MAX ? vscale(dv, MICRO_DV_MAX / m) : dv;
+}
+
+/** Run the grappler toward a committed target (executed every tick).
+ *  C1: threads the previously-committed anchor in as planGrapple's `sticky`
+ *  arg so two near-equal anchors no longer flip frame-to-frame, and writes
+ *  the chosen anchor back into the commit. Pure replay of injected state —
+ *  NO rng, determinism-safe. */
 function navigateTo(
   player: PlayerSim,
   state: SimState,
   target: Vec3,
+  commit: PlayerCommit,
 ): Partial<PlayerInput> {
   // planToInput is the frozen bridge; planGrapple is invoked by role nav but
   // here we need a direct plan to the committed point.
   // Re-use the planner via a tiny shim role-agnostic call.
-  const plan = planGrapple(player, target, state);
+  const sticky =
+    commit.lastAnchorPos !== null
+      ? { pos: commit.lastAnchorPos, reel: commit.lastAnchorReel }
+      : null;
+  const plan = planGrapple(player, target, state, true, sticky);
+  if (plan) {
+    commit.lastAnchorPos = plan.anchorPos;
+    commit.lastAnchorReel = plan.reel;
+  } else {
+    // No grapple needed (already at target): clear so a stale anchor doesn't
+    // get re-pinned next time we DO need to swing.
+    commit.lastAnchorPos = null;
+  }
   const aim = plan ? vnorm(vsub(plan.anchorPos, player.p)) : v3(1, 0, 0);
   return planToInput(plan, aim);
 }

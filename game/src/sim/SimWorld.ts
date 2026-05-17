@@ -5,7 +5,7 @@
 import type { Vec3 } from './vec';
 import { vadd, vsub, vlen, vscale, vnorm } from './vec';
 import type { InputFrame, PlayerInput, SimState, SimEvent } from './types';
-import { REG, GATE_X } from './RegConstants';
+import { REG, GATE_X, FEEL } from './RegConstants';
 import { stepBell, chime, type BellBody } from './Bell';
 import { skinBounce, tryCatch, applyBobble, contestClatter } from './Collision';
 import { stepPlayer, pushOff, thrumbler, type PlayerBody, makePlayer } from './Player';
@@ -122,8 +122,28 @@ export class SimWorld {
     if (this.bellHeldBy) {
       const holder = this.find(this.bellHeldBy);
       if (holder) {
-        this.bell.p = { ...holder.body.p };
-        this.bell.v = { ...holder.body.v };
+        // Held bell follows the holder's hand via a stiff spring (continuous
+        // tracking, no raw p/v copy). Unit mass; semi-implicit Euler
+        // (ω_n·h ≈ 0.118 ≪ 2 ⇒ stable, tight). The throw/release velocity
+        // math in applyInput is unchanged — it reads the PLAYER's v.
+        const hp = holder.body.p;
+        const hv = holder.body.v;
+        const dx = this.bell.p.x - hp.x;
+        const dy = this.bell.p.y - hp.y;
+        const dz = this.bell.p.z - hp.z;
+        const fx = -FEEL.HOLD_K * dx - FEEL.HOLD_C * (this.bell.v.x - hv.x);
+        const fy = -FEEL.HOLD_K * dy - FEEL.HOLD_C * (this.bell.v.y - hv.y);
+        const fz = -FEEL.HOLD_K * dz - FEEL.HOLD_C * (this.bell.v.z - hv.z);
+        this.bell.v = {
+          x: this.bell.v.x + fx * h,
+          y: this.bell.v.y + fy * h,
+          z: this.bell.v.z + fz * h,
+        };
+        this.bell.p = {
+          x: this.bell.p.x + this.bell.v.x * h,
+          y: this.bell.p.y + this.bell.v.y * h,
+          z: this.bell.p.z + this.bell.v.z * h,
+        };
       }
     } else {
       const prevX = this.bell.p.x;

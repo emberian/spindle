@@ -1,15 +1,21 @@
-//! Rig-line impulse constraint — port of TS sim/Grapple.ts.
+//! Rig-line spring-damper constraint — port of TS sim/Grapple.ts.
 //!
-//! Three states per frame:
-//!   • slack  (len < rest_len): no force — free ballistic swing within radius
-//!   • taut   (len ≥ rest_len): cancel only the separating radial relative
-//!              velocity via impulse; equal-and-opposite on a player anchor
-//!              ⇒ momentum-conserving slingshot, no special case.
-//!   • reel   : shrink/grow rest_len; conserve angular momentum about the
-//!              anchor (L = v_t · r) ⇒ tangential speed rises on reel-in —
-//!              the emergent slingshot, not scripted.
+//! Continuous (Fluidity Spike) model. The rope is a one-sided radial
+//! spring-damper — TENSION ONLY, it never pushes inward when slack:
+//!   • deep slack  (stretch ≤ −SLACK_BAND): no force — true free swing.
+//!   • slack band  (−SLACK_BAND < stretch ≤ 0): a gentle pre-tension spring
+//!              eases the line into tautness instead of snapping.
+//!   • taut        (stretch > 0): F = −LINE_K·stretch − LINE_C·v_radial,
+//!              clamped so it can only pull toward the anchor.
+//! The reel ONLY eases `rest_len` toward the target — it never sets position
+//! and never rescales tangential velocity. The angular-momentum slingshot is
+//! therefore fully EMERGENT from the spring + free-flight integration.
+//!
+//! Semi-implicit (symplectic) Euler: velocities are updated from the spring
+//! force this step (ω_n·h ≈ 0.018 ≪ 2 ⇒ unconditionally stable here).
 
 use crate::math::Vec3;
+use crate::tuning::{LINE_C, LINE_K, LINE_SLACK_BAND, LINE_SLACK_K};
 
 // ── public constants ──────────────────────────────────────────────────────────
 
@@ -46,7 +52,7 @@ pub struct Line {
 ///
 /// * `player` — the body attached to this end of the line.
 /// * `line`   — mutable line state (rest_len, taut).
-/// * `anchor` — `Some(b)` for a player↔player line (impulse applied to `b`
+/// * `anchor` — `Some(b)` for a player↔player line (force applied to `b`
 ///              equal-and-opposite); `None` for a static world anchor at
 ///              `line.anchor_pos` (infinite mass, zero velocity).
 /// * `reel`   — `−1` reel in, `0` hold, `+1` reel out.
@@ -72,72 +78,51 @@ pub fn resolve_line(
     }
     let n = d.scale(1.0 / len); // unit vector, anchor → player
 
-    // ── Reel: adjust rest_len, conserving angular momentum about the anchor ──
+    // ── Reel: ONLY ease rest_len toward the target. No position set, no
+    //    velocity rescale — the slingshot must emerge from the spring. ──
     if reel != 0 {
         let target = (line.rest_len + reel as f64 * REEL_RATE * h)
             .max(TETHER_MIN)
             .min(TETHER_MAX);
-
-        if (target - line.rest_len).abs() > f64::EPSILON {
-            let rel_v = player.v.sub(a_v);
-            let v_rad = rel_v.dot(n);
-            let v_tan_vec = rel_v.sub(n.scale(v_rad)); // tangential component
-
-            // Scale tangential speed by r_old/r_new (angular-momentum conservation).
-            let scale = if line.rest_len > 1e-6 {
-                line.rest_len / target
-            } else {
-                1.0
-            };
-            let new_tan = v_tan_vec.norm().scale(v_tan_vec.len() * scale);
-
-            // Radial velocity follows the reel direction (closing when reeling in).
-            let new_rad = -(reel as f64) * REEL_RATE;
-            let new_rel_v = new_tan.add(n.scale(new_rad));
-
-            player.v = a_v.add(new_rel_v);
-            player.p = a_p.add(n.scale(target));
-            line.rest_len = target;
-            line.taut = true;
-            return;
-        }
+        line.rest_len = target;
     }
 
-    // ── Slack: inside the radius, the line does nothing (free swing) ──────────
-    if len < line.rest_len - 1e-4 {
+    let stretch = len - line.rest_len;
+
+    // ── Deep slack: line does nothing (free ballistic swing). ──
+    if stretch <= -LINE_SLACK_BAND {
         line.taut = false;
-        return;
-    }
-
-    // ── Taut: cancel only the separating radial relative velocity ────────────
-    line.taut = true;
-
-    let rv = player.v.sub(a_v);
-    let v_rel = rv.dot(n); // > 0 means separating
-    if v_rel <= 0.0 {
-        // Swinging inward or along the line — nothing to do.
         return;
     }
 
     let inv_sum = player.inv_mass + a_inv_mass;
     if inv_sum <= 0.0 {
+        line.taut = stretch > 0.0;
         return;
     }
 
-    let j = -v_rel / inv_sum; // impulse magnitude along n
+    // Radial relative velocity (positive ⇒ separating from the anchor).
+    let rv = player.v.sub(a_v);
+    let v_rad = rv.dot(n);
 
-    player.v = player.v.add(n.scale(j * player.inv_mass));
+    // Scalar radial force along n. Tension pulls toward the anchor ⇒ this is
+    // ≤ 0 (along −n). We clamp to ≤ 0 so the rope can NEVER push outward.
+    let f = if stretch > 0.0 {
+        // Taut: full spring-damper.
+        line.taut = true;
+        let raw = -LINE_K * stretch - LINE_C * v_rad;
+        raw.min(0.0)
+    } else {
+        // Slack band: gentle pre-tension only (stretch ≤ 0 ⇒ already ≤ 0).
+        line.taut = false;
+        LINE_SLACK_K * stretch
+    };
 
-    // Equal-and-opposite impulse on a player anchor.
+    // Semi-implicit Euler velocity update; equal-and-opposite on the anchor.
+    let impulse = f * h; // N·s along n
+    player.v = player.v.add(n.scale(impulse * player.inv_mass));
     if let Some(b) = anchor {
-        b.v = b.v.add(n.scale(-j * b.inv_mass));
-    }
-
-    // Soft Baumgarte position correction — prevents slow drift past rest_len.
-    let err = len - line.rest_len;
-    if err > 0.0 {
-        let corr = (0.2 * err) / h.max(1e-4);
-        player.v = player.v.add(n.scale(-corr * (player.inv_mass / inv_sum) * h));
+        b.v = b.v.add(n.scale(-impulse * b.inv_mass));
     }
 }
 
@@ -149,7 +134,7 @@ mod tests {
 
     const H: f64 = 1.0 / 240.0;
 
-    /// Slack line (inside radius) must not change the player's velocity.
+    /// Deep-slack line (well inside radius) must not change the velocity.
     #[test]
     fn slack_no_force() {
         let mut p = Body {
@@ -168,12 +153,13 @@ mod tests {
         assert!(!line.taut);
     }
 
-    /// Taut static anchor: separating radial velocity removed, tangential kept.
+    /// Taut static anchor: a separating-radial spring force decelerates the
+    /// outward (radial) motion while tangential is untouched in one step.
     #[test]
-    fn taut_static_removes_radial_keeps_tangential() {
-        // Player 10 m out on +x, moving outward (+x) and along +y (tangential).
+    fn taut_static_decelerates_radial_keeps_tangential() {
+        // Player 10.1 m out on +x (stretch +0.1), moving outward + tangential.
         let mut p = Body {
-            p: Vec3::new(10.0, 0.0, 0.0),
+            p: Vec3::new(10.1, 0.0, 0.0),
             v: Vec3::new(6.0, 4.0, 0.0),
             inv_mass: 1.0,
         };
@@ -183,20 +169,39 @@ mod tests {
             taut: false,
         };
         resolve_line(&mut p, &mut line, None, 0, H);
+        // Radial spring force is inward (−x) ⇒ outward speed must drop.
+        assert!(p.v.x < 6.0, "radial speed should drop, got {}", p.v.x);
+        // Tangential (y) is untouched in a single radial-force step.
         assert!(
-            p.v.x.abs() < 1e-4,
-            "radial (outward) should be cancelled, got {}",
-            p.v.x
-        );
-        assert!(
-            (p.v.y - 4.0).abs() < 1e-4,
+            (p.v.y - 4.0).abs() < 1e-12,
             "tangential should be preserved, got {}",
             p.v.y
         );
         assert!(line.taut);
     }
 
-    /// Player↔player taut: total linear momentum must be conserved.
+    /// The rope is tension-only: a slack body moving inward gets NO outward push.
+    #[test]
+    fn slack_band_never_pushes_outward() {
+        // 9.7 m out, rest_len 10 ⇒ stretch −0.3 (inside the 0.6 m band).
+        let mut p = Body {
+            p: Vec3::new(9.7, 0.0, 0.0),
+            v: Vec3::new(-2.0, 0.0, 0.0), // moving inward
+            inv_mass: 1.0,
+        };
+        let mut line = Line {
+            anchor_pos: Vec3::new(0.0, 0.0, 0.0),
+            rest_len: 10.0,
+            taut: false,
+        };
+        resolve_line(&mut p, &mut line, None, 0, H);
+        // Pre-tension pulls gently inward (−x); never pushes outward (+x).
+        assert!(p.v.x <= -2.0, "must not be pushed outward, got {}", p.v.x);
+        assert!(!line.taut);
+    }
+
+    /// Player↔player taut: total linear momentum must be conserved (the spring
+    /// force is equal-and-opposite ⇒ the slingshot stays "free").
     #[test]
     fn player_player_conserves_momentum() {
         let mut anchor_body = Body {
@@ -205,7 +210,7 @@ mod tests {
             inv_mass: 1.0 / 80.0,
         };
         let mut p = Body {
-            p: Vec3::new(12.0, 0.0, 0.0),
+            p: Vec3::new(12.5, 0.0, 0.0),
             v: Vec3::new(9.0, 0.0, 0.0),
             inv_mass: 1.0 / 75.0,
         };
@@ -231,9 +236,12 @@ mod tests {
         assert!(p.v.x < 9.0, "player should decelerate outward");
     }
 
-    /// Reel-in increases tangential speed: v_t · r ≈ conserved (L conservation).
+    /// Reel now ONLY eases rest_len toward the target — it never teleports
+    /// position and never rescales velocity. (The slingshot is verified to
+    /// be EMERGENT via real free-flight integration in player.rs:
+    /// `reel_in_slingshot_is_emergent`.)
     #[test]
-    fn reel_in_raises_tangential_speed() {
+    fn reel_only_eases_rest_len_no_teleport() {
         let mut p = Body {
             p: Vec3::new(20.0, 0.0, 0.0),
             v: Vec3::new(0.0, 5.0, 0.0),
@@ -245,23 +253,30 @@ mod tests {
             taut: false,
         };
 
-        // Reel in for ~0.5 s (120 steps).
-        for _ in 0..120 {
+        // One reel-in step: rest_len shrinks by exactly REEL_RATE·h.
+        let p_before = p.p;
+        resolve_line(&mut p, &mut line, None, -1, H);
+        let expected_rest = 20.0 - REEL_RATE * H;
+        assert!(
+            (line.rest_len - expected_rest).abs() < 1e-12,
+            "rest_len must ease by REEL_RATE·h, got {}",
+            line.rest_len
+        );
+        // Position is NOT teleported onto the new radius (no p = a + n·target).
+        assert_eq!(p.p, p_before, "reel must never set position");
+
+        // Reel-in for ~1 s: rest_len monotonically eases toward TETHER_MIN
+        // and the line becomes taut (len now exceeds the shrunken rest_len),
+        // so the spring engages — the slingshot work is done by the spring,
+        // not by a scripted v_tan rescale.
+        for _ in 0..240 {
             resolve_line(&mut p, &mut line, None, -1, H);
         }
-
-        let r = p.p.len();
-        // Motion stays in the x-y plane; tangential = y and z components.
-        let v_tan = (p.v.y * p.v.y + p.v.z * p.v.z).sqrt();
-
-        assert!(r < 20.0, "should have been pulled inward, r = {}", r);
-        assert!(v_tan > 5.0, "tangential speed should have risen, v_tan = {}", v_tan);
-        // L = v_t · r should be close to the initial value of 5 · 20 = 100.
-        let l = v_tan * r;
         assert!(
-            (l - 100.0).abs() < 1.0,
-            "angular momentum not conserved: v_t·r = {}",
-            l
+            line.rest_len < 20.0 && line.rest_len >= TETHER_MIN,
+            "rest_len eased inward, got {}",
+            line.rest_len
         );
+        assert!(line.taut, "shrunk rest_len ⇒ line is taut and pulling");
     }
 }

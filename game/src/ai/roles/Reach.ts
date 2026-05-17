@@ -26,13 +26,23 @@ export interface ReachIntent {
   intent: 'defend-mouth' | 'pivot-ring' | 'contest-approach' | 'clear-zone';
 }
 
+/** Stable per-commitment style draws (C2). Supplied → deterministic angle;
+ *  absent → CURRENT inline rng() behavior (byte-identical for direct callers
+ *  like reachNavigate and the planner tests). */
+export interface RoleStyle {
+  angle: number;
+  radius: number;
+}
+
 export function reachPolicy(
   player: PlayerSim,
   state: SimState,
   match: MatchState,
   _profile: TeamProfile,
   rng: () => number,
+  style?: RoleStyle,
 ): ReachIntent {
+  const sAngle = () => (style ? style.angle : rng());
   const bell = state.bell;
   const possession = match.possession === player.team;
   // ORIENTATION-CORRECT: defend OUR ring, contest near the ring WE attack.
@@ -62,7 +72,7 @@ export function reachPolicy(
 
     // Normal defense: float in front of the ring.
     const guardX = defendX + (defendX > 0 ? -18 : 18);
-    const angle = Math.PI * (0.3 + rng() * 0.2);
+    const angle = Math.PI * (0.3 + sAngle() * 0.2);
     return {
       targetPos: {
         x: guardX,
@@ -75,7 +85,7 @@ export function reachPolicy(
   } else {
     // Offense: position near the ring WE attack to contest/clean up.
     const attackX = ourAttackX + (ourAttackX > 0 ? -20 : 20);
-    const angle = Math.PI * (0.2 + rng() * 0.2);
+    const angle = Math.PI * (0.2 + sAngle() * 0.2);
     return {
       targetPos: {
         x: attackX,

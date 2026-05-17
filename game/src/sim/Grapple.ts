@@ -1,15 +1,22 @@
-// The rig line — THE core mechanic, and v0.1's biggest failure (a dumb
-// max-distance position clamp with no momentum). Here it is a velocity-level
-// impulse distance constraint:
-//   • slack  (len < restLen): no force — free ballistic swing within radius
-//   • taut   (len ≥ restLen): remove ONLY the separating radial velocity,
-//              preserving all tangential velocity (the swing). Equal & opposite
-//              on a player anchor ⇒ momentum-conserving slingshot, no special case.
-//   • reel   : shrink restLen; angular momentum about the anchor is conserved
-//              ⇒ tangential speed rises ⇒ emergent slingshot (real, not scripted).
+// The rig line — THE core mechanic. Continuous (Fluidity Spike) model: a
+// one-sided radial spring-damper. TENSION ONLY — it never pushes inward when
+// slack, so deep slack is a true free ballistic swing:
+//   • deep slack  (stretch ≤ −SLACK_BAND): no force.
+//   • slack band  (−SLACK_BAND < stretch ≤ 0): a gentle pre-tension spring
+//              eases the line into tautness instead of snapping.
+//   • taut        (stretch > 0): F = −LINE_K·stretch − LINE_C·v_radial,
+//              clamped so it can only pull toward the anchor; equal & opposite
+//              on a player anchor ⇒ momentum-conserving slingshot.
+// The reel ONLY eases restLen toward target (no position set, no v_tan
+// rescale) ⇒ the angular-momentum slingshot is fully EMERGENT.
+//
+// Semi-implicit (symplectic) Euler; ω_n·h ≈ 0.018 ≪ 2 ⇒ stable at 1/240 s.
+// Arithmetic is byte-identical to rig-core/src/grapple.rs (same literals,
+// same operation order).
 
 import type { Vec3 } from './vec';
-import { vsub, vdot, vscale, vadd, vlen, vnorm } from './vec';
+import { vsub, vdot, vscale, vadd, vlen } from './vec';
+import { FEEL } from './RegConstants';
 
 export interface Body {
   p: Vec3;
@@ -38,6 +45,8 @@ function anchorV(line: Line): Vec3 {
 // One constraint solve for one line. `reel` ∈ {-1,0,1} (in/none/out).
 export function resolveLine(player: Body, line: Line, reel: -1 | 0 | 1, h: number): void {
   const aP = anchorP(line);
+  const aV = anchorV(line);
+  const aInvMass = line.anchorBody ? line.anchorBody.invMass : 0;
   const d = vsub(player.p, aP);
   const len = vlen(d);
   if (len < 1e-6) {
@@ -46,53 +55,50 @@ export function resolveLine(player: Body, line: Line, reel: -1 | 0 | 1, h: numbe
   }
   const n = vscale(d, 1 / len); // unit, anchor -> player
 
-  // Reel: change rope length, conserving angular momentum about the anchor
-  // (L = m·v_t·r ⇒ shrinking r raises v_t — the slingshot, emergent).
+  // Reel: ONLY ease restLen toward the target. No position set, no v_tan
+  // rescale — the slingshot must emerge from the spring.
   if (reel !== 0) {
     const target = Math.max(
       TETHER_MIN,
       Math.min(TETHER_MAX, line.restLen + reel * REEL_RATE * h),
     );
-    if (target !== line.restLen) {
-      const relV = vsub(player.v, anchorV(line));
-      const vRad = vdot(relV, n);
-      const vTanVec = vsub(relV, vscale(n, vRad)); // tangential component
-      const scale = line.restLen > 1e-6 ? line.restLen / target : 1;
-      const newTan = vscale(vnorm(vTanVec), vlen(vTanVec) * scale);
-      // closing/opening radial velocity follows the reel
-      const newRad = -reel * REEL_RATE;
-      const newRelV = vadd(newTan, vscale(n, newRad));
-      player.v = vadd(anchorV(line), newRelV);
-      player.p = vadd(aP, vscale(n, target));
-      line.restLen = target;
-      line.taut = true;
-      return;
-    }
+    line.restLen = target;
   }
 
-  // Slack: inside the radius, the line does nothing (free swing) — this is
-  // what gives the arena-shooter arc feel.
-  if (len < line.restLen - 1e-4) {
+  const stretch = len - line.restLen;
+
+  // Deep slack: the line does nothing (free ballistic swing).
+  if (stretch <= -FEEL.LINE_SLACK_BAND) {
     line.taut = false;
     return;
   }
 
-  // Taut: cancel only the separating radial velocity, preserve tangential.
-  line.taut = true;
-  const rv = vsub(player.v, anchorV(line));
-  const vrel = vdot(rv, n); // >0 = separating
-  if (vrel <= 0) return; // swinging inward / along: nothing to do
-  const aBody = line.anchorBody;
-  const invSum = player.invMass + (aBody ? aBody.invMass : 0);
-  if (invSum <= 0) return;
-  const j = -vrel / invSum; // impulse magnitude along n
-  player.v = vadd(player.v, vscale(n, j * player.invMass));
-  if (aBody) aBody.v = vadd(aBody.v, vscale(n, -j * aBody.invMass));
+  const invSum = player.invMass + aInvMass;
+  if (invSum <= 0) {
+    line.taut = stretch > 0;
+    return;
+  }
 
-  // Soft Baumgarte position correction so it can't slowly drift past restLen.
-  const err = len - line.restLen;
-  if (err > 0) {
-    const corr = (0.2 * err) / Math.max(h, 1e-4);
-    player.v = vadd(player.v, vscale(n, -corr * (player.invMass / invSum) * h));
+  // Radial relative velocity (positive ⇒ separating from the anchor).
+  const rv = vsub(player.v, aV);
+  const vRad = vdot(rv, n);
+
+  // Scalar radial force along n. Tension pulls toward the anchor ⇒ ≤ 0.
+  // Clamp to ≤ 0 so the rope can NEVER push outward.
+  let f: number;
+  if (stretch > 0) {
+    line.taut = true;
+    const raw = -FEEL.LINE_K * stretch - FEEL.LINE_C * vRad;
+    f = Math.min(0, raw);
+  } else {
+    line.taut = false;
+    f = FEEL.LINE_SLACK_K * stretch;
+  }
+
+  // Semi-implicit Euler velocity update; equal-and-opposite on the anchor.
+  const impulse = f * h; // N·s along n
+  player.v = vadd(player.v, vscale(n, impulse * player.invMass));
+  if (line.anchorBody) {
+    line.anchorBody.v = vadd(line.anchorBody.v, vscale(n, -impulse * line.anchorBody.invMass));
   }
 }

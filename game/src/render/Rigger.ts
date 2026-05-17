@@ -82,8 +82,8 @@ class RiggerInstance {
 
   readonly figure = new RiggerFigure();
 
-  // Kept state for motion derivation + damping.
-  private px = 0; private py = 0; private pz = 0;
+  // Kept state for motion derivation + damping. We retain the interpolated
+  // velocity across frames to derive acceleration (frame-to-frame Δv).
   private vx = 0; private vy = 0; private vz = 0;
   private hasPrev = false;
 
@@ -146,23 +146,18 @@ class RiggerInstance {
     this.figure.root.visible = true;
     this.figure.root.position.set(ps.p.x, ps.p.y, ps.p.z);
 
-    // ── Motion derivation (render-frame deltas) ─────────────────────────────
+    // ── Motion derivation ───────────────────────────────────────────────────
+    // ps.v is now the cleanly RenderState-interpolated sim velocity, so use it
+    // directly instead of double-differencing render-frame positions (that old
+    // path turned every 240 Hz sim snap into an accel spike that lurched the
+    // cel pose). Acceleration = frame-to-frame delta of the interpolated v.
     let ax = 0, ay = 0, az = 0;
     if (this.hasPrev && dt > 1e-5) {
-      const nvx = (ps.p.x - this.px) / dt;
-      const nvy = (ps.p.y - this.py) / dt;
-      const nvz = (ps.p.z - this.pz) / dt;
-      ax = (nvx - this.vx) / dt;
-      ay = (nvy - this.vy) / dt;
-      az = (nvz - this.vz) / dt;
-      // Blend derived velocity with sim velocity for stability.
-      this.vx = nvx * 0.5 + ps.v.x * 0.5;
-      this.vy = nvy * 0.5 + ps.v.y * 0.5;
-      this.vz = nvz * 0.5 + ps.v.z * 0.5;
-    } else {
-      this.vx = ps.v.x; this.vy = ps.v.y; this.vz = ps.v.z;
+      ax = (ps.v.x - this.vx) / dt;
+      ay = (ps.v.y - this.vy) / dt;
+      az = (ps.v.z - this.vz) / dt;
     }
-    this.px = ps.p.x; this.py = ps.p.y; this.pz = ps.p.z;
+    this.vx = ps.v.x; this.vy = ps.v.y; this.vz = ps.v.z;
     this.hasPrev = true;
 
     const speed = Math.hypot(this.vx, this.vy, this.vz);

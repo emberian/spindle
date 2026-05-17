@@ -50,6 +50,15 @@ const REEL_RATE = 14;   // m/s (mirrors Grapple.ts canon)
 const TETHER_MIN = 3;
 const SKIN_BUFFER = 4;  // m inside skin — don't fire at skin if within this
 
+// Nav-anchor hysteresis: a freshly-considered anchor must beat the currently
+// committed ("sticky") anchor's cost by this margin before we switch to it.
+// Mirrors the throw-target SWITCH_MARGIN pattern in RiggerAI. Without this,
+// two near-equal-cost anchors flip frame-to-frame and the rigger is yanked
+// (fireLineAt + reel toggling). Tuned: ~6 m of projected-distance cost — large
+// enough to kill dithering between adjacent spars, small enough that a
+// genuinely better anchor (closer approach, defender avoidance) still wins.
+const ANCHOR_SWITCH_MARGIN = 6;
+
 export interface GrapplePlan {
   /** The world-space anchor point to fire the line at. */
   anchorPos: Vec3;
@@ -187,6 +196,7 @@ export function planGrapple(
   target: Vec3,
   state: SimState,
   avoidDefenders = true,
+  sticky?: { pos: Vec3; reel: -1 | 0 } | null,
 ): GrapplePlan | null {
   const pos = player.p;
   const vel = player.v;
@@ -296,6 +306,54 @@ export function planGrapple(
     return a.anchorPos.x - b.anchorPos.x;
   });
   const best = candidates[0];
+
+  // ── Nav-anchor hysteresis ─────────────────────────────────────────────────
+  // If the caller passed the previously-committed anchor and it is STILL a
+  // valid candidate under the SAME filters used to admit fresh candidates,
+  // re-score it with the SAME scorer and KEEP it unless the new best beats it
+  // by ANCHOR_SWITCH_MARGIN. This mirrors the throw-target hysteresis in
+  // RiggerAI (decideThrow ~649-667) and is deterministic: no rng, pure
+  // geometry / replayed-physics scoring of the injected state.
+  if (sticky) {
+    const sPos = sticky.pos;
+    const stickyDist = vlen(vsub(pos, sPos));
+    // Determine whether the sticky anchor is the skin point (high radius in
+    // the y,z plane and matching the player's current skin projection) vs a
+    // spar/teammate-style point — so we apply the matching admission filter.
+    const sRadius = Math.sqrt(sPos.y * sPos.y + sPos.z * sPos.z);
+    const isSkinSticky = sRadius > REG.R * 0.85;
+
+    let stickyValid = false;
+    if (isSkinSticky) {
+      // Same gate as the skin candidate above.
+      stickyValid = skinUseful && sticky.reel === 0;
+    } else {
+      // Same gate as spar / teammate candidates: in useful range and not
+      // fired back the way we came relative to the target.
+      const toAnchor = vnorm(vsub(sPos, pos));
+      const toTarget = vnorm(vsub(target, pos));
+      stickyValid =
+        stickyDist >= 2 &&
+        stickyDist <= 80 &&
+        vdot(toAnchor, toTarget) >= -0.7 &&
+        sticky.reel === -1;
+    }
+
+    if (stickyValid) {
+      const sc = scorePlan(sPos, sticky.reel);
+      // Keep sticky unless the fresh best is clearly better.
+      if (best.cost >= sc.cost - ANCHOR_SWITCH_MARGIN) {
+        return {
+          anchorPos: sPos,
+          reel: sticky.reel,
+          projectedDist: sc.projectedDist,
+          // isSpar only affects callers' cosmetics; reflect geometry.
+          isSpar: !isSkinSticky && sRadius < 1,
+        };
+      }
+    }
+  }
+
   return {
     anchorPos: best.anchorPos,
     reel: best.reel,

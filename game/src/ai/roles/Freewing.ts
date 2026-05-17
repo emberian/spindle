@@ -25,13 +25,25 @@ export interface FreewingIntent {
   isAttacking: boolean;
 }
 
+/** Stable per-commitment style draws (C2). Supplied → deterministic angle;
+ *  absent → CURRENT inline rng() behavior (byte-identical for direct callers
+ *  like freewingNavigate and the planner tests). The freeEndBias COIN draw is
+ *  a read decision, NOT an angle/radius, so it stays on inline rng() in both
+ *  modes — preserving the style-divergence test's call sequence. */
+export interface RoleStyle {
+  angle: number;
+  radius: number;
+}
+
 export function freewingPolicy(
   player: PlayerSim,
   state: SimState,
   match: MatchState,
   profile: TeamProfile,
   rng: () => number,
+  style?: RoleStyle,
 ): FreewingIntent {
+  const sAngle = () => (style ? style.angle : rng());
   const bell = state.bell;
   const possession = match.possession === player.team;
   // ORIENTATION-CORRECT: the Freewing still plays HIGH/near-axis for the Free
@@ -47,7 +59,7 @@ export function freewingPolicy(
       if (bellDistToFree < REG.L * 0.35) {
         // Free-end attack: position near axis (cross-spin curve territory).
         const attackX = freeX + (freeX > 0 ? -20 : 20);
-        const angle = Math.PI * (0.05 + rng() * 0.12);
+        const angle = Math.PI * (0.05 + sAngle() * 0.12);
         return {
           targetPos: {
             x: attackX,
@@ -62,7 +74,7 @@ export function freewingPolicy(
       // Loop receive: near axis, ready for a loop-setter feed.
       if (profile.loopPropensity > 0.4) {
         const loopX = bell.p.x + (freeX > 0 ? 80 : -80) * profile.loopPropensity;
-        const angle = rng() * Math.PI * 0.1;
+        const angle = sAngle() * Math.PI * 0.1;
         return {
           targetPos: {
             x: loopX,
@@ -77,7 +89,7 @@ export function freewingPolicy(
 
     // Midfield high hold: wait for the pass.
     const midX = bell.p.x + (freeX > 0 ? 60 : -60) * 0.6;
-    const angle = Math.PI * (0.15 + rng() * 0.15);
+    const angle = Math.PI * (0.15 + sAngle() * 0.15);
     return {
       targetPos: {
         x: midX,

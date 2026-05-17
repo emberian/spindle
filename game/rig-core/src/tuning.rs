@@ -8,6 +8,53 @@ pub const GATE_RADIUS: f64 = 8.0;
 pub const EARTH_G: f64 = 9.80665;
 pub const GATE_X: f64 = L / 2.0;
 
+// ── FEEL constants (Fluidity Spike) ───────────────────────────────────────────
+// Continuous player physics. NOT part of tuning::evaluate (gameplay gate).
+// All springs integrated with semi-implicit (symplectic) Euler at h = 1/240 s;
+// every ω_n·h ≪ 2 so they are unconditionally stable here. Same literals are
+// mirrored verbatim in RegConstants.ts so Rust and TS compute identical f64.
+
+/// Taut rig-line radial spring stiffness (N/m equivalent over PLAYER_MASS).
+/// ω_n = sqrt(LINE_K / 78) ≈ 4.24 rad/s ⇒ ω_n·h ≈ 0.018 ≪ 2.
+pub const LINE_K: f64 = 1400.0;
+/// Taut rig-line radial damping. ζ ≈ LINE_C / (2·sqrt(LINE_K·78)) ≈ 0.55
+/// (near-critical: snappy, no ring-out, no overshoot).
+pub const LINE_C: f64 = 520.0;
+/// Slack pre-tension band width (m) below rest_len where a gentle spring
+/// pre-loads the rope so it eases into tautness instead of snapping.
+pub const LINE_SLACK_BAND: f64 = 0.6;
+/// Pre-tension stiffness inside the slack band (soft — ~1/12 of LINE_K).
+pub const LINE_SLACK_K: f64 = 120.0;
+
+/// Soft-grounding penetration push-out spring (rho ≥ R).
+/// ω_n = sqrt(GROUND_K / 78) ≈ 8.0 rad/s ⇒ ω_n·h ≈ 0.033 ≪ 2.
+pub const GROUND_K: f64 = 5000.0;
+/// Grounding push-out damping (near-critical on the radial DOF).
+pub const GROUND_C: f64 = 1250.0;
+/// Per-step tangential friction multiplier applied to the grounded
+/// tangential velocity. PRECOMPUTED so neither side calls exp() per step:
+/// = exp(-FRICTION_RATE · h) with FRICTION_RATE = 6 /s, h = 1/240
+/// → exp(-0.025) computed once, frozen as a literal for bit-identical f64.
+pub const FRICTION_DECAY: f64 = 0.9753099120283326;
+
+/// Eased-actuator ramp lengths (ticks). TOTAL Δv is unchanged; the budget is
+/// consumed immediately on trigger so cap/determinism semantics are preserved.
+pub const PUSHOFF_RAMP_TICKS: u32 = 18;
+pub const THRUMBLER_RAMP_TICKS: u32 = 12;
+
+/// Stiff stick-spring used for `contact` (replaces the inv_mass=0 freeze).
+/// ω_n = sqrt(CONTACT_K / 78) ≈ 8.77 rad/s ⇒ ω_n·h ≈ 0.037 ≪ 2.
+pub const CONTACT_K: f64 = 6000.0;
+/// Stick-spring damping (near-critical → no buzz).
+pub const CONTACT_C: f64 = 1400.0;
+
+/// Held-bell follow spring (bell tracks holder's hand softly instead of a raw
+/// p/v copy). Bell mass ≈ 1 (treated as unit in sim) so ω_n = sqrt(HOLD_K)
+/// ≈ 28.3 rad/s ⇒ ω_n·h ≈ 0.118 ≪ 2 (still stable, tight tracking).
+pub const HOLD_K: f64 = 800.0;
+/// Held-bell follow damping (near-critical for unit mass).
+pub const HOLD_C: f64 = 56.0;
+
 const STRONG_THROW: f64 = 30.0;
 const LAUNCH_RHO: f64 = 2.0;
 const LAUNCH_VPERP: f64 = 2.0;

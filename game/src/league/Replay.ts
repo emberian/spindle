@@ -256,8 +256,12 @@ function decodeFrames(
 
 // ── Compact (de)serialiser (FROZEN API) ────────────────────────────────────
 
+// v2: the Fluidity-Spike soft-physics rewrite changed all sim dynamics, so
+// v1 replays (recorded against the old hard-impulse model) no longer reproduce
+// bit-identically. New storage key + format version ⇒ old re-calls are simply
+// not read (clean discard, never mis-decoded).
 interface EncodedReplay {
-  v: 1;
+  v: 2;
   meta: ReplayMeta;
   roster: ReplayData['roster'];
   frameCount: number;
@@ -267,7 +271,7 @@ interface EncodedReplay {
 
 export function encodeReplay(r: ReplayData): string {
   const payload: EncodedReplay = {
-    v: 1,
+    v: 2,
     meta: r.meta,
     roster: r.roster,
     frameCount: r.frames.length,
@@ -278,6 +282,9 @@ export function encodeReplay(r: ReplayData): string {
 
 export function decodeReplay(s: string): ReplayData {
   const payload = JSON.parse(s) as EncodedReplay;
+  if (payload.v !== 2) {
+    throw new Error(`replay format v${payload.v} unsupported (expected v2)`);
+  }
   const roster = payload.roster.map((r) => ({
     id: r.id,
     team: r.team,
@@ -293,7 +300,7 @@ export function decodeReplay(s: string): ReplayData {
 
 // ── Storage (localStorage, mirroring Persistence.ts conventions) ───────────
 
-const STORAGE_KEY = 'rig_recalls_v1';
+const STORAGE_KEY = 'rig_recalls_v2';
 /** Keep only the newest N re-calls (frames are bulky — evict oldest). */
 const MAX_RECALLS = 12;
 

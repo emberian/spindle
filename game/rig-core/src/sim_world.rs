@@ -10,7 +10,7 @@ use crate::loop_detector::{LoopTier, LoopTracker};
 use crate::math::{Quat, Vec3};
 use crate::player::{make_player, push_off, step_player, thrumbler, PlayerBody};
 use crate::rng::Rng;
-use crate::tuning::{GATE_RADIUS, GATE_X, OMEGA};
+use crate::tuning::{GATE_RADIUS, GATE_X, HOLD_C, HOLD_K, OMEGA};
 
 /// A free, untouched-to-rest bell that neither scores nor is caught within
 /// this many ticks is a dead ball (30 s at 240 Hz — generous, longer than a
@@ -357,8 +357,29 @@ impl SimWorld {
         // Bell integration or tracking.
         if let Some(ref holder_id) = self.bell_held_by.clone() {
             if let Some(idx) = self.find_idx(holder_id) {
-                self.bell.p = self.players[idx].body.p;
-                self.bell.v = self.players[idx].body.v;
+                // Held bell follows the holder's hand via a stiff spring
+                // (continuous tracking, no raw p/v copy). Unit mass; semi-
+                // implicit Euler (ω_n·h ≈ 0.118 ≪ 2 ⇒ stable, tight). The
+                // throw/release velocity math in apply_input is unchanged —
+                // it reads the PLAYER's v, never this tracked bell.v.
+                let hp = self.players[idx].body.p;
+                let hv = self.players[idx].body.v;
+                let dx = self.bell.p.x - hp.x;
+                let dy = self.bell.p.y - hp.y;
+                let dz = self.bell.p.z - hp.z;
+                let fx = -HOLD_K * dx - HOLD_C * (self.bell.v.x - hv.x);
+                let fy = -HOLD_K * dy - HOLD_C * (self.bell.v.y - hv.y);
+                let fz = -HOLD_K * dz - HOLD_C * (self.bell.v.z - hv.z);
+                self.bell.v = Vec3::new(
+                    self.bell.v.x + fx * h,
+                    self.bell.v.y + fy * h,
+                    self.bell.v.z + fz * h,
+                );
+                self.bell.p = Vec3::new(
+                    self.bell.p.x + self.bell.v.x * h,
+                    self.bell.p.y + self.bell.v.y * h,
+                    self.bell.p.z + self.bell.v.z * h,
+                );
             }
         } else if !self.bell_dead {
             let prev_x = self.bell.p.x;

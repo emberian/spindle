@@ -23,6 +23,14 @@ export interface RoleIntent {
   intent: 'guard-faith' | 'deep-receive' | 'hold-depth' | 'support-throw';
 }
 
+/** Stable per-commitment style draws (C2). Supplied → deterministic angle;
+ *  absent → CURRENT inline rng() behavior (byte-identical for direct callers
+ *  like anchorNavigate and the planner tests). */
+export interface RoleStyle {
+  angle: number;
+  radius: number;
+}
+
 /**
  * Compute the Anchor's desired position and intent.
  * Decision is pure — no side effects.
@@ -33,7 +41,9 @@ export function anchorPolicy(
   match: MatchState,
   _profile: TeamProfile,
   rng: () => number,
+  style?: RoleStyle,
 ): RoleIntent {
+  const sAngle = () => (style ? style.angle : rng());
   const bell = state.bell;
   const onOffense = bell.heldBy !== null &&
     state.players.find(p => p.id === bell.heldBy)?.team === player.team;
@@ -47,7 +57,7 @@ export function anchorPolicy(
   if (possession || onOffense) {
     // Offense: stay deep near OUR attacking ring to receive / contest loops.
     const deepX = atkX + (atkX > 0 ? -80 : 80); // 80 m short of the ring
-    const angle = Math.PI * (0.4 + rng() * 0.2);
+    const angle = Math.PI * (0.4 + sAngle() * 0.2);
     const targetY = ANCHOR_TARGET_RADIUS * Math.cos(angle);
     const targetZ = ANCHOR_TARGET_RADIUS * Math.sin(angle);
     return {
