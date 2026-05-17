@@ -36,6 +36,28 @@ function capsule(r: number, len: number): THREE.CapsuleGeometry {
   return new THREE.CapsuleGeometry(r, len, 3, 8);
 }
 
+// One shared soft radial-gradient sprite texture — the per-rigger glow aura
+// that keeps a tiny figure trackable in the vast lore-scale calm without
+// zooming the camera in. Built once, tinted per figure via the sprite colour.
+let _auraTex: THREE.Texture | null = null;
+function auraTexture(): THREE.Texture {
+  if (_auraTex) return _auraTex;
+  const S = 64;
+  const cv = document.createElement('canvas');
+  cv.width = cv.height = S;
+  const g = cv.getContext('2d')!;
+  const grad = g.createRadialGradient(S / 2, S / 2, 0, S / 2, S / 2, S / 2);
+  grad.addColorStop(0.0, 'rgba(255,255,255,0.95)');
+  grad.addColorStop(0.35, 'rgba(255,255,255,0.45)');
+  grad.addColorStop(1.0, 'rgba(255,255,255,0.0)');
+  g.fillStyle = grad;
+  g.fillRect(0, 0, S, S);
+  const tex = new THREE.CanvasTexture(cv);
+  tex.needsUpdate = true;
+  _auraTex = tex;
+  return tex;
+}
+
 /** A two-bone limb (upper + lower) with a mid joint pivot. */
 class Limb {
   /** Pivot at the shoulder/hip; rotate this for the whole-limb swing. */
@@ -97,6 +119,14 @@ export class RiggerFigure {
   private readonly spine = new THREE.Group();   // hip→up; lean lives here
   private readonly shoulders = new THREE.Group(); // counter-rotate / follow-through
 
+  // Always-on team-glow aura (every rigger, readable when small).
+  private readonly aura: THREE.Sprite;
+
+  // Stylized rigger kit — bold silhouette read at lore distance.
+  private readonly backPack: InkedPart;
+  private readonly paulL: InkedPart;
+  private readonly paulR: InkedPart;
+
   // P1 highlight extras.
   private readonly halo: THREE.Mesh;
   private readonly beacon: THREE.Mesh;
@@ -116,6 +146,13 @@ export class RiggerFigure {
     this.chestRig = new InkedPart(new THREE.BoxGeometry(0.40, 0.30, 0.16), 0x808080, 0.04);
     this.chestRig.group.position.set(0, TORSO_LEN * 0.62, 0.16);
     this.spine.add(this.chestRig.group);
+
+    // Back rig-pack: the line spool/reel slung between the shoulders. A bold,
+    // asymmetric block on the back so the silhouette reads as an equipped
+    // rigger (not a stick figure) even a few pixels tall. Heavier ink line.
+    this.backPack = new InkedPart(new THREE.BoxGeometry(0.34, 0.40, 0.20), 0x808080, 0.09);
+    this.backPack.group.position.set(0, TORSO_LEN * 0.55, -0.18);
+    this.spine.add(this.backPack.group);
 
     // Shoulder yoke pivot (top of spine) — arms + head hang off this so
     // follow-through twist propagates naturally.
@@ -143,6 +180,14 @@ export class RiggerFigure {
     this.armL.root.position.set(-SHOULDER_W, -0.02, 0);
     this.armR.root.position.set( SHOULDER_W, -0.02, 0);
     this.shoulders.add(this.armL.root, this.armR.root);
+
+    // Pauldrons: blocky shoulder caps. They square off the silhouette into a
+    // stylized "broad-shouldered athlete in a rig" read at any distance.
+    this.paulL = new InkedPart(new THREE.BoxGeometry(0.20, 0.16, 0.22), 0x808080, 0.08);
+    this.paulR = new InkedPart(new THREE.BoxGeometry(0.20, 0.16, 0.22), 0x808080, 0.08);
+    this.paulL.group.position.set(-SHOULDER_W, 0.04, 0);
+    this.paulR.group.position.set( SHOULDER_W, 0.04, 0);
+    this.shoulders.add(this.paulL.group, this.paulR.group);
 
     // Legs — small "boot" cap.
     const boot = (): THREE.BufferGeometry => new THREE.BoxGeometry(0.13, 0.10, 0.22);
@@ -187,6 +232,23 @@ export class RiggerFigure {
     this.beacon.renderOrder = 9999; // always on top, but small & non-additive
     this.root.add(this.beacon);
 
+    // Team-glow aura: a soft additive bloom centred on the torso, drawn under
+    // (never occluded by) the figure so a small rigger is always a clear
+    // coloured presence in the vast calm. Tinted/faded per state in setColors.
+    this.aura = new THREE.Sprite(new THREE.SpriteMaterial({
+      map: auraTexture(),
+      color: 0xffffff,
+      transparent: true,
+      opacity: 0,
+      blending: THREE.AdditiveBlending,
+      depthWrite: false,
+      depthTest: false,
+    }));
+    this.aura.scale.set(3.0, 3.0, 1);
+    this.aura.position.y = HIP_Y + TORSO_LEN * 0.55;
+    this.aura.renderOrder = 9990; // above scene, below the P1 halo/beacon
+    this.root.add(this.aura);
+
     this.root.visible = false;
   }
 
@@ -201,6 +263,24 @@ export class RiggerFigure {
     this.head.setEmissive(emissiveHex, emissiveInt);
     (this.visor.material as THREE.MeshBasicMaterial).color.setHex(accentHex);
     this.setLimbColor(bodyHex);
+
+    // Stylized kit: pack/pauldrons in team body colour; the chest spool gets
+    // a bright accent emissive so every rigger has a hot focal point.
+    this.backPack.setColor(bodyHex);
+    this.paulL.setColor(bodyHex);
+    this.paulR.setColor(bodyHex);
+    this.chestRig.setEmissive(accentHex, emissiveHex === 0 ? 0.0 : 0.85);
+
+    // Team-glow aura: tint to the team emissive (which Rigger.ts already zeroes
+    // for grounded/out-of-play), and keep a readable floor for anyone in play
+    // so a small figure is always a clear coloured presence.
+    const auraMat = this.aura.material as THREE.SpriteMaterial;
+    if (emissiveHex === 0) {
+      auraMat.opacity = 0;
+    } else {
+      auraMat.color.setHex(emissiveHex);
+      auraMat.opacity = Math.max(0.42, Math.min(0.6, emissiveInt * 0.6));
+    }
   }
 
   private setLimbColor(hex: number): void {
