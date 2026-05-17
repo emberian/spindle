@@ -226,18 +226,27 @@ export class Riggers {
   private group = new THREE.Group();
   private lastNow = 0;
 
+  // Figure scale is VIEW-dependent: the far spectate/cinematic camera needs
+  // big larger-than-life figures to read at all; the close human chase-cam
+  // needs near-human scale or the figures fill the screen and you can't tell
+  // anything. Orchestrator picks via setViewScale(); default = spectate.
+  private viewScale = 5;
+
   constructor(scene: THREE.Scene) {
     for (let i = 0; i < MAX_RIGGERS; i++) {
       const inst = new RiggerInstance();
       this.pool.push(inst);
-      // Stylised scale-up: a true-1.9 m human against the 45 m calm, filmed
-      // from the broadcast camera, is a few pixels — the cel art was
-      // invisible. Riggers are larger-than-life so the figures actually read
-      // (uniform root scale; the per-frame pose math is untouched).
-      inst.root.scale.setScalar(5);
+      inst.root.scale.setScalar(this.viewScale);
       this.group.add(inst.root);
     }
     scene.add(this.group);
+  }
+
+  /** Set the figure world-scale for the current view (play ≈ 2, spectate = 5). */
+  setViewScale(k: number): void {
+    if (k === this.viewScale) return;
+    this.viewScale = k;
+    for (const inst of this.pool) inst.root.scale.setScalar(k);
   }
 
   /**

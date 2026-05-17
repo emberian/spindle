@@ -152,13 +152,13 @@ export class GameCamera {
   update(bell: V3, p1: V3, attackX: number, loopGlow: number, skinR: number, dt: number): void {
     const dir = this.smoothDir(attackX, dt); // smoothed; no possession snap
 
-    // Focus = weighted blend of the bell (lead) and your rigger. (No raw
-    // attackX pull — it lurched the frame 64 m on every turnover; the aim
-    // target below already leans goal-ward via `dir`.)
+    // CHASE-CAM: the subject is YOU (p1), not the bell. The player must be
+    // able to see the figure they control as the clear, centred subject —
+    // only a slight bell lean so the bell stays roughly in frame.
     const focus = new V(
-      bell.x * 0.66 + p1.x * 0.34,
-      bell.y * 0.58 + p1.y * 0.42,
-      bell.z * 0.58 + p1.z * 0.42,
+      p1.x * 0.82 + bell.x * 0.18,
+      p1.y * 0.82 + bell.y * 0.18,
+      p1.z * 0.82 + bell.z * 0.18,
     );
 
     // Estimate focus velocity → lead the camera so traversal reads as fast
@@ -222,11 +222,11 @@ export class GameCamera {
       fovTarget = 46 - 6 * loopGlow;
       upTarget = new V(1, 0, 0).multiplyScalar(dir); // spine reads as horizon
     } else {
-      // ── BROADCAST/FOLLOW: behind the action, lifted toward the axis,
-      // looking down-spine at the goal so length & depth are obvious.
-      const back = skinR * 1.7; // behind, opposite the attack direction
-      const lift = skinR * 0.55; // toward the axis (so we look "down" the tube)
-      const side = skinR * 0.45; // slight tangential offset for parallax
+      // ── CHASE: close behind YOU so you're a large, centred subject and
+      // can see what you control — then look forward toward the goal.
+      const back = skinR * 0.42; // ≈19 m behind the player (close chase)
+      const lift = skinR * 0.16; // small lift toward the axis
+      const side = skinR * 0.12; // slight tangential offset for parallax
 
       // Player look: add a tangential orbit (yaw) + radial pitch on top of
       // the framed default. Limited so bell/self/goal stay in frame.
@@ -243,13 +243,14 @@ export class GameCamera {
         fy - ry * liftTotal + ty * sideTotal,
         fz - rz * liftTotal + tz * sideTotal,
       );
-      // look toward the goal-ward action (lead a touch so motion sits ahead)
+      // Look just past YOU toward the goal-ward action so the player sits
+      // ~centred with where they're going ahead of them.
       aimTarget = new V(
-        focus.x + dir * skinR * 0.9 + this.lead.x * 0.5,
-        focus.y * 0.7 + this.lead.y * 0.4,
-        focus.z * 0.7 + this.lead.z * 0.4,
+        focus.x + dir * skinR * 0.6 + this.lead.x * 0.5,
+        focus.y + this.lead.y * 0.4,
+        focus.z + this.lead.z * 0.4,
       );
-      fovTarget = 62;
+      fovTarget = 66;
       // up = toward the axis (−radial), so the horizon never tumbles
       upTarget = new V(0, -ry, -rz);
     }

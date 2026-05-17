@@ -158,27 +158,32 @@ export class RiggerFigure {
     this.root.add(hips);
 
     // ── P1 highlight: halo ring at the feet + ▼ beacon overhead ─────────────
+    // The "YOU" marker MUST be unmistakable and never occluded by the other
+    // (large) figures — so it renders on top (depthTest:false, high
+    // renderOrder) and is big.
     this.halo = new THREE.Mesh(
-      new THREE.TorusGeometry(0.95, 0.05, 6, 28),
+      new THREE.TorusGeometry(1.5, 0.12, 8, 32),
       new THREE.MeshBasicMaterial({
         color: 0xffffff, transparent: true, opacity: 0,
-        blending: THREE.AdditiveBlending, depthWrite: false,
+        blending: THREE.AdditiveBlending, depthWrite: false, depthTest: false,
       }),
     );
     this.halo.rotation.x = Math.PI / 2;
     this.halo.position.y = 0.02;
+    this.halo.renderOrder = 9998;
     this.root.add(this.halo);
 
-    const beaconGeo = new THREE.ConeGeometry(0.22, 0.5, 4, 1);
+    const beaconGeo = new THREE.ConeGeometry(0.85, 1.9, 4, 1);
     beaconGeo.rotateZ(Math.PI);
     this.beacon = new THREE.Mesh(
       beaconGeo,
       new THREE.MeshBasicMaterial({
         color: 0xffffff, transparent: true, opacity: 0,
-        blending: THREE.AdditiveBlending, depthWrite: false,
+        blending: THREE.AdditiveBlending, depthWrite: false, depthTest: false,
       }),
     );
-    this.beacon.position.y = SHOULDER_Y + HEAD_R * 2 + 0.55;
+    this.beacon.position.y = SHOULDER_Y + HEAD_R * 2 + 1.4;
+    this.beacon.renderOrder = 9999; // always on top — never hidden behind figures
     this.root.add(this.beacon);
 
     this.root.visible = false;
@@ -282,8 +287,8 @@ export class RiggerFigure {
       haloMat.opacity = 0.85;
       beaconMat.color.setHex(0xffffff);
       beaconMat.opacity = 0.95;
-      this.beacon.position.y = SHOULDER_Y + HEAD_R * 2 + 0.55 + Math.sin(t * 1.5) * 0.12;
-      this.beacon.rotation.y = t * 0.9;
+      this.beacon.position.y = SHOULDER_Y + HEAD_R * 2 + 1.4 + Math.sin(t * 2.2) * 0.35;
+      this.beacon.rotation.y = t * 1.4;
     } else {
       haloMat.opacity = 0;
       beaconMat.opacity = 0;

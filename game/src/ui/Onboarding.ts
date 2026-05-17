@@ -174,13 +174,14 @@ export class Onboarding {
 
     type BodyLine = { text: string; accent?: string; after?: string };
     const lines: BodyLine[] = [
-      { text: 'You are the ', accent: 'cyan rigger' },
+      { text: 'You are the cyan rigger under the ', accent: '▼ marker' },
       { text: 'You cannot fly. You move by line.' },
       { text: '' },
       { text: 'Point at a spar or the skin wall.' },
-      { text: 'Fire your ', accent: 'LINE', after: ' (LMB). Haul with W / S.' },
+      { text: 'Fire your ', accent: 'LINE', after: ' (RIGHT mouse). Haul with W / S.' },
+      { text: 'Let RIGHT go to release the line (slingshot).' },
       { text: '' },
-      { text: 'When you hold the bell, ', accent: 'hold LMB', after: ' to charge.' },
+      { text: 'When you hold the bell, ', accent: 'hold LEFT', after: ' to charge a throw.' },
       { text: 'The ', accent: 'ghost arc', after: ' shows where it will go.' },
       { text: 'The curve is the Coriolis. Learn it.' },
       { text: '' },
@@ -225,10 +226,11 @@ export class Onboarding {
     });
 
     const bindings: [string, string][] = [
-      ['LMB',       'Fire line / charge throw'],
-      ['W / S',     'Reel in / out'],
+      ['RIGHT MB',  'Fire line  ·  release = let go / slingshot'],
+      ['LEFT MB',   'Hold to charge a throw (when you have the bell)'],
+      ['W / S',     'Reel line in / out'],
       ['A / D',     'Spin (curl the bell)'],
-      ['SHIFT',     'Push off surface'],
+      ['SHIFT',     'Push off a surface'],
       ['SCROLL',    'Adjust spin'],
       ['SPACE',     'Thrumbler nudge'],
     ];
