@@ -5,7 +5,11 @@
 import type { SimState } from '../sim/types';
 
 export const SIM_H = 1 / 240;
-const MAX_SUBSTEPS = 12; // clamp to avoid spiral of death
+// Clamp to avoid the spiral of death (excess time is dropped on hitting it).
+// 64 matches the old hand-rolled watch loop: at 4× spectate a slow renderer
+// needs up to ~64 sim ticks/frame; the previous 12 throttled the sim to ~⅓
+// speed so AI matches showed no progression in CI's wall-time window.
+const MAX_SUBSTEPS = 64;
 
 export class FixedStepDriver {
   private acc = 0;
