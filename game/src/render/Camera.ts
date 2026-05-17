@@ -13,15 +13,15 @@ import * as THREE from 'three';
 
 type V3 = { x: number; y: number; z: number };
 
-const CAM_Y = 46;       // constant height above the axis
-const CAM_Z = -115;     // closer side standoff so the tube fills the frame
-const CAM_FOV = 58;     // resting FOV
+const CAM_Y = 38;       // constant height above the axis
+const CAM_Z = -82;      // pulled in close so the riggers read big & clear
+const CAM_FOV = 50;     // tighter resting FOV (zoomed in on the action)
 const FOLLOW_LAMBDA = 4; // smooth glide along x — never jerky
 
 // Speed-coupled FOV liveness: a static frame flattens the new athletic motion +
 // blazing trail, so widen the lens *slightly* with subject speed to sell pace.
 // Strictly bounded & heavily eased — NO rotation, dolly, shake or cut, ever.
-const FOV_MAX_GAIN = 5;        // hard cap: 58 → at most 63
+const FOV_MAX_GAIN = 3;        // hard cap: 50 → at most 53 (stays tight)
 const SPEED_FULL = 26;         // m/s mapping to full gain
 const SPEED_LAMBDA = 2.2;      // heavy speed smoothing (slower than the glide)
 const FOV_LAMBDA = 2.6;        // heavy FOV smoothing — no snap on speed spikes
