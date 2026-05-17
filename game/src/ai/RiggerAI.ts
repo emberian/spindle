@@ -475,6 +475,20 @@ function decideNavTarget(
       st = rk4Step(st, REG.omega, h);
       tAcc += h;
     }
+    // SMARTER CATCH: don't aim AT the bell (you arrive across its path at
+    // huge closing speed → bobble/miss). Aim a short way BACK along the
+    // bell's predicted velocity so the catcher runs ONTO it from behind /
+    // alongside — relative speed drops into the CATCH_SPEED_BASE absorb
+    // window and the snare actually completes (a caught, not a clatter).
+    const bs = Math.hypot(st.v.x, st.v.y, st.v.z);
+    if (bs > 1e-3) {
+      const TUCK = 6; // m behind the bell along its heading
+      return {
+        x: st.p.x - (st.v.x / bs) * TUCK,
+        y: st.p.y - (st.v.y / bs) * TUCK,
+        z: st.p.z - (st.v.z / bs) * TUCK,
+      };
+    }
     return { x: st.p.x, y: st.p.y, z: st.p.z };
   }
 

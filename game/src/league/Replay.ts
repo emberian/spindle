@@ -261,7 +261,7 @@ function decodeFrames(
 // bit-identically. New storage key + format version ⇒ old re-calls are simply
 // not read (clean discard, never mis-decoded).
 interface EncodedReplay {
-  v: 2;
+  v: 3;
   meta: ReplayMeta;
   roster: ReplayData['roster'];
   frameCount: number;
@@ -271,7 +271,7 @@ interface EncodedReplay {
 
 export function encodeReplay(r: ReplayData): string {
   const payload: EncodedReplay = {
-    v: 2,
+    v: 3,
     meta: r.meta,
     roster: r.roster,
     frameCount: r.frames.length,
@@ -282,8 +282,8 @@ export function encodeReplay(r: ReplayData): string {
 
 export function decodeReplay(s: string): ReplayData {
   const payload = JSON.parse(s) as EncodedReplay;
-  if (payload.v !== 2) {
-    throw new Error(`replay format v${payload.v} unsupported (expected v2)`);
+  if (payload.v !== 3) {
+    throw new Error(`replay format v${payload.v} unsupported (expected v3)`);
   }
   const roster = payload.roster.map((r) => ({
     id: r.id,
@@ -300,7 +300,7 @@ export function decodeReplay(s: string): ReplayData {
 
 // ── Storage (localStorage, mirroring Persistence.ts conventions) ───────────
 
-const STORAGE_KEY = 'rig_recalls_v2';
+const STORAGE_KEY = 'rig_recalls_v3';
 /** Keep only the newest N re-calls (frames are bulky — evict oldest). */
 const MAX_RECALLS = 12;
 

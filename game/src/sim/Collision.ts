@@ -7,8 +7,15 @@ import { REG } from './RegConstants';
 import { clatter, type BellBody } from './Bell';
 
 const RESTITUTION = 0.55;
-const ARM_REACH = 0.7; // m — a catch needs the bell within arm's reach
-const CATCH_SPEED_BASE = 9; // m/s rel-speed a baseline rigger can absorb
+// Catch envelope. The original 0.7 m / 9 m/s was physically unreachable for
+// grapple-only locomotion vs an 18–34 m/s Coriolis bell — telemetry showed
+// ZERO completed catches across a whole match, so no possession/pass play
+// ever formed. Widened to a tether-claw catch (a rigger leads & snares the
+// bell, not bare hands): a real but skill-gated window so possession exists.
+// Determinism is twice-equal (not golden) and the Rust twin moves in
+// lockstep, so this stays bit-safe; stale replays are version-discarded.
+const ARM_REACH = 1.8; // m — claw/tether snare radius
+const CATCH_SPEED_BASE = 16; // m/s rel-speed a baseline rigger can absorb
 
 /** Bounce a free body off the cylinder skin (cross-axis radius = R). Returns
  *  true if it hit this step. */

@@ -6,8 +6,11 @@ use crate::math::Vec3;
 use crate::tuning::R;
 
 pub const RESTITUTION: f64 = 0.55;
-pub const ARM_REACH: f64 = 0.7; // m — a catch needs the bell within arm's reach
-pub const CATCH_SPEED_BASE: f64 = 9.0; // m/s rel-speed a baseline rigger can absorb
+// LOCKSTEP with src/sim/Collision.ts. Widened from 0.7 m / 9 m/s — that
+// envelope was unreachable for grapple locomotion vs a Coriolis bell (zero
+// catches/match, no possession). A tether-claw snare: real but skill-gated.
+pub const ARM_REACH: f64 = 1.8; // m — claw/tether snare radius
+pub const CATCH_SPEED_BASE: f64 = 16.0; // m/s rel-speed a baseline rigger can absorb
 
 /// Bounce a free body off the cylinder skin (cross-axis radius = R).
 /// Reflects the outward-pointing radial velocity component by RESTITUTION;
