@@ -57,13 +57,14 @@ export function pLoop(
   distToRing: number,
   loopPropensity: number,
 ): number {
-  // Only achievable near-axis (high) with the right spin. Window & base
-  // raised (user call: hunt Loops more — the marquee 7 should actually
-  // show in a watched match, not "never in a season"). Team loopPropensity
-  // still scales it, so franchise style divergence is preserved.
-  const radiusFactor = Math.max(0, 1 - radiusFromAxis / (REG.R * 0.9));
-  const distFactor = Math.max(0, 1 - distToRing / (REG.L * 0.5));
-  return Math.min(0.7, 0.20 * radiusFactor * distFactor * (0.4 + loopPropensity));
+  // Canon-rare on purpose: ANY score ends the inning, so if loops are easy
+  // every inning collapses to one spinner-huck and the whole match is ~9
+  // plays with vast dead time. Keeping the Loop a hard, special event makes
+  // innings long multi-cast possession battles (pass chains, gate clears,
+  // Fall as the bread) — far more happens, and the rare Loop still pops.
+  const radiusFactor = Math.max(0, 1 - radiusFromAxis / (REG.R * 0.7));
+  const distFactor = Math.max(0, 1 - distToRing / (REG.L * 0.35));
+  return Math.min(0.6, 0.08 * radiusFactor * distFactor * (0.4 + loopPropensity));
 }
 
 /**

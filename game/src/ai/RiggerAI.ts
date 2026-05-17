@@ -796,11 +796,21 @@ function decideThrow(
     // Otherwise fall through to PRIORITY 2 (pass to an advancing receiver) so
     // possession, pass chains, other roles throwing, and Fall/Rise variety
     // actually emerge instead of spinner-hucks-Loop-or-nothing every cast.
+    // CANON CAST DRIVE (the fix for "~1 throw per inning, nothing happens").
+    // A cast is "three throws to carry the bell past the next gate; clear a
+    // gate → fresh three throws" — a methodical gate-by-gate ADVANCE
+    // ('first' → 'deep' → 'mouth'), only SCORING from the mouth. Hucking a
+    // ring/loop arc on throw 1 from anywhere is what collapsed every inning
+    // to a single play. So: only take the ring shot when we're at the final
+    // ('mouth') gate AND it threads well AND we're in range — OR it's a
+    // do-or-lose last throw. Before the mouth, fall through to the advancing
+    // pass game so possession, catches and gate-clears actually accumulate.
     const throwsLeft = match.cast ? match.cast.throwsLeft : 1;
+    const atMouth = match.cast ? match.cast.gate === 'mouth' : true;
     const threadsWell = gate ? gate.arriveRho <= REG.gateRadius * 0.6 : false;
     const inRange = distToRing < REG.L * 0.45;
     const mustShoot = throwsLeft <= 1;
-    if (gate && ((threadsWell && inRange) || mustShoot)) {
+    if (gate && ((atMouth && threadsWell && inRange) || mustShoot)) {
       // Aim along the REQUIRED throw vector (sim adds player.v back to it);
       // charge so the sim's release speed equals |throwVec| exactly. This
       // makes the realised free-bell velocity match the solved v0, so the
@@ -918,8 +928,12 @@ function decideThrow(
   // when we're pressured). The carrier's own nav advances the bell otherwise.
   const opp = nearestOpponentDist(player, opponents);
   const pressured = opp < 14;
-  const passGainsGround = bestGain > 18;
-  const safeOutlet = bestScore > 0.2 && bestGain > -25;
+  // Lower the forward-gain bar: the cast drive should move the bell gate to
+  // gate readily (a modest advancing pass is the bread of an inning, now
+  // that catches actually complete). Was 18 — too sticky, the carrier just
+  // held and innings never built.
+  const passGainsGround = bestGain > 8;
+  const safeOutlet = bestScore > 0.15 && bestGain > -25;
   const acceptable =
     bestTm != null &&
     bestV0 != null &&

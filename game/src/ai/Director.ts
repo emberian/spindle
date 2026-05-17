@@ -417,7 +417,7 @@ export function runDirector(
   // the attackingFree-divergence test both still hold.
   const attackingFree = !ourRingIsFaith;
 
-  const useLoop = profile.loopPropensity > 0.15 && posture !== 'grind';
+  const useLoop = profile.loopPropensity > 0.25 && posture !== 'grind';
   const loopSetterId = useLoop ? pickLoopSetter(state.players, teamSide) : null;
 
   // Possession / loose-bell determination.
