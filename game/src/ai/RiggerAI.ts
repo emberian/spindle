@@ -294,6 +294,7 @@ export function computePlayerInput(
         markId: null,
         depthSlot: 0.4,
         radiusSlot: 0.45,
+        pressure: 0,
       };
 
       // C2 — Commit role jitter ONCE. The role policies (roles/*.ts) draw a
@@ -489,16 +490,57 @@ function decideNavTarget(
     };
   }
 
-  // Man-marking: sit between the marked opponent and OUR defended ring
-  // (orientation-correct: home defends -X, away defends +X).
+  // Man-marking: shadow the marked opponent on the goal side, but how TIGHT
+  // depends on the Director's pressure. A hard press (carrier-shadower)
+  // closes almost onto the target and slightly TOWARD the bell so it can
+  // snatch/clatter; a loose screen sits further goal-side. This makes
+  // defenders visibly hunt and contest instead of parking 6 m back.
   if (assignment.job === 'mark' && assignment.markId) {
     const mark = state.players.find(p => p.id === assignment.markId);
     if (mark) {
       const tRing = { x: defendRingX(player.team), y: 0, z: 0 };
       const toRing = vnorm(vsub(tRing, mark.p));
-      // 6 m goal-side of the mark (between mark and the ring we defend).
-      return vadd(mark.p, vscale(toRing, 6));
+      // pressure 1 → ~1.2 m onto the target (snatch range);
+      // pressure 0 → ~7 m goal-side screen.
+      const standoff = 7 - assignment.pressure * 5.8;
+      const base = vadd(mark.p, vscale(toRing, standoff));
+      // When pressing hard, bias the target a touch toward the live bell so
+      // the marker actually arrives in clatter/snatch range, not behind it.
+      if (assignment.pressure > 0.7) {
+        const toBell = vsub(state.bell.p, base);
+        const bl = vlen(toBell);
+        if (bl > 1e-6) {
+          const lean = Math.min(2.5, bl) ;
+          return vadd(base, vscale(toBell, lean / bl));
+        }
+      }
+      return base;
     }
+  }
+
+  // SUPPORT (offense, off-ball): don't trail passively — make a CUT into a
+  // distinct lane ahead of the bell so there is always a moving outlet the
+  // eye can follow. Lane is a stable function of the committed styleAngle so
+  // it does not jitter; depth leads the bell toward our ring.
+  if (assignment.job === 'support') {
+    const sgn = director.attackSign;
+    const cutX = state.bell.p.x + sgn * (45 + style!.radius * 55);
+    const ang = Math.PI * (0.12 + (style?.angle ?? 0.5) * 1.4);
+    const R = 14 + (style?.radius ?? 0.5) * 30;
+    return { x: cutX, y: R * Math.cos(ang), z: R * Math.sin(ang) };
+  }
+
+  // ZONE (defense, off-ball / help): roam a covering arc in front of OUR
+  // defended ring at the slotted radius rather than planting on one point —
+  // keeps the back line visibly alive and ready to help/intercept.
+  if (assignment.job === 'zone') {
+    const dx = defendRingX(player.team);
+    const sgn = attackSign(player.team); // toward our attack = away from our ring
+    const guardX = dx + sgn * (22 + (style?.radius ?? 0.5) * 30);
+    const ang =
+      Math.PI * (0.15 + assignment.radiusSlot * 1.3 + (style?.angle ?? 0) * 0.2);
+    const R = 16 + assignment.radiusSlot * 34;
+    return { x: guardX, y: R * Math.cos(ang), z: R * Math.sin(ang) };
   }
 
   // Otherwise defer to the role policy for positional craft, but feed it the

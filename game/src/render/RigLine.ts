@@ -36,6 +36,8 @@ const _mid = new THREE.Vector3();
 const _radial = new THREE.Vector3();
 const _quat = new THREE.Quaternion();
 const _off = new THREE.Vector3();
+const _dir = new THREE.Vector3();
+const _perp = new THREE.Vector3();
 
 function blendHex(a: number, b: number, t: number): number {
   const ar = (a >> 16) & 0xff, ag = (a >> 8) & 0xff, ab = a & 0xff;
@@ -100,6 +102,13 @@ class LineInstance {
   private glint: THREE.Mesh;
   private glintCore: THREE.Mesh;
 
+  // Dynamics state.
+  private active = false;     // had a line last frame? (for fire-snap detect)
+  private fire = 0;           // 0→1 snap-out progress on a fresh fire
+  private prevChord = 0;      // last frame chord length (reel-in detection)
+  private ta15 = false;       // prev taut (for snap-to-taut shimmer kick)
+  private snapKick = 0;       // brief shimmer burst when a line goes taut
+
   constructor() {
     const count = (SAG_SEGMENTS + 1) * 3;
     this.posArr = new Float32Array(count);
@@ -142,10 +151,12 @@ class LineInstance {
     this.group.visible = false;
   }
 
-  apply(ps: PlayerSim, isP1: boolean, now: number): void {
+  apply(ps: PlayerSim, isP1: boolean, now: number, dt: number): void {
     const ls = ps.line;
     if (!ls) {
       this.group.visible = false;
+      this.active = false;
+      this.fire = 0;
       return;
     }
     this.group.visible = true;
@@ -155,9 +166,64 @@ class LineInstance {
 
     const chord = _from.distanceTo(_to);
     const taut = ls.taut;
-    const sag = taut ? 0 : Math.min(chord * 0.12, 6);
+
+    // ── Fire-snap: a brand-new line shoots out from the hand to the anchor
+    // in a fast ease-out (~90 ms) instead of just appearing welded.
+    if (!this.active) {
+      this.fire = 0;
+      this.prevChord = chord;
+    }
+    this.active = true;
+    this.fire = Math.min(1, this.fire + dt / 0.09);
+    const fireEase = 1 - Math.pow(1 - this.fire, 3); // fast out, eases in
+
+    // ── Snap-to-taut shimmer kick: the instant slack→taut, the line cracks
+    // tight; give it a brief high-freq tension shimmer that decays.
+    if (taut && !this.ta15) this.snapKick = 1;
+    this.ta15 = taut;
+    this.snapKick = Math.max(0, this.snapKick - dt * 4.5);
+
+    // Reeling-in reads as the chord shrinking frame-to-frame: tighten the
+    // line visibly (sag collapses faster, slight extra brightness).
+    const reelingIn = chord < this.prevChord - 0.02;
+    this.prevChord = chord;
+
+    // Sag: taut = laser straight; slack = lazy catenary; reeling pulls it in.
+    let sag = taut ? 0 : Math.min(chord * 0.12, 6);
+    if (reelingIn) sag *= 0.55;
+
+    // The animated endpoint races out along the chord during the fire-snap.
+    _to.lerpVectors(_from, _to, fireEase);
 
     fillCatenary(_from, _to, sag, SAG_SEGMENTS, this.posArr);
+
+    // ── Tension shimmer: a taut line is *energized* — overlay a tiny, fast
+    // perpendicular ripple (sub-cm, scaled by chord) so it sings rather than
+    // sitting dead-straight. Strongest right after it cracks taut, then a
+    // faint idle hum. None when slack (a slack line is lazy, not humming).
+    if (taut && this.fire >= 1) {
+      _dir.subVectors(_to, _from);
+      const dl = _dir.length();
+      if (dl > 1e-4) {
+        _dir.multiplyScalar(1 / dl);
+        _perp.set(0, _dir.z, -_dir.y); // a stable perpendicular (in y,z)
+        if (_perp.lengthSq() < 1e-6) _perp.set(0, 1, 0);
+        else _perp.normalize();
+        const hum = 0.012 + this.snapKick * 0.06;
+        const amp = hum * Math.min(dl, 30) * 0.06;
+        const tt = now * 0.001;
+        for (let i = 1; i < SAG_SEGMENTS; i++) {
+          const u = i / SAG_SEGMENTS;
+          // standing-wave-ish: nodes at the ends, fast travelling ripple
+          const env = Math.sin(u * Math.PI);
+          const w = Math.sin(u * 26 - tt * 34) * env * amp;
+          this.posArr[i * 3 + 0] += _perp.x * w;
+          this.posArr[i * 3 + 1] += _perp.y * w;
+          this.posArr[i * 3 + 2] += _perp.z * w;
+        }
+      }
+    }
+
     this.geo.attributes.position.needsUpdate = true;
     this.geo.setDrawRange(0, SAG_SEGMENTS + 1);
 
@@ -176,11 +242,18 @@ class LineInstance {
     this.inkGeo.setDrawRange(0, SAG_SEGMENTS + 1);
 
     const teamCol = ps.team === 'home' ? PAL.cyan : PAL.orange;
-    const lineHex = taut ? teamCol : blendHex(teamCol, PAL.dim, 0.5);
-    const op = (taut ? TAUT_OPACITY : SLACK_OPACITY) + (isP1 ? P1_BOOST : 0);
+    // Taut = energized: push the colour toward bright paper (hot wire) and
+    // pulse it subtly with the snap-kick so a freshly-tensioned line cracks
+    // visibly. Slack = lazy & dim. (No additive on the line — opacity only,
+    // so it never contributes to a screen-white mass.)
+    const tautHot = blendHex(teamCol, PAL.paper, 0.30 + this.snapKick * 0.25);
+    const lineHex = taut ? tautHot : blendHex(teamCol, PAL.dim, 0.5);
+    const op = (taut ? TAUT_OPACITY : SLACK_OPACITY)
+      + (isP1 ? P1_BOOST : 0)
+      + (taut ? this.snapKick * 0.04 : 0);
 
     this.lineMat.color.setHex(lineHex);
-    this.lineMat.opacity = op;
+    this.lineMat.opacity = Math.min(1, op);
     this.inkMat.opacity = (taut ? 0.85 : 0.55) + (isP1 ? P1_BOOST : 0);
 
     // Anchor glint — bright/faceted when taut, soft when slack.
@@ -200,6 +273,8 @@ class LineInstance {
 
   hide(): void {
     this.group.visible = false;
+    this.active = false;
+    this.fire = 0;
   }
 }
 
@@ -210,6 +285,7 @@ export class RigLines {
   private instances = new Map<string, LineInstance>();
   private group = new THREE.Group();
   private p1Id: string | null = null;
+  private lastNow = 0;
 
   constructor(scene: THREE.Scene) {
     scene.add(this.group);
@@ -228,6 +304,10 @@ export class RigLines {
     }
 
     const now = performance.now();
+    let dt = this.lastNow ? (now - this.lastNow) / 1000 : 1 / 60;
+    dt = THREE.MathUtils.clamp(dt, 1 / 240, 1 / 15);
+    this.lastNow = now;
+
     for (const inst of this.instances.values()) inst.hide();
 
     for (const ps of players) {
@@ -237,7 +317,7 @@ export class RigLines {
         this.group.add(inst.group);
         this.instances.set(ps.id, inst);
       }
-      inst.apply(ps, ps.id === this.p1Id, now);
+      inst.apply(ps, ps.id === this.p1Id, now, dt);
     }
   }
 }

@@ -43,6 +43,14 @@ export interface PlayerAssignment {
   depthSlot: number;
   /** Assigned axis-radius fraction [0,1] for spacing receivers vertically. */
   radiusSlot: number;
+  /**
+   * DYNAMISM: how tightly this marker pressures its target. 1 = press right
+   * onto the target (the carrier-shadower / snatch attempt), 0.5 = close
+   * shadow of a likely receiver, 0 = passive goal-side screen. Drives the
+   * stand-off distance in RiggerAI's mark nav AND whether the marker fires a
+   * contest line at the bell when in snatch range. Defenders no longer just
+   * sit goal-side — they hunt. */
+  pressure: number;
 }
 
 export interface DirectorState {
@@ -224,6 +232,7 @@ function assignMarks(
   opponents: PlayerSim[],
   bellHolderId: string | null,
   assignments: Record<string, PlayerAssignment>,
+  aggression: number,
 ): void {
   if (opponents.length === 0) return;
   const usedOpp = new Set<string>();
@@ -235,8 +244,14 @@ function assignMarks(
     return 0;
   });
 
-  // Each defender marks the nearest still-unmarked, highest-threat opponent.
+  // DYNAMISM: defenders HUNT. The carrier-marker presses right onto the
+  // carrier (snatch attempts at the mouth); the next two most-dangerous
+  // opponents get close shadows; the rest get a tighter-than-before goal-side
+  // screen. Aggression scales every press up so brave franchises crowd the
+  // contest. Each defender marks the nearest still-unmarked, highest-threat
+  // opponent (greedy, deterministic via id tie-break in dist order).
   const defenders = [...myPlayers];
+  let rank = 0;
   for (const opp of ranked) {
     if (defenders.length === 0) break;
     if (usedOpp.has(opp.id)) continue;
@@ -244,25 +259,44 @@ function assignMarks(
     let bestD = Infinity;
     for (let i = 0; i < defenders.length; i++) {
       const d = dist3(defenders[i].p, opp.p);
-      if (d < bestD) {
+      if (d < bestD - 1e-6) {
         bestD = d;
         bestI = i;
       }
     }
     if (bestI < 0) break;
     const def = defenders.splice(bestI, 1)[0];
+    const isCarrier = opp.id === bellHolderId;
+    // Carrier shadower presses hardest (snatch). Secondary threats get a
+    // close shadow; deeper-ranked opponents get a firm screen — but nobody
+    // sits passively any more.
+    let pressure: number;
+    if (isCarrier) pressure = Math.min(1, 0.85 + aggression * 0.15);
+    else if (rank <= 2) pressure = Math.min(1, 0.55 + aggression * 0.35);
+    else pressure = Math.min(0.85, 0.35 + aggression * 0.35);
     assignments[def.id] = {
       job: 'mark',
       markId: opp.id,
       depthSlot: 0,
       radiusSlot: 0,
+      pressure,
     };
     usedOpp.add(opp.id);
+    rank++;
   }
 
-  // Leftover defenders (more of us than them): hold a zone near our ring.
+  // Leftover defenders (more of us than them): don't plant — actively roam a
+  // help zone at varied radii so the calm stays populated, not parked.
+  let zi = 0;
   for (const def of defenders) {
-    assignments[def.id] = { job: 'zone', markId: null, depthSlot: 0, radiusSlot: 0.5 };
+    assignments[def.id] = {
+      job: 'zone',
+      markId: null,
+      depthSlot: 0,
+      radiusSlot: 0.3 + (zi % 3) * 0.28,
+      pressure: 0,
+    };
+    zi++;
   }
 }
 
@@ -293,6 +327,7 @@ function assignReceivers(
         markId: null,
         depthSlot: 0.4,
         radiusSlot: 0.15,
+        pressure: 0,
       };
       continue;
     }
@@ -304,31 +339,42 @@ function assignReceivers(
         markId: null,
         depthSlot: 0.18,
         radiusSlot: 0.35,
+        pressure: 0,
       };
       continue;
     }
-    // Spread the rest from a mid outlet to a deep scoring threat.
+    // Spread the rest from a mid outlet to a DEEP scoring threat. Push the
+    // deep band right up to the ring so the calm always has a runner
+    // threatening the mouth (dramatic, not bunched mid-field).
     const frac = nonLoopCount > 2 ? (k - 1) / (nonLoopCount - 2) : 0.6;
-    const depthSlot = 0.4 + frac * 0.55; // 0.40 (mid) .. 0.95 (deep at ring)
-    // Alternate radius bands by role so wings keep their identity.
+    const depthSlot = 0.45 + frac * 0.54; // 0.45 (mid) .. 0.99 (at the ring)
+    // Alternate radius bands by role so wings keep their identity AND fan to
+    // visibly distinct radii — widened so the spread reads on screen instead
+    // of every rigger hugging the same band.
     let radiusSlot: number;
     switch (p.role) {
       case 'freewing':
-        radiusSlot = 0.22;
+        radiusSlot = 0.16; // high / near-axis (Coriolis curve game)
         break;
       case 'faithwing':
-        radiusSlot = 0.6;
+        radiusSlot = 0.68; // wide spinward
         break;
       case 'anchor':
-        radiusSlot = 0.78;
+        radiusSlot = 0.85; // deep, near the rim
         break;
       case 'spinner':
-        radiusSlot = 0.42;
+        radiusSlot = 0.4;
         break;
       default:
-        radiusSlot = 0.4 + 0.3 * frac;
+        radiusSlot = 0.35 + 0.45 * frac;
     }
-    assignments[p.id] = { job: 'receive', markId: null, depthSlot, radiusSlot };
+    assignments[p.id] = {
+      job: 'receive',
+      markId: null,
+      depthSlot,
+      radiusSlot,
+      pressure: 0,
+    };
   }
 }
 
@@ -418,24 +464,30 @@ export function runDirector(
     recoverId = best ? best.id : null;
     for (const p of myPlayers) {
       if (p.id === recoverId) {
-        assignments[p.id] = { job: 'recover', markId: null, depthSlot: 0, radiusSlot: 0 };
+        assignments[p.id] = { job: 'recover', markId: null, depthSlot: 0, radiusSlot: 0, pressure: 0 };
       } else if (hasPossession || thrownByUs) {
         // Our throw in flight: keep offensive receiving shape.
-        assignments[p.id] = { job: 'receive', markId: null, depthSlot: 0.6, radiusSlot: 0.4 };
+        assignments[p.id] = { job: 'receive', markId: null, depthSlot: 0.6, radiusSlot: 0.4, pressure: 0 };
       } else {
         // Their loose bell about to be theirs: pre-mark.
-        assignments[p.id] = { job: 'zone', markId: null, depthSlot: 0, radiusSlot: 0.5 };
+        assignments[p.id] = { job: 'zone', markId: null, depthSlot: 0, radiusSlot: 0.5, pressure: 0 };
       }
     }
     if (hasPossession || thrownByUs) {
       const recvs = myPlayers.filter(p => p.id !== recoverId);
       assignReceivers(recvs, loopSetterId, assignments);
       if (recoverId)
-        assignments[recoverId] = { job: 'recover', markId: null, depthSlot: 0, radiusSlot: 0 };
+        assignments[recoverId] = { job: 'recover', markId: null, depthSlot: 0, radiusSlot: 0, pressure: 0 };
     } else {
-      assignMarks(myPlayers.filter(p => p.id !== recoverId), opponents, null, assignments);
+      assignMarks(
+        myPlayers.filter(p => p.id !== recoverId),
+        opponents,
+        null,
+        assignments,
+        profile.aggression,
+      );
       if (recoverId)
-        assignments[recoverId] = { job: 'recover', markId: null, depthSlot: 0, radiusSlot: 0 };
+        assignments[recoverId] = { job: 'recover', markId: null, depthSlot: 0, radiusSlot: 0, pressure: 0 };
     }
   } else if (heldByUs) {
     // OFFENSE: the holder is the carrier; the rest are receivers in slots.
@@ -445,11 +497,17 @@ export function runDirector(
     // If the carrier is a non-AI/excluded player (e.g. P1 in single-player),
     // carrierId may not be in myPlayers — that's fine, slots still hold.
     if (myPlayers.some(p => p.id === carrierId)) {
-      assignments[carrierId] = { job: 'carry', markId: null, depthSlot: 1, radiusSlot: 0.4 };
+      assignments[carrierId] = { job: 'carry', markId: null, depthSlot: 1, radiusSlot: 0.4, pressure: 0 };
     }
   } else {
     // DEFENSE: the opponent holds it — man-mark, prioritising the carrier.
-    assignMarks(myPlayers, opponents, holder ? holder.id : null, assignments);
+    assignMarks(
+      myPlayers,
+      opponents,
+      holder ? holder.id : null,
+      assignments,
+      profile.aggression,
+    );
   }
 
   // Stable style noise for the window (decorrelated, deterministic).
@@ -461,8 +519,8 @@ export function runDirector(
     if (p.id === 'P1') continue;
     if (!assignments[p.id]) {
       assignments[p.id] = hasPossession
-        ? { job: 'support', markId: null, depthSlot: 0.4, radiusSlot: 0.45 }
-        : { job: 'zone', markId: null, depthSlot: 0, radiusSlot: 0.5 };
+        ? { job: 'support', markId: null, depthSlot: 0.4, radiusSlot: 0.45, pressure: 0 }
+        : { job: 'zone', markId: null, depthSlot: 0, radiusSlot: 0.5, pressure: 0 };
     }
   }
 

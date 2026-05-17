@@ -26,13 +26,26 @@ export function bellGlow(chime: number): number {
 const NORMAL_LEN = 300;   // segments to hold Coriolis arc
 const LOOP_LEN   = 600;   // hold full closed-orbit history in loop mode
 const HALF_W_BASE = 0.10; // half-width of ribbon at newest (metres — tune to ring scale)
-const HALF_W_LOOP = 0.18; // wider in loop mode for extra drama
+const HALF_W_LOOP = 0.20; // wider in loop mode for extra drama
+// Speed (m/s, derived from sample spacing × assumed push cadence) at which
+// the trail reaches its full blaze width/heat. Tunable — lower = blazes
+// sooner. The push() cadence is the frame rate (~60 Hz) so we treat the
+// per-sample step distance directly as a speed proxy.
+const BLAZE_FULL_STEP = 0.55; // metres between consecutive samples = "fast"
+const HALF_W_SPEED_GAIN = 1.9; // taut-fast ribbon up to ~1.9× wide
 
 // Palette (linear sRGB, not gamma — three.js colour math is linear)
 //   chime=1  → brilliant cyan-white  #1aa6b7 saturated + blown toward white
 //   chime=0  → muted grey            desaturated, dimmed
 const TRUE_R = 0.18, TRUE_G = 0.85, TRUE_B = 1.00; // cyan-white
 const FLAT_R = 0.28, FLAT_G = 0.30, FLAT_B = 0.32; // cool grey
+
+// Hot-path scratch (push()/_rebuild() runs every frame — zero per-call alloc).
+const _camDir = new THREE.Vector3();
+const _tan    = new THREE.Vector3();
+const _perp   = new THREE.Vector3();
+const _va     = new THREE.Vector3();
+const _vb     = new THREE.Vector3();
 
 // ── material ─────────────────────────────────────────────────────────────────
 // Vertex-coloured, additive-blended mesh.  No lighting — colours ARE the light.
@@ -120,21 +133,36 @@ export class BellTrail {
 
     // We need a "right" vector perpendicular to the trail direction at each point.
     // Strategy: compute tangent at each sample, cross with view direction.
-    const camDir = new THREE.Vector3(0, 0, 1); // fallback
+    const camDir = _camDir.set(0, 0, 1); // fallback
     if (this.cam) {
       this.cam.getWorldDirection(camDir);
     }
 
-    const tan  = new THREE.Vector3();
-    const perp = new THREE.Vector3();
-    const a    = new THREE.Vector3();
-    const b    = new THREE.Vector3();
+    const tan  = _tan;
+    const perp = _perp;
+    const a    = _va;
+    const b    = _vb;
 
     let quadCount = 0;
 
     for (let i = 0; i < n; i++) {
       const p = this.buf[i];
       const age = i / (n - 1);  // 0 = oldest, 1 = newest
+
+      // Per-sample SPEED proxy: distance to the neighbouring sample. push()
+      // is called at frame cadence, so a bigger step = a faster bell. This
+      // makes the ribbon visibly BLAZE wider/hotter exactly where it's fast
+      // (a hard swing or a developing Loop) and stay slim where it dawdles —
+      // pure geometry, zero sim/determinism coupling.
+      let step: number;
+      if (i === n - 1) {
+        const q = this.buf[n - 2];
+        step = Math.hypot(p.x - q.x, p.y - q.y, p.z - q.z);
+      } else {
+        const q = this.buf[i + 1];
+        step = Math.hypot(q.x - p.x, q.y - p.y, q.z - p.z);
+      }
+      const spd = Math.min(1, step / BLAZE_FULL_STEP); // 0..1 blaze factor
 
       // Tangent: central difference where possible
       if (i === 0) {
@@ -157,10 +185,11 @@ export class BellTrail {
         perp.crossVectors(tan, THREE.Object3D.DEFAULT_UP).normalize();
       }
 
-      // Width taper: fat at newest (age=1), whisper-thin at oldest (age=0)
-      // Use a gentle curve so middle of arc is still readable
+      // Width taper: fat at newest (age=1), whisper-thin at oldest (age=0).
+      // Speed swells the ribbon so a fast bell carves a bold sweeping arc.
       const widthFactor = 0.15 + 0.85 * Math.pow(age, 0.6);
-      const hw = halfW * widthFactor;
+      const speedSwell = 1 + spd * (HALF_W_SPEED_GAIN - 1) * (0.4 + 0.6 * age);
+      const hw = halfW * widthFactor * speedSwell;
 
       // Vertex positions
       const vi = i * 2; // vertex pair index
@@ -172,16 +201,36 @@ export class BellTrail {
       this.verts[pi + 0] = a.x; this.verts[pi + 1] = a.y; this.verts[pi + 2] = a.z;
       this.verts[pi + 3] = b.x; this.verts[pi + 4] = b.y; this.verts[pi + 5] = b.z;
 
-      // Colour: blend between grey (c=0) and cyan-white (c=1)
+      // Colour: blend between grey (c=0) and cyan-white (c=1). Speed then
+      // shifts the HOT (recent) part of the trail toward incandescent white
+      // so a fast bell reads as a blazing streak — this carries the drama via
+      // HUE/whiteness, NOT raw magnitude, which keeps additive bloom in check.
       const t = p.c; // chime
-      const cr = FLAT_R + (TRUE_R - FLAT_R) * t;
-      const cg = FLAT_G + (TRUE_G - FLAT_G) * t;
-      const cb = FLAT_B + (TRUE_B - FLAT_B) * t;
+      let cr = FLAT_R + (TRUE_R - FLAT_R) * t;
+      let cg = FLAT_G + (TRUE_G - FLAT_G) * t;
+      let cb = FLAT_B + (TRUE_B - FLAT_B) * t;
+      const heat = spd * Math.pow(age, 0.7);     // only the recent fast part
+      cr += (1.0 - cr) * heat * 0.55;
+      cg += (1.0 - cg) * heat * 0.35;            // bias toward cyan-white
+      cb += (1.0 - cb) * heat * 0.20;
 
-      // Brightness: oldest=dim, newest=bright; in loop mode blast it
+      // Brightness: oldest=dim, newest=bright; loop blasts it. A modest
+      // speed lift sharpens the leading edge. Hard-capped well under a
+      // white-out: max ≈ 1.0·1.6(loop)·1.18(speed) ≈ 1.9 on a partly-
+      // desaturated colour through opacity-0.78 additive — bloom-safe at 46 m
+      // (no increase vs the pre-existing 1.6 loop ceiling territory).
       const loopBoost = this.loopMode ? 1.6 : 1.0;
-      // Fade floor: 0.08 so the old tail is faint but not gone
-      const bright = (0.08 + 0.92 * Math.pow(age, 0.8)) * loopBoost;
+      const speedLift = 1 + spd * 0.18 * Math.pow(age, 1.2);
+      // In loop mode the WHOLE closed orbit should glow evenly (a held ring,
+      // not a fading comet): lift the floor and flatten the age curve so the
+      // arc reads as one continuous gorgeous loop. Normal mode keeps the
+      // comet taper (fade floor 0.08) for the developing-arc money shot.
+      const floor = this.loopMode ? 0.45 : 0.08;
+      const ageCurve = this.loopMode ? Math.pow(age, 0.35) : Math.pow(age, 0.8);
+      const bright = Math.min(
+        1.9,
+        (floor + (1 - floor) * ageCurve) * loopBoost * speedLift,
+      );
 
       this.colors[pi + 0] = cr * bright;  this.colors[pi + 1] = cg * bright;  this.colors[pi + 2] = cb * bright;
       this.colors[pi + 3] = cr * bright;  this.colors[pi + 4] = cg * bright;  this.colors[pi + 5] = cb * bright;

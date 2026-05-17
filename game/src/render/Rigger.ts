@@ -35,6 +35,13 @@ const STROKE_FULL_SPEED = 14;
 const STROKE_PER_METRE = 0.5;
 // Idle drift angular speed (rad/s).
 const IDLE_RATE = 1.1;
+// Speed (m/s) at which the athletic "effort" (streamline + hard cadence)
+// saturates. Lower than STROKE_FULL_SPEED so the figure reads as *working*
+// well before top speed. Tunable.
+const EFFORT_FULL_SPEED = 9;
+// Decel (m/s²) magnitude (opposing velocity) at which the brace/settle pose
+// is fully expressed — an athlete planting a stop. Tunable.
+const BRACE_FULL_DECEL = 22;
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -68,6 +75,8 @@ const _basisM = new THREE.Matrix4();
 const _basisQ = new THREE.Quaternion();
 const _hand = new THREE.Vector3();
 const _accLocal = new THREE.Vector3();
+const _toAnchor = new THREE.Vector3();
+const _velDir = new THREE.Vector3();
 
 // ── Per-figure instance ──────────────────────────────────────────────────────
 
@@ -93,6 +102,20 @@ class RiggerInstance {
   private strokePhase = 0;
   private reach = 0;
   private idlePhase = Math.random() * Math.PI * 2;
+
+  // Athletic-motion damped state.
+  private effort = 0;
+  private brace = 0;
+  private wind = 0;
+  private swingPhase = Math.random() * Math.PI * 2;
+  // For swing-rate derivation: prior unit vector hand→anchor (the line we
+  // whip around). We advance swingPhase by the angle swept per frame so the
+  // haul cadence is welded to how fast the rigger actually orbits the anchor.
+  private prevAx = 0; private prevAy = 0; private prevAz = 0;
+  private hadAnchor = false;
+  private wasLine = false;
+  private prevEmph = 0;
+  private throwTimer = 0; // s remaining in a windup→release throw envelope
 
   get root(): THREE.Group {
     return this.figure.root;
@@ -183,15 +206,88 @@ class RiggerInstance {
       emphasis,
     );
 
+    // ── Athletic effort: fast travel = streamlined, hard-pumping athlete.
+    const effortTarget = THREE.MathUtils.clamp(speed / EFFORT_FULL_SPEED, 0, 1);
+
+    // ── Brace/settle: project acceleration onto the OPPOSITE of velocity.
+    // A large component fighting the direction of travel = the rigger is
+    // killing speed → plant a brace pose. (Only meaningful while moving.)
+    let braceTarget = 0;
+    if (speed > 1.5) {
+      _velDir.set(this.vx, this.vy, this.vz).multiplyScalar(1 / speed);
+      const decel = -(ax * _velDir.x + ay * _velDir.y + az * _velDir.z);
+      braceTarget = THREE.MathUtils.clamp(decel / BRACE_FULL_DECEL, 0, 1);
+    }
+
+    // ── Throw envelope: detect the bell leaving the hand. The orchestrator
+    // raises emphasis on the carrier/thrower; the frame emphasis DROPS sharply
+    // (carry → released) we fire a windup→release whip. Also fires on a line
+    // release (let the bell go on a cross-line). Pure visual, no sim read.
+    const lineReleased = this.wasLine && !ps.line;
+    const carryDrop = this.prevEmph - emphasis;
+    if (this.throwTimer <= 0 && (carryDrop > 0.35 || (lineReleased && this.prevEmph > 0.2))) {
+      this.throwTimer = 0.42; // s: brief wind-up then explosive release
+    }
+    this.wasLine = !!ps.line;
+    this.prevEmph = emphasis;
+    let windTarget = 0;
+    if (this.throwTimer > 0) {
+      this.throwTimer -= dt;
+      // First ~45% = cock back (negative), remainder = whip across (positive),
+      // decaying to 0 (follow-through settle).
+      const u = 1 - Math.max(0, this.throwTimer) / 0.42; // 0→1 over envelope
+      windTarget = u < 0.45
+        ? -(u / 0.45)                       // -1 … 0  (wind up)
+        :  Math.pow(1 - (u - 0.45) / 0.55, 0.6); // 1 → 0 (release + follow)
+      if (u < 0.45) windTarget = -Math.pow(u / 0.45, 0.7);
+    }
+
     // ── Damp everything (frame-rate independent) ────────────────────────────
     this.lean = damp(this.lean, leanTarget, 8, dt);
     this.bank = damp(this.bank, bankTarget, 8, dt);
     this.strokeAmp = damp(this.strokeAmp, ampTarget, 5, dt);
     this.reach = damp(this.reach, reachTarget, 7, dt);
+    this.effort = damp(this.effort, effortTarget, 4, dt);
+    this.brace = damp(this.brace, braceTarget, 9, dt);
+    // Wind whips fast (snappy) but never pops because the envelope itself is
+    // smooth; a quick damp removes any frame jitter.
+    this.wind = damp(this.wind, windTarget, 22, dt);
+
+    // ── Swing/haul cadence: when on a line, advance swingPhase by the angle
+    // actually swept around the anchor this frame (welded to the swing), plus
+    // a speed baseline so a fast straight haul still pumps. Off-line it idles.
+    const swingRate = 1.0 + speed * 0.10;          // rad/s baseline (off-line)
+    if (ps.line) {
+      _toAnchor.set(
+        ps.line.anchorPos.x - ps.p.x,
+        ps.line.anchorPos.y - ps.p.y,
+        ps.line.anchorPos.z - ps.p.z,
+      );
+      const al = _toAnchor.length();
+      if (al > 1e-3) {
+        _toAnchor.multiplyScalar(1 / al);
+        if (this.hadAnchor) {
+          const dot = THREE.MathUtils.clamp(
+            this.prevAx * _toAnchor.x + this.prevAy * _toAnchor.y + this.prevAz * _toAnchor.z,
+            -1, 1,
+          );
+          const swept = Math.acos(dot);            // angle orbited this frame
+          // 2 haul beats per radian swept feels like driving the swing.
+          this.swingPhase += swept * 2.0 + speed * dt * 0.15;
+        }
+        this.prevAx = _toAnchor.x; this.prevAy = _toAnchor.y; this.prevAz = _toAnchor.z;
+        this.hadAnchor = true;
+      }
+    } else {
+      this.hadAnchor = false;
+      this.swingPhase += swingRate * dt;
+    }
 
     // Stroke phase advances with distance travelled (+ a slow idle baseline so
-    // a parked rigger still breathes/floats rather than freezing).
-    this.strokePhase += speed * dt * STROKE_PER_METRE + dt * 1.4;
+    // a parked rigger still breathes/floats rather than freezing). Effort
+    // adds tempo so a hard-driving rigger's limbs cadence faster.
+    this.strokePhase += speed * dt * STROKE_PER_METRE * (1 + this.effort * 0.8)
+      + dt * 1.4;
     this.idlePhase += dt * IDLE_RATE;
 
     // ── Colours ─────────────────────────────────────────────────────────────
@@ -207,6 +303,7 @@ class RiggerInstance {
       this.lean, this.bank,
       this.strokePhase, this.strokeAmp,
       this.reach, this.idlePhase,
+      this.effort, this.swingPhase, this.brace, this.wind,
     );
 
     // ── Publish animated grapple hand for RigLine coordination ──────────────

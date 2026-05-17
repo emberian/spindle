@@ -227,44 +227,98 @@ export class RiggerFigure {
    * @param reach     0..1 how far the R (grapple) arm extends forward toward
    *                  the line/travel direction
    * @param idle      idle-drift phase (radians) for the near-still calm sway
+   * @param effort    0..1 athletic exertion: streamline + powered haul. Drives
+   *                  the difference between "sliding" and "swinging hard".
+   * @param swingPhase  rad, the haul cycle: the grapple arm rhythmically
+   *                  HAULS the line in (pull → recover) when on a taut line.
+   * @param brace     0..1 deceleration brace/settle (legs forward, body up,
+   *                  arms wide to kill speed) — an athlete planting a stop.
+   * @param wind      -1..+1 throw shaping: <0 = wind-up (arm cocked back),
+   *                  >0 = release follow-through (arm whipped across). 0 = none.
    */
   pose(
     lean: number, bank: number,
     strokeAng: number, strokeAmp: number,
     reach: number, idle: number,
+    effort = 0, swingPhase = 0, brace = 0, wind = 0,
   ): void {
-    // Spine: lean + bank. Idle adds a slow breathing sway when amp is low.
+    // ── Spine: lean + bank, plus an effort streamline (curl toward velocity)
+    // and a brace-up (chest rises, hips drop forward) when killing speed.
     const idleSway = (1 - strokeAmp) * 0.05;
+    const streamline = effort * 0.45;          // tuck forward when driving hard
+    const braceArch  = -brace * 0.55;          // arch back, plant against motion
+    // Throw torque: wind-up coils the spine away, release whips it across.
+    const windCoil = wind < 0 ? wind * 0.30 : wind * 0.22;
     this.spine.rotation.set(
-      lean + Math.sin(idle) * idleSway,
-      0,
+      lean + streamline + braceArch + Math.sin(idle) * idleSway,
+      windCoil,
       bank + Math.cos(idle * 0.7) * idleSway * 0.6,
     );
-    // Shoulder yoke counter-rotates slightly = secondary follow-through.
-    this.shoulders.rotation.y = -Math.sin(strokeAng) * strokeAmp * 0.22;
-    this.shoulders.rotation.x = -lean * 0.25;
+    // Shoulder yoke: stroke counter-rotation + a strong haul/throw twist so
+    // the whole upper body whips around the working arm (athletic, not sliding).
+    const haul = Math.sin(swingPhase);                 // -1..1 pull/recover
+    const haulTwist = haul * reach * (0.35 + effort * 0.45);
+    this.shoulders.rotation.y = -Math.sin(strokeAng) * strokeAmp * 0.22
+      + haulTwist - windCoil * 1.4;
+    this.shoulders.rotation.x = -lean * 0.25 - effort * 0.30 + brace * 0.35;
 
-    // Zero-g swim stroke: arms & legs sweep in smooth opposed arcs. Amplitude
-    // scales with speed; a gentle baseline keeps idle floaty (never frozen).
-    const amp = 0.28 + strokeAmp * 0.95;
+    // ── Limb cadence: amplitude AND tempo scale with speed/effort so a fast
+    // rigger thrashes hard; a settling one stiffens (brace damps the swim).
+    const swimGate = (1 - brace * 0.8);
+    const amp = (0.28 + strokeAmp * 0.95 + effort * 0.55) * swimGate;
     const s = Math.sin(strokeAng);
     const c = Math.cos(strokeAng);
 
-    // Arms sweep fore/aft (X) with a soft outward flare (Z); elbows trail.
-    const armBend = 0.35 + strokeAmp * 0.45;
-    this.armL.set( s * amp * 0.7,  armBend + (s * 0.5 + 0.5) * 0.3, -0.12 - c * 0.10);
-    // Right arm: blend stroke with the reach pose toward +Z (travel/line).
-    const reachSwing = -1.15;            // arm forward+up toward travel
-    const reachBend  = 0.18;             // nearly straight when reaching
-    const rSwing = THREE.MathUtils.lerp(-s * amp * 0.7, reachSwing, reach);
-    const rBend  = THREE.MathUtils.lerp(armBend + (-s * 0.5 + 0.5) * 0.3, reachBend, reach);
-    const rFlare = THREE.MathUtils.lerp(0.12 + c * 0.10, -0.05, reach);
+    // Left arm: swim stroke; a fast hard pump when effort is high. Under brace
+    // it flares WIDE forward to kill momentum (an athlete's air-brake).
+    const armBend = 0.35 + strokeAmp * 0.45 + effort * 0.25;
+    const lSwim  =  s * amp * 0.7;
+    const lBrace = -1.05;                       // forward, wide
+    this.armL.set(
+      THREE.MathUtils.lerp(lSwim, lBrace, brace),
+      armBend + (s * 0.5 + 0.5) * 0.3 + brace * 0.2,
+      -0.12 - c * 0.10 - brace * 0.55,
+    );
+
+    // ── Right (grapple) arm — the worker. Three blended intents:
+    //   reach  → arm extended toward line/travel
+    //   haul   → rhythmic powerful pull (bicep curl back toward the chest rig)
+    //   wind   → cocked back (windup, wind<0) then whipped across (release>0)
+    const reachSwing = -1.30;                   // straighter, higher, athletic
+    const reachBend  = 0.14;
+    // Haul: from a long extended catch (-1.5) to a hard pulled-in flex.
+    const haulSwing  = THREE.MathUtils.lerp(-1.5, -0.35, haul * 0.5 + 0.5);
+    const haulBend   = THREE.MathUtils.lerp(0.10, 1.35, haul * 0.5 + 0.5);
+    // Reach pose is the base; the haul cycle modulates it by reach amount.
+    let rSwing = THREE.MathUtils.lerp(-s * amp * 0.7, reachSwing, reach);
+    let rBend  = THREE.MathUtils.lerp(armBend + (-s * 0.5 + 0.5) * 0.3, reachBend, reach);
+    rSwing = THREE.MathUtils.lerp(rSwing, haulSwing, reach * 0.7);
+    rBend  = THREE.MathUtils.lerp(rBend,  haulBend,  reach * 0.7);
+    let rFlare = THREE.MathUtils.lerp(0.12 + c * 0.10, -0.05, reach);
+    // Throw: wind-up cocks the arm way back+bent; release whips it forward.
+    const wUp = Math.max(0, -wind), wRel = Math.max(0, wind);
+    rSwing = THREE.MathUtils.lerp(rSwing, 1.7, wUp);     // cocked behind
+    rBend  = THREE.MathUtils.lerp(rBend, 1.9, wUp);      // deep cock
+    rSwing = THREE.MathUtils.lerp(rSwing, -2.0, wRel);   // whipped across+up
+    rBend  = THREE.MathUtils.lerp(rBend, 0.05, wRel);    // snapped straight
+    rFlare = THREE.MathUtils.lerp(rFlare, 0.35 * wind, Math.abs(wind));
     this.armR.set(rSwing, rBend, rFlare);
 
-    // Legs scissor opposite the arms; knees trail through the stroke.
-    const legBend = 0.30 + strokeAmp * 0.55;
-    this.legL.set(-s * amp * 0.55, legBend + (-s * 0.5 + 0.5) * 0.35);
-    this.legR.set( s * amp * 0.55, legBend + ( s * 0.5 + 0.5) * 0.35);
+    // ── Legs: scissor opposite the arms; on a hard swing they drive off
+    // (deep coil → extension); braced legs swing forward to plant the stop.
+    const legBend = 0.30 + strokeAmp * 0.55 + effort * 0.30;
+    const drive = haul * reach * 0.5;           // legs push as the arm hauls
+    const lLeg = -s * amp * 0.55 - drive;
+    const rLeg =  s * amp * 0.55 - drive;
+    const braceLeg = 0.95;                       // both legs forward to brake
+    this.legL.set(
+      THREE.MathUtils.lerp(lLeg, braceLeg, brace),
+      legBend + (-s * 0.5 + 0.5) * 0.35 + brace * 0.7,
+    );
+    this.legR.set(
+      THREE.MathUtils.lerp(rLeg, braceLeg, brace),
+      legBend + ( s * 0.5 + 0.5) * 0.35 + brace * 0.7,
+    );
   }
 
   /**
