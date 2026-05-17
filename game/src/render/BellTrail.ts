@@ -17,7 +17,9 @@ import * as THREE from 'three';
 
 export function bellGlow(chime: number): number {
   // Exponential ramp: a true ring blazes; a clatter barely glows.
-  return 0.25 + 2.95 * Math.pow(chime, 2.2);
+  // Tamed (was 0.25 + 2.95·…): at close/goal camera angles the old peak
+  // blew the whole frame to white through bloom.
+  return 0.2 + 1.35 * Math.pow(chime, 2.2);
 }
 
 // ── geometry constants ────────────────────────────────────────────────────────

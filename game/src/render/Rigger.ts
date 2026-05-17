@@ -1,364 +1,245 @@
-// Rigger renderer — bold, emissive, instantly readable figures.
-// Team-coloured (home = cyan #1aa6b7, away = orange #d4602a) with role accent.
-// P1 (the human) is unmistakably YOU: brightest emissive + halo ring + ▼ beacon above.
-// Grounded = dimmed + skin-tint. contactRef = clip-bracket glint.
-// Motion streak when moving fast (juice). Pooled for perf.
+// Rigger renderer — CEL / GRAPHIC-NOVEL zero-g sport athletes.
+//
+// Each rigger is an articulated humanoid (RiggerFigure): slim suit + chest
+// grapple-rig, flat team-colour fill, bold black ink outlines (inverted-hull),
+// 3-band quantised toon shade. Team reads from fill colour (home cyan / away
+// orange), role/team accent from the chest plate + visor. The human player
+// (p1Id) gets a tasteful halo + ▼ beacon highlight on the new model.
+//
+// Motion is procedural and fluid: every render frame sync() derives velocity &
+// acceleration from kept prior positions and drives a damped pose —
+//   • lean/bank into acceleration,
+//   • a smooth zero-g swim/stroke cycle whose amplitude scales with speed,
+//   • the right "grapple" arm extends toward travel/line when a line is active
+//     (its animated hand is published for RigLine to originate the line from),
+//   • secondary follow-through on torso/limbs (eased, never snaps),
+//   • a calm idle drift when nearly still.
+// All easing is frame-rate-independent (exponential smoothing on dt).
+//
+// World scale matched to RegConstants: R = 45 m calm; figures are ~1.9 m
+// humans. Footprint kept close to the previous placeholder so the spectate
+// camera framing and in-world placement are unchanged.
 
 import * as THREE from 'three';
 import type { PlayerSim } from '../sim/types';
 import { PAL, ROLE_TINT } from '../ui/palette';
-
-// ── Geometry constants — sized for a ~45 m calm radius ───────────────────────
-
-// Players live in a 90 m diameter cylinder. We need figures visible from
-// camera distances of ~20-60 m. Scale accordingly.
-const BODY_RADIUS  = 1.2;  // m — thick trunk, easy to read
-const BODY_LENGTH  = 2.8;  // m — capsule cylinder half-length
-const HEAD_RADIUS  = 0.85; // m — faceted gem head
-const AIM_LEN      = 3.2;  // m — facing spike length
-const AIM_BASE_R   = 0.22; // m — base radius of aim cone
-
-// P1 distinction
-const HALO_OUTER   = 3.2;  // m — ring outer
-const HALO_TUBE    = 0.18; // m
-const BEACON_SIZE  = 1.6;  // m — ▼ tetrahedron arrow above player
-const BEACON_Y     = BODY_LENGTH * 0.5 + HEAD_RADIUS * 2.0 + BEACON_SIZE * 1.1;
-
-// Contact clip bracket
-const CLIP_OUTER   = 2.2;
-const CLIP_TUBE    = 0.14;
-
-// Streak tail — shown when speed > threshold
-const STREAK_SPEED_SQ = 6 * 6; // m/s squared threshold
-const STREAK_LEN      = 5.0;
+import { RiggerFigure } from './RiggerFigure';
+import { publishGrappleHand } from './RigGrapple';
 
 const MAX_RIGGERS = 12;
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
+// Speed (m/s) at which the stroke cycle reaches full amplitude.
+const STROKE_FULL_SPEED = 14;
+// Stroke phase advance per unit distance travelled (rad/m) — couples the swim
+// rhythm to actual motion so it never looks like a treadmill.
+const STROKE_PER_METRE = 0.5;
+// Idle drift angular speed (rad/s).
+const IDLE_RATE = 1.1;
 
-/** Blend two hex colours by t (0=a, 1=b). */
+// ── Helpers ──────────────────────────────────────────────────────────────────
+
 function lerpHex(a: number, b: number, t: number): number {
-  const ri = a >> 16 & 0xff, gi = a >> 8 & 0xff, bi = a & 0xff;
-  const rf = b >> 16 & 0xff, gf = b >> 8 & 0xff, bf = b & 0xff;
-  const r = (ri + (rf - ri) * t) | 0;
-  const g = (gi + (gf - gi) * t) | 0;
-  const bl = (bi + (bf - bi) * t) | 0;
-  return (r << 16) | (g << 8) | bl;
+  const ri = (a >> 16) & 0xff, gi = (a >> 8) & 0xff, bi = a & 0xff;
+  const rf = (b >> 16) & 0xff, gf = (b >> 8) & 0xff, bf = b & 0xff;
+  return (((ri + (rf - ri) * t) | 0) << 16)
+       | (((gi + (gf - gi) * t) | 0) << 8)
+       |  ((bi + (bf - bi) * t) | 0);
 }
 
 function teamBase(team: string): number {
   return team === 'home' ? PAL.cyan : PAL.orange;
 }
 
-/** Body colour: full team when airborne, dimmed toward skin-tint when grounded. */
 function bodyColor(team: string, grounded: boolean): number {
   const base = teamBase(team);
-  if (!grounded) return base;
-  return lerpHex(base, PAL.dim, 0.70);
+  return grounded ? lerpHex(base, PAL.dim, 0.65) : base;
 }
 
-/** Apply sim Quat to a THREE.Quaternion in-place. */
-function applySimQuat(
-  out: THREE.Quaternion,
-  q: { x: number; y: number; z: number; w: number },
-): void {
-  out.set(q.x, q.y, q.z, q.w).normalize();
+/** Frame-rate-independent exponential smoothing toward `target`. */
+function damp(cur: number, target: number, lambda: number, dt: number): number {
+  return target + (cur - target) * Math.exp(-lambda * dt);
 }
 
-// Reusable scratch vectors (avoid alloc in hot path)
-const _vel = new THREE.Vector3();
-const _negVel = new THREE.Vector3();
+// Scratch (no per-frame alloc in the hot path).
+const _fwd = new THREE.Vector3();
+const _up = new THREE.Vector3();
+const _right = new THREE.Vector3();
+const _basisM = new THREE.Matrix4();
+const _basisQ = new THREE.Quaternion();
+const _hand = new THREE.Vector3();
+const _accLocal = new THREE.Vector3();
 
-// ── Per-instance visual group ─────────────────────────────────────────────────
+// ── Per-figure instance ──────────────────────────────────────────────────────
 
 class RiggerInstance {
-  readonly root = new THREE.Group();
+  /**
+   * Optional, purely-additive posing emphasis per player id (0..1). The
+   * orchestrator MAY set this (e.g. bell carrier / throw windup) via
+   * Riggers.setPoseEmphasis() for a richer reach pose. Untouched = 0 =
+   * current behaviour.
+   */
+  static readonly emphasis = new Map<string, number>();
 
-  // Core body parts
-  private bodyMesh: THREE.Mesh;
-  private headMesh: THREE.Mesh;
-  // Emissive shell over body — separate so we can tune glow independently
-  private glowShell: THREE.Mesh;
+  readonly figure = new RiggerFigure();
 
-  // Facing indicator
-  private aimMesh: THREE.Mesh;
+  // Kept state for motion derivation + damping.
+  private px = 0; private py = 0; private pz = 0;
+  private vx = 0; private vy = 0; private vz = 0;
+  private hasPrev = false;
 
-  // Role ring at chest
-  private accentRing: THREE.Mesh;
+  private lean = 0;
+  private bank = 0;
+  private strokeAmp = 0;
+  private strokePhase = 0;
+  private reach = 0;
+  private idlePhase = Math.random() * Math.PI * 2;
 
-  // P1-only extras (always in scene, visibility toggled)
-  private haloRing: THREE.Mesh;
-  private beacon: THREE.Mesh;     // ▼ arrow above
-
-  // Contact clip bracket
-  private clipGlint: THREE.Mesh;
-
-  // Motion streak
-  private streakLine: THREE.Line;
-  private streakPos: Float32Array;
-  private streakGeo: THREE.BufferGeometry;
-  private streakMat: THREE.LineBasicMaterial;
-
-  constructor() {
-    // ── Body: capsule, bold & readable ───────────────────────────────────────
-    const bodyGeo = new THREE.CapsuleGeometry(BODY_RADIUS, BODY_LENGTH, 6, 12);
-    this.bodyMesh = new THREE.Mesh(
-      bodyGeo,
-      new THREE.MeshStandardMaterial({
-        color: PAL.dim,
-        roughness: 0.55,
-        metalness: 0.10,
-        // emissive set dynamically
-      }),
-    );
-    this.bodyMesh.castShadow = false;
-
-    // Translucent glow shell — slightly larger, additive
-    this.glowShell = new THREE.Mesh(
-      new THREE.CapsuleGeometry(BODY_RADIUS * 1.14, BODY_LENGTH, 4, 8),
-      new THREE.MeshBasicMaterial({
-        color: PAL.dim,
-        transparent: true,
-        opacity: 0.0,
-        blending: THREE.AdditiveBlending,
-        depthWrite: false,
-        side: THREE.BackSide,
-      }),
-    );
-
-    // ── Head: faceted gem ─────────────────────────────────────────────────────
-    this.headMesh = new THREE.Mesh(
-      new THREE.OctahedronGeometry(HEAD_RADIUS, 1),
-      new THREE.MeshStandardMaterial({
-        color: PAL.dim,
-        roughness: 0.45,
-        metalness: 0.25,
-        emissive: new THREE.Color(0x000000),
-        emissiveIntensity: 0,
-      }),
-    );
-    // Sits atop the body capsule
-    this.headMesh.position.y = BODY_LENGTH * 0.5 + BODY_RADIUS + HEAD_RADIUS * 0.9;
-
-    // ── Aim indicator: tapered cone in local +Y (facing direction) ────────────
-    const aimGeo = new THREE.CylinderGeometry(0, AIM_BASE_R, AIM_LEN, 6, 1);
-    this.aimMesh = new THREE.Mesh(
-      aimGeo,
-      new THREE.MeshBasicMaterial({
-        color: PAL.paper,
-        transparent: true,
-        opacity: 0.7,
-        blending: THREE.AdditiveBlending,
-        depthWrite: false,
-      }),
-    );
-    // Position: tip points forward, base at head level
-    this.aimMesh.position.y = this.headMesh.position.y + HEAD_RADIUS + AIM_LEN * 0.5;
-
-    // ── Role accent ring at chest ─────────────────────────────────────────────
-    this.accentRing = new THREE.Mesh(
-      new THREE.TorusGeometry(BODY_RADIUS * 0.85, 0.14, 4, 16),
-      new THREE.MeshBasicMaterial({
-        color: PAL.dim,
-        blending: THREE.AdditiveBlending,
-        depthWrite: false,
-        transparent: true,
-        opacity: 0.85,
-      }),
-    );
-    this.accentRing.position.y = BODY_LENGTH * 0.12;
-    this.accentRing.rotation.x = Math.PI / 2;
-
-    // ── P1 halo ring (horizontal disc at mid-body) ────────────────────────────
-    this.haloRing = new THREE.Mesh(
-      new THREE.TorusGeometry(HALO_OUTER, HALO_TUBE, 6, 24),
-      new THREE.MeshBasicMaterial({
-        color: PAL.paper,
-        blending: THREE.AdditiveBlending,
-        depthWrite: false,
-        transparent: true,
-        opacity: 0.0,
-      }),
-    );
-    this.haloRing.rotation.x = Math.PI / 2;
-    this.haloRing.position.y = 0;
-
-    // ── P1 beacon: ▼ tetrahedron arrow floating above ─────────────────────────
-    // ConeGeometry pointing down (tip at -y)
-    const beaconGeo = new THREE.ConeGeometry(BEACON_SIZE * 0.55, BEACON_SIZE, 4, 1);
-    // Rotate so tip faces down toward the player
-    beaconGeo.rotateZ(Math.PI);
-    this.beacon = new THREE.Mesh(
-      beaconGeo,
-      new THREE.MeshBasicMaterial({
-        color: PAL.paper,
-        blending: THREE.AdditiveBlending,
-        depthWrite: false,
-        transparent: true,
-        opacity: 0.0,
-      }),
-    );
-    this.beacon.position.y = BEACON_Y;
-
-    // ── Contact clip bracket (torus at equator, team-tinted) ──────────────────
-    this.clipGlint = new THREE.Mesh(
-      new THREE.TorusGeometry(CLIP_OUTER, CLIP_TUBE, 4, 20),
-      new THREE.MeshBasicMaterial({
-        color: PAL.paper,
-        blending: THREE.AdditiveBlending,
-        depthWrite: false,
-        transparent: true,
-        opacity: 0.0,
-      }),
-    );
-    this.clipGlint.rotation.x = Math.PI / 2;
-    this.clipGlint.position.y = BODY_LENGTH * 0.5;
-
-    // ── Motion streak: 2-point line behind the player ─────────────────────────
-    this.streakPos = new Float32Array(6); // 2 points × 3 components
-    this.streakGeo = new THREE.BufferGeometry();
-    this.streakGeo.setAttribute('position', new THREE.BufferAttribute(this.streakPos, 3));
-    this.streakMat = new THREE.LineBasicMaterial({
-      color: PAL.dim,
-      transparent: true,
-      opacity: 0.0,
-      blending: THREE.AdditiveBlending,
-      depthWrite: false,
-    });
-    this.streakLine = new THREE.Line(this.streakGeo, this.streakMat);
-    this.streakLine.frustumCulled = false;
-
-    this.root.add(
-      this.glowShell,
-      this.bodyMesh,
-      this.headMesh,
-      this.aimMesh,
-      this.accentRing,
-      this.haloRing,
-      this.beacon,
-      this.clipGlint,
-      this.streakLine,
-    );
-    this.root.visible = false;
-  }
-
-  /** Update this instance for a given PlayerSim. isP1 = the human player. */
-  apply(ps: PlayerSim, isP1: boolean): void {
-    this.root.visible = true;
-
-    // ── Position & orientation ────────────────────────────────────────────────
-    this.root.position.set(ps.p.x, ps.p.y, ps.p.z);
-    applySimQuat(this.root.quaternion, ps.q);
-
-    const base    = teamBase(ps.team);
-    const bodyCol = bodyColor(ps.team, ps.grounded);
-
-    // ── Body & head colours ───────────────────────────────────────────────────
-    const bodyMat = this.bodyMesh.material as THREE.MeshStandardMaterial;
-    bodyMat.color.setHex(bodyCol);
-
-    const headMat = this.headMesh.material as THREE.MeshStandardMaterial;
-    headMat.color.setHex(bodyCol);
-
-    // Emissive glow — P1 is brightest, airborne > grounded
-    const emissiveHex = ps.grounded ? 0x000000 : bodyCol;
-    const emissiveInt = isP1
-      ? (ps.grounded ? 0.45 : 1.2)
-      : (ps.grounded ? 0.0  : 0.4);
-
-    bodyMat.emissive.setHex(isP1 ? base : emissiveHex);
-    bodyMat.emissiveIntensity = emissiveInt;
-    headMat.emissive.setHex(isP1 ? base : (ps.grounded ? 0x000000 : bodyCol));
-    headMat.emissiveIntensity = isP1 ? emissiveInt * 0.8 : emissiveInt * 0.5;
-
-    // Glow shell
-    const shellMat = this.glowShell.material as THREE.MeshBasicMaterial;
-    shellMat.color.setHex(base);
-    shellMat.opacity = isP1 ? 0.28 : (ps.grounded ? 0.0 : 0.10);
-
-    // ── Aim indicator ─────────────────────────────────────────────────────────
-    const aimMat = this.aimMesh.material as THREE.MeshBasicMaterial;
-    aimMat.color.setHex(isP1 ? PAL.paper : lerpHex(base, PAL.paper, 0.25));
-    aimMat.opacity = isP1 ? 0.95 : 0.40;
-
-    // ── Role accent ring ──────────────────────────────────────────────────────
-    const roleTint = ROLE_TINT[ps.role] ?? PAL.dim;
-    (this.accentRing.material as THREE.MeshBasicMaterial).color.setHex(roleTint);
-    (this.accentRing.material as THREE.MeshBasicMaterial).opacity = 0.90;
-
-    // ── P1 halo & beacon ──────────────────────────────────────────────────────
-    const haloMat   = this.haloRing.material as THREE.MeshBasicMaterial;
-    const beaconMat = this.beacon.material   as THREE.MeshBasicMaterial;
-    if (isP1) {
-      haloMat.color.setHex(PAL.cyan);
-      haloMat.opacity = 0.90;
-      beaconMat.color.setHex(PAL.paper);
-      beaconMat.opacity = 0.95;
-      // Gentle bob: beacon oscillates slightly on local Y (world-space via root)
-      const t = performance.now() * 0.0015;
-      this.beacon.position.y = BEACON_Y + Math.sin(t) * 0.4;
-    } else {
-      haloMat.opacity   = 0.0;
-      beaconMat.opacity = 0.0;
-    }
-
-    // ── Contact clip bracket ──────────────────────────────────────────────────
-    const clipMat = this.clipGlint.material as THREE.MeshBasicMaterial;
-    if (ps.contactRef !== null) {
-      clipMat.color.setHex(lerpHex(base, PAL.paper, 0.50));
-      clipMat.opacity = isP1 ? 0.95 : 0.65;
-    } else {
-      clipMat.opacity = 0.0;
-    }
-
-    // ── Motion streak ─────────────────────────────────────────────────────────
-    const vx = ps.v.x, vy = ps.v.y, vz = ps.v.z;
-    const speedSq = vx * vx + vy * vy + vz * vz;
-    if (speedSq > STREAK_SPEED_SQ) {
-      const invSpeed = 1.0 / Math.sqrt(speedSq);
-      // In local (root) space — tail is behind body
-      // The root's quaternion transforms world->local, but for streak
-      // we work in world space directly (streakLine is a child of root,
-      // so we must express positions relative to root origin = ps.p)
-      _vel.set(vx, vy, vz);
-      _negVel.set(-vx * invSpeed * STREAK_LEN, -vy * invSpeed * STREAK_LEN, -vz * invSpeed * STREAK_LEN);
-      // Transform into root-local space (root.quaternion is the inverse of world->local for pure rotation)
-      _negVel.applyQuaternion(this.root.quaternion.clone().invert());
-
-      // Point 0 = body centre (local origin)
-      this.streakPos[0] = 0;
-      this.streakPos[1] = 0;
-      this.streakPos[2] = 0;
-      // Point 1 = tail
-      this.streakPos[3] = _negVel.x;
-      this.streakPos[4] = _negVel.y;
-      this.streakPos[5] = _negVel.z;
-      this.streakGeo.attributes.position.needsUpdate = true;
-
-      this.streakMat.color.setHex(base);
-      // Opacity ramps with speed, capped at 0.75
-      this.streakMat.opacity = Math.min(0.75, (speedSq - STREAK_SPEED_SQ) / (30 * 30 - STREAK_SPEED_SQ) * 0.75);
-    } else {
-      this.streakMat.opacity = 0.0;
-    }
+  get root(): THREE.Group {
+    return this.figure.root;
   }
 
   hide(): void {
-    this.root.visible = false;
+    this.figure.root.visible = false;
+  }
+
+  /**
+   * Build an orientation with NO global up: "up" points toward the cylinder
+   * axis (−radial in the (y,z) cross-section, since centrifugal "down" is
+   * radially outward from the +X spin axis). Facing follows travel direction;
+   * falls back to the sim quat's forward when nearly still so a parked rigger
+   * doesn't spin randomly.
+   */
+  private orient(ps: PlayerSim, speed: number): void {
+    // Radial-inward = local up. On-axis fallback → +Y.
+    const ry = ps.p.y, rz = ps.p.z;
+    const rl = Math.hypot(ry, rz);
+    if (rl > 1e-4) {
+      _up.set(0, -ry / rl, -rz / rl);
+    } else {
+      _up.set(0, 1, 0);
+    }
+
+    // Facing: velocity direction if moving, else sim-quat forward (+Z).
+    if (speed > 0.4) {
+      _fwd.set(this.vx, this.vy, this.vz).multiplyScalar(1 / speed);
+    } else {
+      _fwd.set(0, 0, 1).applyQuaternion(
+        _basisQ.set(ps.q.x, ps.q.y, ps.q.z, ps.q.w).normalize(),
+      );
+    }
+
+    // Orthonormalise: right = fwd × up, then re-derive fwd = up × right.
+    _right.crossVectors(_fwd, _up);
+    if (_right.lengthSq() < 1e-6) {
+      // fwd nearly parallel to up — nudge with world +X (the spin axis).
+      _right.set(1, 0, 0).cross(_up);
+    }
+    _right.normalize();
+    _fwd.crossVectors(_up, _right).normalize();
+
+    // Basis columns: X=right, Y=up, Z=fwd → figure faces +Z, stands +Y.
+    _basisM.makeBasis(_right, _up, _fwd);
+    this.figure.root.quaternion.setFromRotationMatrix(_basisM);
+  }
+
+  apply(ps: PlayerSim, isP1: boolean, dt: number, now: number): void {
+    this.figure.root.visible = true;
+    this.figure.root.position.set(ps.p.x, ps.p.y, ps.p.z);
+
+    // ── Motion derivation (render-frame deltas) ─────────────────────────────
+    let ax = 0, ay = 0, az = 0;
+    if (this.hasPrev && dt > 1e-5) {
+      const nvx = (ps.p.x - this.px) / dt;
+      const nvy = (ps.p.y - this.py) / dt;
+      const nvz = (ps.p.z - this.pz) / dt;
+      ax = (nvx - this.vx) / dt;
+      ay = (nvy - this.vy) / dt;
+      az = (nvz - this.vz) / dt;
+      // Blend derived velocity with sim velocity for stability.
+      this.vx = nvx * 0.5 + ps.v.x * 0.5;
+      this.vy = nvy * 0.5 + ps.v.y * 0.5;
+      this.vz = nvz * 0.5 + ps.v.z * 0.5;
+    } else {
+      this.vx = ps.v.x; this.vy = ps.v.y; this.vz = ps.v.z;
+    }
+    this.px = ps.p.x; this.py = ps.p.y; this.pz = ps.p.z;
+    this.hasPrev = true;
+
+    const speed = Math.hypot(this.vx, this.vy, this.vz);
+
+    // Orientation (no global up).
+    this.orient(ps, speed);
+
+    // ── Pose targets from motion, expressed in figure-local space ───────────
+    // Acceleration in local frame → lean (local Z accel) & bank (local X).
+    _accLocal.set(ax, ay, az).applyQuaternion(
+      _basisQ.copy(this.figure.root.quaternion).invert(),
+    );
+    const leanTarget = THREE.MathUtils.clamp(_accLocal.z * 0.05, -0.6, 0.6);
+    const bankTarget = THREE.MathUtils.clamp(-_accLocal.x * 0.05, -0.5, 0.5);
+
+    const ampTarget = THREE.MathUtils.clamp(speed / STROKE_FULL_SPEED, 0, 1);
+    // Reach: active line OR clipped contact → extend grapple arm toward travel.
+    // Optional emphasis (bell-carry / throw windup) lets the orchestrator push
+    // the reach arm out further without touching the frozen sync() signature.
+    const emphasis = RiggerInstance.emphasis.get(ps.id) ?? 0;
+    const reachTarget = Math.max(
+      ps.line ? 1 : (ps.contactRef !== null ? 0.5 : 0),
+      emphasis,
+    );
+
+    // ── Damp everything (frame-rate independent) ────────────────────────────
+    this.lean = damp(this.lean, leanTarget, 8, dt);
+    this.bank = damp(this.bank, bankTarget, 8, dt);
+    this.strokeAmp = damp(this.strokeAmp, ampTarget, 5, dt);
+    this.reach = damp(this.reach, reachTarget, 7, dt);
+
+    // Stroke phase advances with distance travelled (+ a slow idle baseline so
+    // a parked rigger still breathes/floats rather than freezing).
+    this.strokePhase += speed * dt * STROKE_PER_METRE + dt * 1.4;
+    this.idlePhase += dt * IDLE_RATE;
+
+    // ── Colours ─────────────────────────────────────────────────────────────
+    const base = teamBase(ps.team);
+    const bodyCol = bodyColor(ps.team, ps.grounded);
+    const accent = isP1 ? PAL.paper : (ROLE_TINT[ps.role] ?? lerpHex(base, PAL.paper, 0.4));
+    const emissiveHex = isP1 ? base : (ps.grounded ? 0x000000 : base);
+    const emissiveInt = isP1 ? (ps.grounded ? 0.4 : 0.9) : (ps.grounded ? 0.0 : 0.28);
+    this.figure.setColors(bodyCol, accent, emissiveHex, emissiveInt);
+
+    // ── Drive the pose ──────────────────────────────────────────────────────
+    this.figure.pose(
+      this.lean, this.bank,
+      this.strokePhase, this.strokeAmp,
+      this.reach, this.idlePhase,
+    );
+
+    // ── Publish animated grapple hand for RigLine coordination ──────────────
+    this.figure.grappleHandWorld(_hand);
+    publishGrappleHand(ps.id, _hand);
+
+    // ── P1 highlight ────────────────────────────────────────────────────────
+    this.figure.setHighlight(isP1, PAL.cyan, now * 0.001);
   }
 }
 
-// ── Public API ────────────────────────────────────────────────────────────────
+// ── Public API (FROZEN SIGNATURES) ───────────────────────────────────────────
 
-/** Manages a pool of rigger visual instances. Call sync() every rendered frame. */
+/** Manages a pool of rigger figures. Call sync() every rendered frame. */
 export class Riggers {
   private pool: RiggerInstance[] = [];
   private group = new THREE.Group();
+  private lastNow = 0;
 
   constructor(scene: THREE.Scene) {
     for (let i = 0; i < MAX_RIGGERS; i++) {
       const inst = new RiggerInstance();
       this.pool.push(inst);
+      // Stylised scale-up: a true-1.9 m human against the 45 m calm, filmed
+      // from the broadcast camera, is a few pixels — the cel art was
+      // invisible. Riggers are larger-than-life so the figures actually read
+      // (uniform root scale; the per-frame pose math is untouched).
+      inst.root.scale.setScalar(5);
       this.group.add(inst.root);
     }
     scene.add(this.group);
@@ -367,14 +248,30 @@ export class Riggers {
   /**
    * Sync visuals to the current (interpolated) player list.
    * @param players  Interpolated PlayerSim array for this render frame.
-   * @param p1Id     The local human player's id — rendered unmistakably bright.
+   * @param p1Id     Local human player's id; '' = spectate/replay (no highlight).
    */
   sync(players: PlayerSim[], p1Id: string): void {
+    const now = performance.now();
+    let dt = this.lastNow ? (now - this.lastNow) / 1000 : 1 / 60;
+    // Clamp dt so a tab-stall / first frame can't make the pose explode.
+    dt = THREE.MathUtils.clamp(dt, 1 / 240, 1 / 15);
+    this.lastNow = now;
+
     for (const inst of this.pool) inst.hide();
 
     const n = Math.min(players.length, MAX_RIGGERS);
     for (let i = 0; i < n; i++) {
-      this.pool[i].apply(players[i], players[i].id === p1Id);
+      this.pool[i].apply(players[i], players[i].id === p1Id, dt, now);
     }
+  }
+
+  /**
+   * OPTIONAL additive hook (not part of the frozen contract — safe to ignore).
+   * Sets a 0..1 posing emphasis for a player id so the orchestrator can later
+   * make e.g. the bell carrier / a thrower wind the grapple arm out further.
+   * Damped like everything else, so toggling it never pops.
+   */
+  setPoseEmphasis(id: string, amount: number): void {
+    RiggerInstance.emphasis.set(id, THREE.MathUtils.clamp(amount, 0, 1));
   }
 }

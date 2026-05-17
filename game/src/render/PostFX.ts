@@ -82,9 +82,9 @@ export class PostFX {
   private finishPass: ShaderPass;
 
   // Baseline bloom — strong enough to make the trail/rings sing, not nuclear
-  private readonly BASE_STRENGTH  = 0.85;
-  private readonly BASE_RADIUS    = 0.60;
-  private readonly BASE_THRESHOLD = 0.26; // a bit higher → only bright things bloom (less wash)
+  private readonly BASE_STRENGTH  = 0.55;
+  private readonly BASE_RADIUS    = 0.55;
+  private readonly BASE_THRESHOLD = 0.40; // only genuinely bright pixels bloom — axis-aligned shots no longer wash
 
   // Loop peak bloom
   private readonly LOOP_STRENGTH  = 3.8;  // blazing

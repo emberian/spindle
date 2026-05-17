@@ -79,7 +79,7 @@ function makeAxisGlow(): THREE.Mesh {
   const mat = new THREE.MeshBasicMaterial({
     color: 0xd4eef5,
     transparent: true,
-    opacity: 0.18,
+    opacity: 0.06, // was 0.18 — looking down the 640 m axis the additive tube saturated to white
     side: THREE.BackSide,
     depthWrite: false,
     blending: THREE.AdditiveBlending,
@@ -104,7 +104,7 @@ function makeGoalAssembly(
     new THREE.MeshStandardMaterial({
       color,
       emissive: color,
-      emissiveIntensity: 2.8,
+      emissiveIntensity: 1.6,
       roughness: 0.2,
       metalness: 0.6,
     }),

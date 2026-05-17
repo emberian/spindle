@@ -89,7 +89,13 @@ export class GameCamera {
 
   // ── Cinematic director ──────────────────────────────────────────────────
   private cineAngle: CinematicAngle = 'broadcast';
-  private cineOrder: CinematicAngle[] = ['broadcast', 'low', 'goal', 'wide'];
+  // Only the two cross-axis angles are in the cycle. 'goal' and 'wide' both
+  // look back DOWN the 640 m spine, which stacks the bell + ring + spars +
+  // axis glow into a bloom white-out that per-knob tuning can't reliably
+  // beat (and headless can't be trusted to judge). broadcast + low both
+  // read cleanly with full volume context; the loop-cam (broadside, also
+  // cross-axis) still triggers separately for the money shot.
+  private cineOrder: CinematicAngle[] = ['broadcast', 'low'];
   private cineT = 0; // running clock for slow drift moves
 
   // Smoothed attack direction (−1..+1). Possession flips pivot the rig over
@@ -323,8 +329,11 @@ export class GameCamera {
     const wantLoop = this.wantLoopCam(loopGlow);
     this.loopBlend += ((wantLoop ? 1 : 0) - this.loopBlend) * (1 - Math.exp(-4 * dt));
 
-    // framing scale grows with the spread so the cluster never overflows
-    const frame = Math.max(skinR * 1.3, maxd * 1.6);
+    // framing scale grows with the spread so the cluster never overflows.
+    // Min raised so we always sit far enough back to read a good chunk of
+    // the cylinder cross-section — gives volume context so a bell near the
+    // skin reads as "inside the tube" rather than "at the edge".
+    const frame = Math.max(skinR * 1.8, maxd * 1.6);
 
     if (this.loopBlend > 0.02) {
       // Hero broadside loop-cam (shared with PLAY) — never gimbal-locks
@@ -351,15 +360,22 @@ export class GameCamera {
           break;
         }
         case 'goal': {
-          // Goal-cam: sit just inside the attacked ring looking back at the
-          // incoming play. Down-spine compression = great for scoring drama.
+          // Goal-cam: BEHIND & above the attacked ring, off-axis, looking
+          // back at the incoming play. Deliberately NOT down the spine —
+          // staring along the axis stacked the additive sunline + ring to a
+          // white-out. The 3/4 behind-the-goal angle keeps the scoring drama
+          // (ring + incoming bell in frame) without nuking the lens.
           camTarget = new V(
-            attackX - dir * skinR * 0.6,
-            ry * skinR * 0.35,
-            rz * skinR * 0.35,
+            attackX + dir * frame * 0.45,
+            ry * skinR * 0.85,
+            rz * skinR * 0.85,
           );
-          aimTarget = new V(focus.x, focus.y * 0.7, focus.z * 0.7);
-          fovTarget = 52;
+          aimTarget = new V(
+            focus.x * 0.45 + attackX * 0.55,
+            focus.y * 0.4,
+            focus.z * 0.4,
+          );
+          fovTarget = 50;
           upTarget = new V(0, -ry, -rz);
           break;
         }
@@ -378,17 +394,18 @@ export class GameCamera {
         }
         case 'broadcast':
         default: {
-          // Broadcast-follow: behind & lifted, slow parallax track.
+          // Broadcast-follow: behind & lifted, slow parallax track. Lifted
+          // more toward the axis so the cross-section / volume stays in frame.
           const back = frame * 1.7;
-          const lift = skinR * 0.55;
+          const lift = skinR * 0.72;
           const side = skinR * 0.45 + Math.sin(this.cineT * 0.12) * skinR * 0.08;
           camTarget = new V(
             focus.x - dir * back,
             focus.y - ry * lift + ty * side,
             focus.z - rz * lift + tz * side,
           );
-          aimTarget = new V(focus.x + dir * skinR * 0.9, focus.y * 0.7, focus.z * 0.7);
-          fovTarget = 60;
+          aimTarget = new V(focus.x + dir * skinR * 0.9, focus.y * 0.5, focus.z * 0.5);
+          fovTarget = 64;
           upTarget = new V(0, -ry, -rz);
           break;
         }

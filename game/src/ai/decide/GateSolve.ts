@@ -147,7 +147,11 @@ export function solveGateThrow(
   const MAX_FLIGHT = 24; // s — safe margin below the 30 s dead-ball limit
   // Axial speed must keep the REQUIRED release speed |v0 − thrower.v| within
   // the sim's [THROW_MIN, THROW_MAX] band, else the shot is unthrowable.
-  const speeds = [14, 16, 18, 20, 22, 25, 28, 30, 32, baseSpeed].filter(
+  // Slower axial speeds → longer flight → SMALLER perpendicular launch
+  // (v_rot = −ζ₀/t shrinks as t grows) → the bell stays near the axis (the
+  // canon "calm") instead of bulging to the skin. Include slow speeds so the
+  // elegant near-axial Loop solutions are in the candidate set.
+  const speeds = [10, 12, 14, 16, 18, 20, 22, 25, 28, 30, 32, baseSpeed].filter(
     s => s > 6 && s < THROW_MAX_SPEED + 8,
   );
 
@@ -189,10 +193,14 @@ export function solveGateThrow(
     // Reject if the flight ever touches the skin.
     if (hit.maxR >= REG.R) continue;
 
-    // Cost: thread accuracy first, then prefer a shorter (lower-risk,
-    // dead-ball-safe) flight. All candidates thread the ring (rho≈0) by
-    // construction, so the flight-time term is what actually decides.
-    const cost = hit.rho + hit.t * 0.05;
+    // Cost: thread accuracy first, then strongly prefer a trajectory that
+    // STAYS IN THE CALM (small max cross-section radius) rather than one that
+    // flings out near the skin — RIG is "the game played in the calm", the
+    // near-axial Loop is the canon-elegant shot, and a skin-hugging bell read
+    // badly on screen. All candidates thread the ring (rho≈0) by construction,
+    // so maxR is the real discriminator; a light flight-time term keeps it
+    // safely under the dead-ball timeout among similar-radius options.
+    const cost = hit.rho + hit.maxR * 0.6 + hit.t * 0.05;
     if (cost < bestCost) {
       bestCost = cost;
       best = {

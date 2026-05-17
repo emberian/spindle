@@ -202,6 +202,7 @@ async function runMatch(
       trail.setLoopMode(isLoop);
       post.setLoopGlow(lg);
       riggers.sync(s.players, 'P1');
+      for (const pp of s.players) riggers.setPoseEmphasis(pp.id, pp.id === s.bell.heldBy ? 1 : 0);
       riglines.sync(s.players);
       audio.setBell(s.bell.chime, Math.hypot(s.bell.w.x, s.bell.w.y, s.bell.w.z),
         Math.max(-1, Math.min(1, s.bell.p.z / REG.R)), s.bell.heldBy === null);
@@ -382,6 +383,7 @@ async function runWatch(
       trail.setLoopMode(isLoop);
       post.setLoopGlow(lg);
       riggers.sync(s.players, '');
+      for (const pp of s.players) riggers.setPoseEmphasis(pp.id, pp.id === s.bell.heldBy ? 1 : 0);
       riglines.sync(s.players);
       audio.setBell(s.bell.chime, Math.hypot(s.bell.w.x, s.bell.w.y, s.bell.w.z),
         Math.max(-1, Math.min(1, s.bell.p.z / REG.R)), s.bell.heldBy === null);
@@ -574,6 +576,7 @@ async function runReplay(
       trail.setLoopMode(isLoop);
       post.setLoopGlow(lg);
       riggers.sync(s.players, '');
+      for (const pp of s.players) riggers.setPoseEmphasis(pp.id, pp.id === s.bell.heldBy ? 1 : 0);
       riglines.sync(s.players);
       audio.setBell(s.bell.chime, Math.hypot(s.bell.w.x, s.bell.w.y, s.bell.w.z),
         Math.max(-1, Math.min(1, s.bell.p.z / REG.R)), s.bell.heldBy === null);
