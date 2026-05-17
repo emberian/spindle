@@ -503,6 +503,14 @@ async function runWatch(
   ai.reset();
   let ended = false;
   let prevLoop = false;
+  // AI diagnostics: last sim snapshot + last AI input frame (for __rigai).
+  let dbgSnap: ReturnType<typeof sim.snapshot> | null = null;
+  let dbgAi: { players: import('./sim/types').PlayerInput[] } | null = null;
+  // Cumulative counters updated EVERY sim tick (throw release is a 1-tick
+  // event — sampling the flag misses it; count it at the source instead).
+  const dbgThrows: Record<string, number> = {};
+  const dbgScores: Record<string, number> = {};
+  let dbgHeldTicks = 0, dbgTotalTicks = 0;
 
   const reArm = (): void => {
     if (match.state.winner !== null || match.state.phase === 'live') return;
@@ -516,21 +524,31 @@ async function runWatch(
     if (match.state.winner !== null) return;
     const snap = sim.snapshot();
     const aiFrame = ai.tick(snap, match.state as never, cfgs, gameSeed);
+    dbgSnap = snap; dbgAi = aiFrame;
+    dbgTotalTicks++;
+    if (snap.bell.heldBy) dbgHeldTicks++;
+    snap.players.forEach((pl, i) => {
+      if (aiFrame.players[i] && aiFrame.players[i].throwReleased) {
+        dbgThrows[pl.id] = (dbgThrows[pl.id] ?? 0) + 1;
+      }
+    });
     const frame: InputFrame = { tick: snap.tick, players: aiFrame.players };
     rec.push(frame);
     const evs = sim.step(frame);
     const upd = match.consume(evs, sim.snapshot() as never);
     for (const e of evs) {
-      if (e.type === 'bell_caught') audio.event('catch');
-      else if (e.type === 'bell_clatter' || e.type === 'bell_bobble') audio.event('clatter');
+      if (e.type === 'bell_caught') { audio.event('catch'); dbgScores['caught'] = (dbgScores['caught'] ?? 0) + 1; }
+      else if (e.type === 'bell_clatter' || e.type === 'bell_bobble') { audio.event('clatter'); dbgScores['clatter'] = (dbgScores['clatter'] ?? 0) + 1; }
     }
     if (upd && upd.scored) {
       const kd = upd.scored.kind;
+      dbgScores[kd] = (dbgScores[kd] ?? 0) + 1;
       audio.event(
         kd === 'loop' ? 'score_loop' : kd === 'rise' || kd === 'curl' ? 'score_rise'
           : kd === 'ground' ? 'score_ground' : 'score_fall',
       );
     } else if (upd && upd.turnover) {
+      dbgScores['turnover'] = (dbgScores['turnover'] ?? 0) + 1;
       audio.event('turnover');
     }
     reArm();
@@ -575,6 +593,30 @@ async function runWatch(
         gate: match.state.cast.gate, throwsLeft: match.state.cast.throwsLeft,
         msg: match.state.message,
       };
+      // Per-player AI telemetry: are they MOVING, GRAPPLING, ACTING?
+      if (dbgSnap && dbgAi) {
+        const bp = dbgSnap.bell.p;
+        (window as unknown as { __rigai?: unknown }).__rigai = {
+          tick: dbgSnap.tick,
+          held: dbgSnap.bell.heldBy,
+          heldFrac: dbgTotalTicks ? +(dbgHeldTicks / dbgTotalTicks).toFixed(2) : 0,
+          throws: { ...dbgThrows },
+          scores: { ...dbgScores },
+          players: dbgSnap.players.map((pl, i) => {
+            const inp = dbgAi!.players[i];
+            return {
+              id: pl.id, role: pl.role, team: pl.team,
+              x: pl.p.x, y: pl.p.y, z: pl.p.z,
+              spd: Math.hypot(pl.v.x, pl.v.y, pl.v.z),
+              line: pl.line ? 1 : 0,
+              fire: inp && inp.fireLineAt ? 1 : 0,
+              reel: inp ? inp.reel : 0,
+              thrown: inp && inp.throwReleased ? 1 : 0,
+              dBell: Math.hypot(pl.p.x - bp.x, pl.p.y - bp.y, pl.p.z - bp.z),
+            };
+          }),
+        };
+      }
 
       if (!ended && match.state.winner !== null) {
         ended = true;

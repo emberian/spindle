@@ -774,7 +774,19 @@ function decideThrow(
       profile.loopPropensity,
       player.v, // sim ADDS thrower velocity — solver cancels it
     );
-    if (gate) {
+    // QUALITY GATE (the fix for "every cast is one full-field huck"): a
+    // solution existing ≠ a good shot. Canon is "three throws to clear the
+    // gate" — you ADVANCE and pass, and only take the ring shot when it is a
+    // real scoring chance (threads the 8 m ring well AND you're in plausible
+    // range) OR it's the cast's last throw (use it or lose the cast).
+    // Otherwise fall through to PRIORITY 2 (pass to an advancing receiver) so
+    // possession, pass chains, other roles throwing, and Fall/Rise variety
+    // actually emerge instead of spinner-hucks-Loop-or-nothing every cast.
+    const throwsLeft = match.cast ? match.cast.throwsLeft : 1;
+    const threadsWell = gate ? gate.arriveRho <= REG.gateRadius * 0.6 : false;
+    const inRange = distToRing < REG.L * 0.45;
+    const mustShoot = throwsLeft <= 1;
+    if (gate && ((threadsWell && inRange) || mustShoot)) {
       // Aim along the REQUIRED throw vector (sim adds player.v back to it);
       // charge so the sim's release speed equals |throwVec| exactly. This
       // makes the realised free-bell velocity match the solved v0, so the
