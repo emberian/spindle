@@ -56,6 +56,27 @@ const riglines = new RigLines(scene);
 const audio = new AudioEngine();
 const hud = new HUD(app);
 const onboarding = new Onboarding(app);
+
+// Explicit-launch "YOUR CAST" prompt: a player must never be surprised by
+// the ball moving on its own. Whenever YOU (P1) hold the bell, this says so
+// and tells you the action that launches it. Orchestrator-owned overlay so
+// HUD's frozen render() contract is untouched. pointer-events:none.
+const castPrompt = document.createElement('div');
+castPrompt.style.cssText =
+  'position:absolute;left:50%;top:18%;transform:translateX(-50%);' +
+  'font-family:ui-monospace,"Space Mono",monospace;text-align:center;' +
+  'color:#1aa6b7;letter-spacing:.18em;font-size:15px;line-height:1.7;' +
+  'text-shadow:0 0 12px #1aa6b7aa;pointer-events:none;z-index:40;' +
+  'display:none;text-transform:uppercase;';
+castPrompt.innerHTML =
+  '▼ YOUR CAST — you have the bell<br>' +
+  '<span style="color:#f4f1ea;font-size:13px;letter-spacing:.12em">' +
+  'aim &nbsp;·&nbsp; <b>LEFT</b> hold = launch throw &nbsp;·&nbsp; ' +
+  '<b>RIGHT</b> = grapple to move</span>';
+app.appendChild(castPrompt);
+const setCastPrompt = (show: boolean): void => {
+  castPrompt.style.display = show ? 'block' : 'none';
+};
 const landing = new LandingScreen(app);
 const title = new TitleScreen(app);
 const bracketUI = new BracketScreen(app);
@@ -217,6 +238,8 @@ async function runMatch(
       gcam.setLook(li.yaw, li.pitch, li.active);
       gcam.update(s.bell.p, p1r ? p1r.p : s.bell.p, GATE_X, lg, REG.R, Math.min(dt, 1 / 30));
       hud.render(s as never, match.state as never, input.view);
+      // You have the bell → it never moves on its own; YOU launch it.
+      setCastPrompt(s.bell.heldBy === 'P1' && match.state.winner === null);
       // Diagnostic hook (cheap; lets a harness observe the HUMAN-play path:
       // can P1 actually move, what is the camera framing, is input live).
       const _iv = input.view;
@@ -233,6 +256,7 @@ async function runMatch(
 
       if (!ended && match.state.winner !== null) {
         ended = true;
+        setCastPrompt(false);
         runtime?.stop();
         try {
           ReplayStore.save(
