@@ -57,11 +57,13 @@ export function pLoop(
   distToRing: number,
   loopPropensity: number,
 ): number {
-  // Only achievable near-axis (high) with the right spin.
-  const radiusFactor = Math.max(0, 1 - radiusFromAxis / (REG.R * 0.7));
-  const distFactor = Math.max(0, 1 - distToRing / (REG.L * 0.35));
-  // Team loop skill scales the baseline chance.
-  return Math.min(0.6, 0.08 * radiusFactor * distFactor * (0.4 + loopPropensity));
+  // Only achievable near-axis (high) with the right spin. Window & base
+  // raised (user call: hunt Loops more — the marquee 7 should actually
+  // show in a watched match, not "never in a season"). Team loopPropensity
+  // still scales it, so franchise style divergence is preserved.
+  const radiusFactor = Math.max(0, 1 - radiusFromAxis / (REG.R * 0.9));
+  const distFactor = Math.max(0, 1 - distToRing / (REG.L * 0.5));
+  return Math.min(0.7, 0.20 * radiusFactor * distFactor * (0.4 + loopPropensity));
 }
 
 /**

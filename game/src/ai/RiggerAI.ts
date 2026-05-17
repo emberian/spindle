@@ -36,6 +36,9 @@ import { faithwingPolicy } from './roles/Faithwing';
 import { freewingPolicy } from './roles/Freewing';
 import { reachPolicy } from './roles/Reach';
 import { solveLeadVelocity } from './decide/LeadPredict';
+import { rk4Step } from '../sim/trajectory';
+import type { PointState } from '../sim/trajectory';
+import { REG } from '../sim/RegConstants';
 import { scoreThrow } from './decide/ThrowScore';
 import type { ThrowCandidate } from './decide/ThrowScore';
 import { solveGateThrow } from './decide/GateSolve';
@@ -449,15 +452,30 @@ function decideNavTarget(
   rng: () => number,
   style?: RoleStyle,
 ): Vec3 {
-  // ROBUSTNESS: loose-bell recoverer always pursues the bell directly (lead
-  // the bell slightly so the swing arrives where it's going).
+  // Loose / in-flight bell pursuit. A smarter single pursuer (canon "no
+  // scrums" — still exactly one): instead of a naïve straight-line lead,
+  // integrate the bell's REAL Coriolis trajectory (same rk4 predictor the
+  // bell uses) to an ADAPTIVE lead time = how long until this pursuer can
+  // realistically close the gap (~grapple closing speed). That aims at a
+  // true cutoff on the curved arc — so the pursuer actually arrives on an
+  // in-flight bell and triggers the contest, rather than chasing where it
+  // *was*. Pure integration, deterministic, no rng.
   if (assignment.job === 'recover') {
     const b = state.bell;
-    return {
-      x: b.p.x + b.v.x * 0.6,
-      y: b.p.y + b.v.y * 0.6,
-      z: b.p.z + b.v.z * 0.6,
-    };
+    const dx = b.p.x - player.p.x;
+    const dy = b.p.y - player.p.y;
+    const dz = b.p.z - player.p.z;
+    const gap = Math.sqrt(dx * dx + dy * dy + dz * dz);
+    const RECOVER_CLOSE_V = 20; // m/s, typical grapple-haul closing speed
+    const tLead = Math.min(2.0, Math.max(0.15, gap / RECOVER_CLOSE_V));
+    let st: PointState = { p: { ...b.p }, v: { ...b.v } };
+    const H = 1 / 60;
+    for (let tAcc = 0; tAcc < tLead; ) {
+      const h = Math.min(H, tLead - tAcc);
+      st = rk4Step(st, REG.omega, h);
+      tAcc += h;
+    }
+    return { x: st.p.x, y: st.p.y, z: st.p.z };
   }
 
   // CARRIER: actively gain ground toward OUR attacking ring. Drive a target a
@@ -594,7 +612,8 @@ function roleTarget(
   // attacking ring (orientation-correct: uses director.attackRingX, never
   // faithEnd). depthSlot interpolates carrier → ring, so receivers always
   // lead into space the carrier is driving toward.
-  if (assignment.job === 'receive' || assignment.job === 'support') {
+  if ((assignment.job === 'receive' || assignment.job === 'support')
+      && player.role !== 'reach') {
     const carrier = director.carrierId
       ? state.players.find(p => p.id === director.carrierId)
       : null;

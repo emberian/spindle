@@ -417,7 +417,7 @@ export function runDirector(
   // the attackingFree-divergence test both still hold.
   const attackingFree = !ourRingIsFaith;
 
-  const useLoop = profile.loopPropensity > 0.25 && posture !== 'grind';
+  const useLoop = profile.loopPropensity > 0.15 && posture !== 'grind';
   const loopSetterId = useLoop ? pickLoopSetter(state.players, teamSide) : null;
 
   // Possession / loose-bell determination.
@@ -522,6 +522,20 @@ export function runDirector(
       assignments[p.id] = hasPossession
         ? { job: 'support', markId: null, depthSlot: 0.4, radiusSlot: 0.45, pressure: 0 }
         : { job: 'zone', markId: null, depthSlot: 0, radiusSlot: 0.5, pressure: 0 };
+    }
+  }
+
+  // KEEPER NEVER ABANDONS GOAL. On defense the loops above hand every
+  // player a mark/zone job, which short-circuits before the role policy —
+  // so the dedicated ring keeper (the Reach) would stop guarding and a
+  // thrown bell sails clean through the hoop. Force the Reach onto a
+  // pass-through job so decideNavTarget falls to reachPolicy (the in-lane
+  // keeper). Offensive jobs (carry/recover/receive) are left intact.
+  for (const p of myPlayers) {
+    if (p.role !== 'reach') continue;
+    const a = assignments[p.id];
+    if (a && (a.job === 'mark' || a.job === 'zone')) {
+      assignments[p.id] = { job: 'receive', markId: null, depthSlot: 0, radiusSlot: 0, pressure: 0 };
     }
   }
 
