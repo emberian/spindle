@@ -35,10 +35,11 @@ const FREE_LAMBDA = 30;
 /** Pitch clamp — avoid full gimbal flip. */
 const MAX_PITCH = Math.PI * 0.48;
 
-/** Anchor snap cone half-angle (radians) — ~9°, very forgiving. */
-const SNAP_CONE = 0.16;
-/** Once locked to a spar, only break the lock past this wider angle (~16°). */
-const SNAP_BREAK = 0.28;
+/** Anchor snap cone half-angle (radians) — ~20°, HEAVY snap so the mouse
+ *  reliably grabs an anchor without precise aiming. */
+const SNAP_CONE = 0.35;
+/** Once locked, only break past this much wider angle (~30°) — very sticky. */
+const SNAP_BREAK = 0.52;
 
 /** Max tether range (metres). */
 const SNAP_RANGE = 130;

@@ -300,7 +300,10 @@ export class TitleScreen {
 
     const conferences: Array<'sol' | 'near' | 'far'> = ['sol', 'near', 'far'];
     for (const conf of conferences) {
-      const teams = TEAMS.filter((t) => t.conference === conf);
+      // Only the 16 SEEDED teams are in The Jump. Showing exhibition
+      // (seed === null) teams let you "join a team that never plays" —
+      // proceed() would auto-sim every game to a champion.
+      const teams = TEAMS.filter((t) => t.conference === conf && t.seed !== null);
       const section = this._buildConferenceSection(conf, teams);
       body.appendChild(section);
     }

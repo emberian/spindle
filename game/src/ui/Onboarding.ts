@@ -177,16 +177,14 @@ export class Onboarding {
       { text: 'You are the cyan rigger under the ', accent: '▼ marker' },
       { text: 'You cannot fly. You move by line.' },
       { text: '' },
-      { text: 'Point at a spar or the skin wall.' },
-      { text: 'Fire your ', accent: 'LINE', after: ' (RIGHT mouse). Haul with W / S.' },
-      { text: 'Let RIGHT go to release the line (slingshot).' },
+      { text: 'Hold ', accent: 'G', after: ' — auto-grapple toward the ring.' },
+      { text: 'No aiming: it hauls you goal-ward.' },
+      { text: '(RIGHT mouse = manual grapple, heavy snap.)' },
       { text: '' },
-      { text: 'When you hold the bell, ', accent: 'hold LEFT', after: ' to charge a throw.' },
-      { text: 'The ', accent: 'ghost arc', after: ' shows where it will go.' },
-      { text: 'The curve is the Coriolis. Learn it.' },
-      { text: '' },
-      { text: 'Bend the bell through the far ring.' },
-      { text: 'A / D sets spin. Spin bends the arc.' },
+      { text: 'When you hold the bell the game ', accent: 'solves the shot' },
+      { text: 'for you: a bold arc shows it thread the ring.' },
+      { text: 'When it says ', accent: 'SHOT READY', after: ', press & release' },
+      { text: 'LEFT to launch. No shot? Hold G to get closer.' },
     ];
 
     for (const ln of lines) {
@@ -226,12 +224,12 @@ export class Onboarding {
     });
 
     const bindings: [string, string][] = [
-      ['RIGHT MB',  'Fire line  ·  release = let go / slingshot'],
-      ['LEFT MB',   'Hold to charge a throw (when you have the bell)'],
-      ['W / S',     'Reel line in / out'],
+      ['G (hold)',  'Auto-grapple toward the ring — no aiming'],
+      ['LEFT MB',   'Launch the SOLVED shot (when SHOT READY)'],
+      ['RIGHT MB',  'Manual grapple (heavy snap) · release = let go'],
+      ['W / S',     'Reel line in / out (fine control)'],
       ['A / D',     'Spin (curl the bell)'],
       ['SHIFT',     'Push off a surface'],
-      ['SCROLL',    'Adjust spin'],
       ['SPACE',     'Thrumbler nudge'],
     ];
     for (const [key, desc] of bindings) {

@@ -157,15 +157,16 @@ export class RiggerFigure {
     hips.add(this.legL.root, this.legR.root);
     this.root.add(hips);
 
-    // ── P1 highlight: halo ring at the feet + ▼ beacon overhead ─────────────
-    // The "YOU" marker MUST be unmistakable and never occluded by the other
-    // (large) figures — so it renders on top (depthTest:false, high
-    // renderOrder) and is big.
+    // ── P1 highlight: small feet ring + ▼ beacon overhead ───────────────────
+    // Always-on-top so it's never lost (depthTest:false + high renderOrder),
+    // but DELIBERATELY small and NON-additive: the previous big additive
+    // version bloomed the whole screen white. A crisp coloured marker reads
+    // fine without being a glow bomb.
     this.halo = new THREE.Mesh(
-      new THREE.TorusGeometry(1.5, 0.12, 8, 32),
+      new THREE.TorusGeometry(0.55, 0.06, 6, 24),
       new THREE.MeshBasicMaterial({
-        color: 0xffffff, transparent: true, opacity: 0,
-        blending: THREE.AdditiveBlending, depthWrite: false, depthTest: false,
+        color: 0x6fe9ff, transparent: true, opacity: 0,
+        depthWrite: false, depthTest: false,
       }),
     );
     this.halo.rotation.x = Math.PI / 2;
@@ -173,17 +174,17 @@ export class RiggerFigure {
     this.halo.renderOrder = 9998;
     this.root.add(this.halo);
 
-    const beaconGeo = new THREE.ConeGeometry(0.85, 1.9, 4, 1);
+    const beaconGeo = new THREE.ConeGeometry(0.3, 0.75, 4, 1);
     beaconGeo.rotateZ(Math.PI);
     this.beacon = new THREE.Mesh(
       beaconGeo,
       new THREE.MeshBasicMaterial({
-        color: 0xffffff, transparent: true, opacity: 0,
-        blending: THREE.AdditiveBlending, depthWrite: false, depthTest: false,
+        color: 0x6fe9ff, transparent: true, opacity: 0,
+        depthWrite: false, depthTest: false,
       }),
     );
-    this.beacon.position.y = SHOULDER_Y + HEAD_R * 2 + 1.4;
-    this.beacon.renderOrder = 9999; // always on top — never hidden behind figures
+    this.beacon.position.y = SHOULDER_Y + HEAD_R * 2 + 1.0;
+    this.beacon.renderOrder = 9999; // always on top, but small & non-additive
     this.root.add(this.beacon);
 
     this.root.visible = false;
@@ -283,11 +284,12 @@ export class RiggerFigure {
     const haloMat = this.halo.material as THREE.MeshBasicMaterial;
     const beaconMat = this.beacon.material as THREE.MeshBasicMaterial;
     if (on) {
-      haloMat.color.setHex(color);
-      haloMat.opacity = 0.85;
-      beaconMat.color.setHex(0xffffff);
-      beaconMat.opacity = 0.95;
-      this.beacon.position.y = SHOULDER_Y + HEAD_R * 2 + 1.4 + Math.sin(t * 2.2) * 0.35;
+      haloMat.color.setHex(0x6fe9ff);
+      haloMat.opacity = 0.7;
+      beaconMat.color.setHex(0x6fe9ff);
+      beaconMat.opacity = 0.8;
+      void color;
+      this.beacon.position.y = SHOULDER_Y + HEAD_R * 2 + 1.0 + Math.sin(t * 2.2) * 0.25;
       this.beacon.rotation.y = t * 1.4;
     } else {
       haloMat.opacity = 0;

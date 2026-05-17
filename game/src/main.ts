@@ -23,6 +23,7 @@ import { SpectateControls } from './ui/SpectateControls';
 import { ReplayScreen } from './ui/ReplayScreen';
 import { ReplayRecorder, ReplayStore, type ReplayData } from './league/Replay';
 import { solveGateThrow, type GateSolution } from './ai/decide/GateSolve';
+import { planGrapple } from './ai/nav/GrapplePlanner';
 import { predictPath } from './sim/trajectory';
 import { InputManager } from './input/InputManager';
 import { AiSystem, type TeamConfig } from './ai/index';
@@ -44,7 +45,7 @@ renderer.setClearColor(0x11131a, 1);
 renderer.toneMapping = THREE.ACESFilmicToneMapping;
 // Pull exposure down: at some cinematic angles the axis sunline + bloom
 // blew out to near-white and hurt legibility.
-renderer.toneMappingExposure = 0.8;
+renderer.toneMappingExposure = 0.68;
 app.appendChild(renderer.domElement);
 
 const scene = new THREE.Scene();
@@ -89,14 +90,14 @@ const setCastPrompt = (m: CastMode): void => {
       '▼ SHOT READY — the arc threads the ring<br>' +
       '<span style="color:#f4f1ea;font-size:13px;letter-spacing:.1em">' +
       'press &amp; release <b>LEFT</b> to launch &nbsp;·&nbsp; ' +
-      '<b>RIGHT</b> = grapple to reposition</span>';
+      'hold <b>G</b> = auto-grapple toward the ring</span>';
   } else {
     castPrompt.style.color = '#d4602a';
     castPrompt.style.textShadow = '0 0 14px #d4602aaa';
     castPrompt.innerHTML =
       '▼ YOU HAVE THE BELL — no shot from here<br>' +
       '<span style="color:#f4f1ea;font-size:13px;letter-spacing:.1em">' +
-      '<b>RIGHT</b> grapple + <b>W</b> reel toward the FAITH ring, then launch</span>';
+      'hold <b>G</b> to auto-grapple toward the ring until a shot opens</span>';
   }
 };
 
@@ -253,6 +254,18 @@ async function runMatch(
       p1in.throwCharge = Math.max(0, Math.min(1, (p1Sol.releaseSpeed - 9) / 25));
     } else if (!p1Sol && p1in.throwReleased) {
       p1in.throwReleased = false; // no solution → don't waste the cast
+    }
+    // ── Assisted grapple-advance (hold G) ──────────────────────────────────
+    // No aiming: the orchestrator reuses the AI's planner to pick an anchor
+    // that hauls YOU toward your attack ring (+x for home). Manual RMB
+    // grapple still works (now with heavy anchor-snap) for deliberate moves.
+    if (p1 && input.wantsAssistGrapple) {
+      const tgt = { x: Math.max(-300, Math.min(300, p1.p.x + 150)), y: 0, z: 0 };
+      const plan = planGrapple(p1 as never, tgt, snap as never);
+      if (plan) {
+        if (!p1.line) p1in.fireLineAt = plan.anchorPos;
+        p1in.reel = plan.reel;
+      }
     }
     const aiFrame = ai.tick(snap, match.state as never, cfgs, gameSeed);
     const frame: InputFrame = { tick: snap.tick, players: [p1in, ...aiFrame.players] };

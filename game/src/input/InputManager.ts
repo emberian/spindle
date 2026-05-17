@@ -321,6 +321,12 @@ export class InputManager {
     return this.aim.lookIntent();
   }
 
+  /** G held → assisted grapple-advance (orchestrator picks an anchor that
+   *  hauls you toward your attack ring; no aiming required). */
+  get wantsAssistGrapple(): boolean {
+    return this.keys.has('KeyG');
+  }
+
   // ── Pointer lock ──────────────────────────────────────────────────────────
 
   /**
@@ -431,7 +437,7 @@ export class InputManager {
     // ── Keyboard ─────────────────────────────────────────────────────────
     // Only call preventDefault for game keys — don't swallow browser shortcuts.
     const GAME_KEYS = new Set([
-      'KeyW','KeyA','KeyS','KeyD',
+      'KeyW','KeyA','KeyS','KeyD','KeyG',
       'ArrowUp','ArrowDown','ArrowLeft','ArrowRight',
       'ShiftLeft','ShiftRight','Space',
     ]);
