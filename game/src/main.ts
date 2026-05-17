@@ -22,6 +22,8 @@ import { SpectateScreen } from './ui/SpectateScreen';
 import { SpectateControls } from './ui/SpectateControls';
 import { ReplayScreen } from './ui/ReplayScreen';
 import { ReplayRecorder, ReplayStore, type ReplayData } from './league/Replay';
+import { solveGateThrow, type GateSolution } from './ai/decide/GateSolve';
+import { predictPath } from './sim/trajectory';
 import { InputManager } from './input/InputManager';
 import { AiSystem, type TeamConfig } from './ai/index';
 import { MatchStateMachine } from './match/MatchStateMachine';
@@ -63,19 +65,64 @@ const onboarding = new Onboarding(app);
 // HUD's frozen render() contract is untouched. pointer-events:none.
 const castPrompt = document.createElement('div');
 castPrompt.style.cssText =
-  'position:absolute;left:50%;top:18%;transform:translateX(-50%);' +
+  'position:absolute;left:50%;top:16%;transform:translateX(-50%);' +
   'font-family:ui-monospace,"Space Mono",monospace;text-align:center;' +
-  'color:#1aa6b7;letter-spacing:.18em;font-size:15px;line-height:1.7;' +
-  'text-shadow:0 0 12px #1aa6b7aa;pointer-events:none;z-index:40;' +
-  'display:none;text-transform:uppercase;';
-castPrompt.innerHTML =
-  '▼ YOUR CAST — you have the bell<br>' +
-  '<span style="color:#f4f1ea;font-size:13px;letter-spacing:.12em">' +
-  'aim &nbsp;·&nbsp; <b>LEFT</b> hold = launch throw &nbsp;·&nbsp; ' +
-  '<b>RIGHT</b> = grapple to move</span>';
+  'letter-spacing:.16em;font-size:15px;line-height:1.7;' +
+  'pointer-events:none;z-index:40;display:none;text-transform:uppercase;';
 app.appendChild(castPrompt);
-const setCastPrompt = (show: boolean): void => {
-  castPrompt.style.display = show ? 'block' : 'none';
+// Three prompt modes for the assisted-shot model:
+//  'ready'  — a real Coriolis ring solution exists; the bright arc shows it
+//             threading; you just press LEFT to launch the SOLVED shot.
+//  'noshot' — no solution from here; grapple (RIGHT) toward the ring.
+//  'none'   — you don't have the bell / match over → hidden.
+type CastMode = 'none' | 'ready' | 'noshot';
+let castMode: CastMode = 'none';
+const setCastPrompt = (m: CastMode): void => {
+  if (m === castMode) return;
+  castMode = m;
+  if (m === 'none') { castPrompt.style.display = 'none'; return; }
+  castPrompt.style.display = 'block';
+  if (m === 'ready') {
+    castPrompt.style.color = '#1aa6b7';
+    castPrompt.style.textShadow = '0 0 14px #1aa6b7cc';
+    castPrompt.innerHTML =
+      '▼ SHOT READY — the arc threads the ring<br>' +
+      '<span style="color:#f4f1ea;font-size:13px;letter-spacing:.1em">' +
+      'press &amp; release <b>LEFT</b> to launch &nbsp;·&nbsp; ' +
+      '<b>RIGHT</b> = grapple to reposition</span>';
+  } else {
+    castPrompt.style.color = '#d4602a';
+    castPrompt.style.textShadow = '0 0 14px #d4602aaa';
+    castPrompt.innerHTML =
+      '▼ YOU HAVE THE BELL — no shot from here<br>' +
+      '<span style="color:#f4f1ea;font-size:13px;letter-spacing:.1em">' +
+      '<b>RIGHT</b> grapple + <b>W</b> reel toward the FAITH ring, then launch</span>';
+  }
+};
+
+// Bold predicted-arc line: the exact Coriolis path of the assisted shot,
+// drawn so the human SEES it thread the ring (always-on-top, can't be lost).
+const arcGeom = new THREE.BufferGeometry();
+arcGeom.setAttribute('position', new THREE.BufferAttribute(new Float32Array(3 * 64), 3));
+const arcLine = new THREE.Line(
+  arcGeom,
+  new THREE.LineBasicMaterial({
+    color: 0x6fe9ff, transparent: true, opacity: 0.95,
+    blending: THREE.AdditiveBlending, depthWrite: false, depthTest: false,
+  }),
+);
+arcLine.renderOrder = 9990;
+arcLine.frustumCulled = false;
+arcLine.visible = false;
+scene.add(arcLine);
+const showArc = (pts: { x: number; y: number; z: number }[] | null): void => {
+  if (!pts || pts.length < 2) { arcLine.visible = false; return; }
+  const n = Math.min(pts.length, 64);
+  const a = arcGeom.getAttribute('position') as THREE.BufferAttribute;
+  for (let i = 0; i < n; i++) a.setXYZ(i, pts[i].x, pts[i].y, pts[i].z);
+  arcGeom.setDrawRange(0, n);
+  a.needsUpdate = true;
+  arcLine.visible = true;
 };
 const landing = new LandingScreen(app);
 const title = new TitleScreen(app);
@@ -178,6 +225,10 @@ async function runMatch(
     match.resumeLive();
   };
 
+  // Latest assisted-shot solution for P1 (computed deterministically in
+  // stepOnce; read by the render block to draw the bold arc + prompt).
+  let p1Sol: GateSolution | null = null;
+
   // One deterministic sim tick: exactly the prior per-tick body. The driver
   // calls this once per fixed 1/240 s tick; renderState() never feeds back in.
   const stepOnce = (): void => {
@@ -186,6 +237,23 @@ async function runMatch(
     const p1 = snap.players.find((p) => p.id === 'P1');
     if (p1) input.setPlayerState(p1.p, p1.v, snap.bell.heldBy === 'P1');
     const p1in = input.get(SIM_H);
+    // ── Assisted solved-shot ───────────────────────────────────────────────
+    // While YOU hold the bell, the game computes the EXACT Coriolis launch
+    // that threads the ring (the same closed-form solver the AI uses). You
+    // don't hand-aim an impossible curve — you reposition until a shot
+    // exists, then LEFT-release fires the SOLVED velocity. Skill =
+    // positioning / reads / timing, not intuiting a rotating-frame ODE.
+    p1Sol = (p1 && snap.bell.heldBy === 'P1')
+      ? solveGateThrow(p1.p, 'home', snap.omega, 22, 0.3, p1.v)
+      : null;
+    if (p1Sol && p1in.throwReleased) {
+      const tv = p1Sol.throwVec;
+      const tl = Math.hypot(tv.x, tv.y, tv.z) || 1;
+      p1in.aim = { x: tv.x / tl, y: tv.y / tl, z: tv.z / tl };
+      p1in.throwCharge = Math.max(0, Math.min(1, (p1Sol.releaseSpeed - 9) / 25));
+    } else if (!p1Sol && p1in.throwReleased) {
+      p1in.throwReleased = false; // no solution → don't waste the cast
+    }
     const aiFrame = ai.tick(snap, match.state as never, cfgs, gameSeed);
     const frame: InputFrame = { tick: snap.tick, players: [p1in, ...aiFrame.players] };
     rec.push(frame);
@@ -238,8 +306,22 @@ async function runMatch(
       gcam.setLook(li.yaw, li.pitch, li.active);
       gcam.update(s.bell.p, p1r ? p1r.p : s.bell.p, GATE_X, lg, REG.R, Math.min(dt, 1 / 30));
       hud.render(s as never, match.state as never, input.view);
-      // You have the bell → it never moves on its own; YOU launch it.
-      setCastPrompt(s.bell.heldBy === 'P1' && match.state.winner === null);
+      // Assisted-shot feedback: when YOU hold the bell, either show the
+      // bold arc threading the ring + "SHOT READY", or "no shot — go
+      // closer". The ball never moves on its own; YOU launch it.
+      if (s.bell.heldBy === 'P1' && match.state.winner === null) {
+        if (p1Sol) {
+          setCastPrompt('ready');
+          const ah = Math.max(0.02, p1Sol.flightTime / 56);
+          showArc(predictPath(s.bell.p, p1Sol.v0, s.omega, ah, 56));
+        } else {
+          setCastPrompt('noshot');
+          showArc(null);
+        }
+      } else {
+        setCastPrompt('none');
+        showArc(null);
+      }
       // Diagnostic hook (cheap; lets a harness observe the HUMAN-play path:
       // can P1 actually move, what is the camera framing, is input live).
       const _iv = input.view;
@@ -256,7 +338,8 @@ async function runMatch(
 
       if (!ended && match.state.winner !== null) {
         ended = true;
-        setCastPrompt(false);
+        setCastPrompt('none');
+        showArc(null);
         runtime?.stop();
         try {
           ReplayStore.save(
