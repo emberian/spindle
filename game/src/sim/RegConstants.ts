@@ -26,7 +26,7 @@ export const GATE_X = REG.L / 2; // ±320 m
 // springs use semi-implicit (symplectic) Euler at h = 1/240 s with ω_n·h ≪ 2.
 export const FEEL = {
   LINE_K: 1400, // taut rig-line radial spring  (ω_n·h ≈ 0.018)
-  LINE_C: 520, // taut rig-line radial damping (ζ ≈ 0.55)
+  LINE_C: 520, // taut rig-line radial damping (ζ ≈ 0.55, near-critical; reel-in still slingshots ~16–30 m/s cruise)
   LINE_SLACK_BAND: 0.6, // m — slack pre-tension band below rest_len
   LINE_SLACK_K: 120, // soft pre-tension stiffness in the band
 

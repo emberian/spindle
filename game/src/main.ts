@@ -216,6 +216,19 @@ async function runMatch(
       gcam.setLook(li.yaw, li.pitch, li.active);
       gcam.update(s.bell.p, p1r ? p1r.p : s.bell.p, GATE_X, lg, REG.R, Math.min(dt, 1 / 30));
       hud.render(s as never, match.state as never, input.view);
+      // Diagnostic hook (cheap; lets a harness observe the HUMAN-play path:
+      // can P1 actually move, what is the camera framing, is input live).
+      const _iv = input.view;
+      (window as unknown as { __rigp?: unknown }).__rigp = {
+        tick: s.tick,
+        p1: p1r ? { x: p1r.p.x, y: p1r.p.y, z: p1r.p.z } : null,
+        p1v: p1r ? Math.hypot(p1r.v.x, p1r.v.y, p1r.v.z) : 0,
+        p1held: s.bell.heldBy === 'P1',
+        bx: s.bell.p.x, bheld: s.bell.heldBy,
+        cam: { x: camera.position.x, y: camera.position.y, z: camera.position.z },
+        reticle: _iv.reticleState, locked: _iv.pointerLocked, charge: _iv.chargeLevel,
+        phase: match.state.phase, sh: match.state.scoreHome, sa: match.state.scoreAway,
+      };
 
       if (!ended && match.state.winner !== null) {
         ended = true;

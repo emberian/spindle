@@ -19,7 +19,9 @@
 //
 // Device bindings:
 //   Mouse aim (pointer-lock or free)  → aim via AimModel
-//   LMB (not holding bell)            → fire grapple line at snapped anchor
+//   RMB press                         → fire grapple at snapped anchor
+//                                       (works WHILE carrying the bell)
+//   RMB release                       → release the line (slingshot off)
 //   LMB hold (holding bell)           → charge throw (0..1)
 //   LMB release (charging)            → throw
 //   A / D  or  scroll                 → throwSpin [-1..1]
@@ -98,9 +100,12 @@ export class InputManager {
 
   // ── Device state ────────────────────────────────────────────────────────────
   private keys        = new Set<string>();
-  private lmbDown     = false;
-  private lmbPressed  = false;   // edge: just went down this tick
-  private lmbReleased = false;   // edge: just went up this tick
+  private lmbDown     = false;   // held → charge throw (while holding bell)
+  private lmbReleased = false;   // edge: just went up this tick → throw
+  // RMB = grapple (works WHILE carrying the bell — the carrier was otherwise
+  // immobile: grapple used to be gated on !holdingBell and LMB is throw).
+  private rmbPressed  = false;   // edge → fire line
+  private rmbReleased = false;   // edge → release line (slingshot off)
   private scrollSpin  = 0;
   private mouseDX     = 0;
   private mouseDY     = 0;
@@ -216,12 +221,15 @@ export class InputManager {
     const reelOut = this.keys.has('KeyS') || this.keys.has('ArrowDown');
     const reel: -1 | 0 | 1 = reelIn ? -1 : reelOut ? 1 : 0;
 
-    // 7. FireLineAt: LMB pressed this tick while NOT holding the bell
-    //    (we fire on press, not release, so grapple feels instant)
+    // 7. FireLineAt: RMB pressed this tick (fire on press → instant), at the
+    //    snapped anchor. Works WHETHER OR NOT we hold the bell — you carry
+    //    the bell down the calm by grappling, then throw with LMB. RMB
+    //    release lets the line go (slingshot off).
     const fireLineAt: Vec3 | null =
-      (this.lmbPressed && !this.holdingBell && this._reticle?.valid)
+      (this.rmbPressed && this._reticle?.valid)
         ? this._reticle.pos
         : null;
+    const releaseLine = this.rmbReleased;
 
     // 8. Pushoff: SHIFT (only when in contact with something)
     const pushoff = this.keys.has('ShiftLeft') || this.keys.has('ShiftRight');
@@ -255,15 +263,16 @@ export class InputManager {
     }
 
     // Consume edge flags
-    this.lmbPressed  = false;
     this.lmbReleased = false;
+    this.rmbPressed  = false;
+    this.rmbReleased = false;
 
     return {
       id:           'P1',
       aim:          aimDir,
       fireLineAt,
       reel,
-      release:      false,
+      release:      releaseLine,
       pushoff,
       throwCharge:  this._charge,
       throwReleased,
@@ -387,26 +396,27 @@ export class InputManager {
     on(this.canvas, 'mousedown', (e: MouseEvent) => {
       if (e.button === 0) {
         this.lmbDown    = true;
-        this.lmbPressed = true;
-        // A click is a deliberate gesture → acquire lock (idempotent, and
-        // the *sole* requester now that main.ts no longer does it). The
-        // game still fires/charges this same tick — free-mouse aim is used
-        // until lock actually engages, so nothing feels gated on the lock.
-        this._tryLock();
+      } else if (e.button === 2) {
+        this.rmbPressed = true;
       }
+      // Any deliberate click acquires pointer-lock (idempotent, sole
+      // requester). Free-mouse aim is used until lock engages so nothing
+      // feels gated on it; LMB throws / RMB grapples the same tick.
+      this._tryLock();
     });
 
-    // Right-click intentionally releases lock for menu/UI access without
-    // feeling trapped; the cursor reappears and free-mouse takes over.
+    // RMB is grapple now (a gameplay action) — just suppress the context
+    // menu; do NOT drop pointer-lock here (Esc still exits lock for UI).
     on(this.canvas, 'contextmenu', (e: MouseEvent) => {
       e.preventDefault();
-      if (this.pointerLocked) document.exitPointerLock?.();
     });
 
     on(this.canvas, 'mouseup', (e: MouseEvent) => {
       if (e.button === 0) {
         this.lmbDown     = false;
         this.lmbReleased = true;
+      } else if (e.button === 2) {
+        this.rmbReleased = true;
       }
     });
 

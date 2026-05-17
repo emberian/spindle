@@ -42,8 +42,19 @@ export class Onboarding {
     };
     window.addEventListener('keydown', onKey);
 
-    // Store cleanup ref so hide() can also remove the listener
-    (this.overlay as any)._cleanupKey = () => window.removeEventListener('keydown', onKey);
+    // Also auto-dismiss the moment the player interacts with the game
+    // (a canvas pointerdown) — clicking is the natural first instinct.
+    const onPtr = () => {
+      this._dismiss();
+      window.removeEventListener('pointerdown', onPtr, true);
+    };
+    window.addEventListener('pointerdown', onPtr, true);
+
+    // Store cleanup ref so hide() can also remove the listeners
+    (this.overlay as any)._cleanupKey = () => {
+      window.removeEventListener('keydown', onKey);
+      window.removeEventListener('pointerdown', onPtr, true);
+    };
 
     // Fade in
     requestAnimationFrame(() => {
@@ -91,7 +102,11 @@ export class Onboarding {
       backdropFilter: 'blur(3px)',
       opacity:        '0',
       transition:     'opacity 0.3s ease',
-      pointerEvents:  'all',
+      // The backdrop must NOT eat input — it was a full-screen z=100 layer
+      // that swallowed every canvas click, so the game was uncontrollable
+      // until dismissed. Clicks now pass straight through to the canvas;
+      // only the card itself is interactive.
+      pointerEvents:  'none',
       fontFamily:     FONT_STACK,
     });
 
@@ -99,6 +114,10 @@ export class Onboarding {
     const card = document.createElement('div');
     Object.assign(card.style, {
       position:     'relative',
+      // NOTE: deliberately NOT pointer-events:auto. The whole overlay is
+      // click-through so it can never eat a game click; the global keydown/
+      // pointerdown auto-dismiss (in show()) closes it on the player's first
+      // interaction, and that same click still reaches the canvas.
       maxWidth:     '480px',
       width:        '90%',
       padding:      '36px 40px 32px',

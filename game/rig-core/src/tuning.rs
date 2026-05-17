@@ -18,7 +18,10 @@ pub const GATE_X: f64 = L / 2.0;
 /// ω_n = sqrt(LINE_K / 78) ≈ 4.24 rad/s ⇒ ω_n·h ≈ 0.018 ≪ 2.
 pub const LINE_K: f64 = 1400.0;
 /// Taut rig-line radial damping. ζ ≈ LINE_C / (2·sqrt(LINE_K·78)) ≈ 0.55
-/// (near-critical: snappy, no ring-out, no overshoot).
+/// (near-critical: snappy, no ring-out, no overshoot). Reeling-in still
+/// slingshots (~16–30 m/s cruise, controllable); the "carrier can't move"
+/// bug was the onboarding eating clicks + grapple gated on !holdingBell,
+/// NOT this damping.
 pub const LINE_C: f64 = 520.0;
 /// Slack pre-tension band width (m) below rest_len where a gentle spring
 /// pre-loads the rope so it eases into tautness instead of snapping.
