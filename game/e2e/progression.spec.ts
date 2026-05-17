@@ -16,11 +16,13 @@
  *     limit — so the assertion fails catastrophically while leaving a healthy
  *     game ≈75 m of breathing room beyond the goal face.
  *
- *   HELD_MIN_FRAC = 0.15
- *     At least 15 % of samples must show the bell held by a player.  Under
- *     the hollow-match bug heldBy was always null (0 %).  A real game at 4×
- *     has players contesting possession constantly; empirically ~30–60 % of
- *     frames show possession.  15 % is the failure floor.
+ *   BX_ACTIVE_SPAN = 60
+ *     The bell's axial position must sweep ≥60 m across the run.  A live
+ *     match works the bell up and down the tube (hundreds of m of span); a
+ *     hollow/frozen match leaves it ≈constant.  Render-cadence independent
+ *     (replaces the old held-fraction proxy, which a competent fast-throwing
+ *     AI on slow CI software-GL almost never sampled — bell is in flight,
+ *     not held, most render frames; confounded local-vs-CI).
  *
  *   PROGRESSION: at least one of
  *     • possession changes ≥ 1      (teams trade the bell)
@@ -52,10 +54,13 @@ const GATE_X = 320;
 const BX_MAX = GATE_X + 80; // 400 m
 
 /**
- * Minimum fraction of samples where `held` must be non-null.
- * Guards against the hollow-match bug (held was always null → 0 %).
+ * Minimum axial span (m) the bell must sweep across the run. A live match
+ * works the bell up and down the tube; a hollow/frozen match does not. This
+ * is render-cadence independent (unlike sampling the brief `held` instant,
+ * which a competent fast-throwing AI on slow CI software-GL almost never
+ * lands on — that proxy was confounded and is replaced by this).
  */
-const HELD_MIN_FRAC = 0.15;
+const BX_ACTIVE_SPAN = 60;
 
 /** Number of samples to collect while the match runs. */
 const SAMPLE_COUNT = 40;
@@ -175,16 +180,20 @@ test('AI-vs-AI match progresses without runaway bell or hollow state', async ({ 
     ).toBeLessThanOrEqual(BX_MAX);
   }
 
-  // 3. Bell is actually held in a meaningful fraction of samples.
-  //    BUG GUARD: hollow-match bug (heldBy always null → 0 %).
-  const heldCount = samples.filter((s) => s.held !== null).length;
-  const heldFrac = heldCount / samples.length;
+  // 3. The bell is actively in play: its axial position must sweep a
+  //    meaningful span across the run (render-cadence independent).
+  //    BUG GUARD: hollow/frozen-match (bx ≈ constant). Runaway (bx huge)
+  //    is already caught by #2.
+  const bxs = samples.map((s) => s.bx);
+  const bxMin = Math.min(...bxs);
+  const bxMax = Math.max(...bxs);
+  const bxSpan = bxMax - bxMin;
   expect(
-    heldFrac,
-    `Bell was never (or barely) held: ${(heldFrac * 100).toFixed(1)} % of samples ` +
-    `had held != null (threshold: ${HELD_MIN_FRAC * 100} %). ` +
-    'Under the hollow-match bug this was 0 % — players never contested possession.',
-  ).toBeGreaterThanOrEqual(HELD_MIN_FRAC);
+    bxSpan,
+    `Bell barely moved: x spanned only ${bxSpan.toFixed(1)} m across ${samples.length} ` +
+    `samples (min ${bxMin.toFixed(1)}, max ${bxMax.toFixed(1)}; threshold ${BX_ACTIVE_SPAN} m). ` +
+    'A live match works the bell up and down the tube; a hollow/frozen match does not.',
+  ).toBeGreaterThanOrEqual(BX_ACTIVE_SPAN);
 
   // 4. Match progresses: at least one of possession changes / inning advance / score increase.
   //    BUG GUARD: hollow-match bug (all state stuck at initial values throughout).
