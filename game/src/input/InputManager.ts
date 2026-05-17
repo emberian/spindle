@@ -464,7 +464,7 @@ export class InputManager {
     // ── Scroll → camera ZOOM ──────────────────────────────────────────────
     on(this.canvas, 'wheel', (e: WheelEvent) => {
       e.preventDefault();
-      this.camDist = Math.max(16, Math.min(240, this.camDist + e.deltaY * 0.06));
+      this.camDist = Math.max(42, Math.min(240, this.camDist + e.deltaY * 0.06));
     }, { passive: false });
 
     // ── Keyboard ─────────────────────────────────────────────────────────

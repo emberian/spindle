@@ -82,14 +82,16 @@ export class PostFX {
   private finishPass: ShaderPass;
 
   // Baseline bloom — strong enough to make the trail/rings sing, not nuclear
-  private readonly BASE_STRENGTH  = 0.35;
-  private readonly BASE_RADIUS    = 0.5;
-  private readonly BASE_THRESHOLD = 0.5; // only very bright pixels bloom — no more whole-frame white-out
+  private readonly BASE_STRENGTH  = 0.12; // near-off: no camera angle can white out the frame
+  private readonly BASE_RADIUS    = 0.4;
+  private readonly BASE_THRESHOLD = 0.7;  // only the very brightest pixels bloom at all
 
-  // Loop peak bloom
-  private readonly LOOP_STRENGTH  = 3.8;  // blazing
-  private readonly LOOP_RADIUS    = 0.85; // wide, corona-like
-  private readonly LOOP_THRESHOLD = 0.05; // grab almost everything
+  // Loop peak bloom — a mild lift, NOT a screen-whiting blaze. The old 3.8
+  // (designed for the deleted loop-cam) was THE recurring blowout: every
+  // Loop ramped bloom to nuclear with no special framing to contain it.
+  private readonly LOOP_STRENGTH  = 0.4;
+  private readonly LOOP_RADIUS    = 0.5;
+  private readonly LOOP_THRESHOLD = 0.55;
 
   constructor(renderer: THREE.WebGLRenderer, scene: THREE.Scene, camera: THREE.Camera) {
     this.composer = new EffectComposer(renderer);
