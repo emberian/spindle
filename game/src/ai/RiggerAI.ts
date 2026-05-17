@@ -138,6 +138,11 @@ export interface PlayerCommit {
    *  sawHeldBy). */
   sawRole: string | null;
   sawJob: string | null;
+  /** Consecutive ticks THIS player has held the bell (0 when not). Drives
+   *  the anti-stall release: with the chase pack reliably catching, the
+   *  carrier must move it along (canon: a slow bell is a foul) so play is
+   *  catch → brief carry → pass to a chasing pack-mate → repeat. */
+  holdTicks: number;
 }
 
 export interface PlayerCommitCache {
@@ -207,6 +212,10 @@ function hardTrigger(commit: PlayerCommit, state: SimState, match: MatchState, p
   if (commit.sawHeldBy !== heldBy) return true; // possession changed hands
   if (commit.sawHadBell !== haveBell) return true; // we gained/lost the bell
   if (commit.sawContest !== contestOn) return true; // a contest opened/closed
+  // Anti-stall: while holding, force a periodic re-decide (~3×/s @240 Hz) so
+  // decideThrow's escalating "move it along now" logic runs instead of a
+  // stale committed hold. Canon: a slow bell is a foul.
+  if (haveBell && commit.holdTicks > 0 && commit.holdTicks % 80 === 0) return true;
   return false;
 }
 
@@ -230,6 +239,9 @@ export function computePlayerInput(
   const tick = state.tick;
 
   let commit = cache.value;
+  if (commit) {
+    commit.holdTicks = state.bell.heldBy === player.id ? commit.holdTicks + 1 : 0;
+  }
   const firstEver = !commit;
   const triggered = commit ? hardTrigger(commit, state, match, player) : true;
 
@@ -257,6 +269,7 @@ export function computePlayerInput(
         styleRadius: 0,
         sawRole: null,
         sawJob: null,
+        holdTicks: 0,
       };
     }
 
@@ -809,7 +822,11 @@ function decideThrow(
     const atMouth = match.cast ? match.cast.gate === 'mouth' : true;
     const threadsWell = gate ? gate.arriveRho <= REG.gateRadius * 0.6 : false;
     const inRange = distToRing < REG.L * 0.45;
-    const mustShoot = throwsLeft <= 1;
+    // Anti-stall: never dwell. Past the hard hold cap, take the shot rather
+    // than cradle the bell (240 Hz sim). The pass game (PRIORITY 2) is the
+    // normal release before the mouth; this is the do-not-stall backstop.
+    const STALL_HARD = 540; // ~2.25 s
+    const mustShoot = throwsLeft <= 1 || commit.holdTicks > STALL_HARD;
     if (gate && ((atMouth && threadsWell && inRange) || mustShoot)) {
       // Aim along the REQUIRED throw vector (sim adds player.v back to it);
       // charge so the sim's release speed equals |throwVec| exactly. This
@@ -932,13 +949,21 @@ function decideThrow(
   // gate readily (a modest advancing pass is the bread of an inning, now
   // that catches actually complete). Was 18 — too sticky, the carrier just
   // held and innings never built.
-  const passGainsGround = bestGain > 8;
-  const safeOutlet = bestScore > 0.15 && bestGain > -25;
+  // Anti-stall: the longer we've cradled the bell the weaker a pass we'll
+  // accept; past the hard cap RELEASE the best option no matter what (the
+  // chase pack will go get it — that's the back-and-forth). Never dwell.
+  const stall = commit.holdTicks;
+  const STALL_HARD2 = 540;
+  const ease = Math.max(0, Math.min(1, (stall - 240) / 300));
+  const passGainsGround = bestGain > 8 - ease * 24;
+  const safeOutlet = bestScore > 0.15 - ease * 0.25 && bestGain > -25 - ease * 30;
+  const forceRelease = stall > STALL_HARD2 && bestTm != null && bestV0 != null;
   const acceptable =
     bestTm != null &&
     bestV0 != null &&
-    bestScore > -0.02 &&
-    (passGainsGround || (pressured && safeOutlet));
+    (forceRelease ||
+      (bestScore > -0.02 - ease * 0.35 &&
+        (passGainsGround || (pressured && safeOutlet))));
 
   if (!acceptable) {
     commit.throwGo = false;

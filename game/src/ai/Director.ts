@@ -450,45 +450,36 @@ export function runDirector(
   let recoverId: string | null = null;
 
   if (bellLoose) {
-    // ROBUSTNESS: exactly one designated recoverer — the closest of OUR
-    // players to the bell — so the team never deadlocks on a loose bell and
-    // never collapses everyone onto it. Tie-break by id for determinism.
-    let best: PlayerSim | null = null;
-    let bestD = Infinity;
-    for (const p of myPlayers) {
-      const d = dist3(p.p, state.bell.p);
-      if (d < bestD - 1e-6 || (Math.abs(d - bestD) <= 1e-6 && best && p.id < best.id)) {
-        bestD = d;
-        best = p;
-      }
+    // CHASE PACK (the fix for "nobody chases the ball, not good to watch").
+    // The bell is airborne most of the match; a lone pursuer left 3 of 4
+    // players drifting in slots — dead to watch. Send the K nearest of OUR
+    // team converging on it: if it's our throw they're receivers racing to
+    // the catch, if it's theirs they're a contesting pack — either way a
+    // visible scrum + back-and-forth + more contests ("a one"). The recover
+    // nav (Coriolis lead, tuck-behind) keeps them on the bell's path so
+    // they spread along it rather than literally piling. Deterministic:
+    // sort by distance, id tie-break, no rng.
+    const ordered = [...myPlayers].sort((a, b) => {
+      const da = dist3(a.p, state.bell.p);
+      const db = dist3(b.p, state.bell.p);
+      if (Math.abs(da - db) > 1e-6) return da - db;
+      return a.id < b.id ? -1 : 1;
+    });
+    const PACK = Math.min(3, ordered.length);
+    const packIds = new Set(ordered.slice(0, PACK).map(p => p.id));
+    recoverId = ordered.length ? ordered[0].id : null;
+    for (const id of packIds) {
+      assignments[id] = { job: 'recover', markId: null, depthSlot: 0, radiusSlot: 0, pressure: 0 };
     }
-    recoverId = best ? best.id : null;
-    for (const p of myPlayers) {
-      if (p.id === recoverId) {
-        assignments[p.id] = { job: 'recover', markId: null, depthSlot: 0, radiusSlot: 0, pressure: 0 };
-      } else if (hasPossession || thrownByUs) {
-        // Our throw in flight: keep offensive receiving shape.
-        assignments[p.id] = { job: 'receive', markId: null, depthSlot: 0.6, radiusSlot: 0.4, pressure: 0 };
-      } else {
-        // Their loose bell about to be theirs: pre-mark.
-        assignments[p.id] = { job: 'zone', markId: null, depthSlot: 0, radiusSlot: 0.5, pressure: 0 };
-      }
-    }
+    const rest = myPlayers.filter(p => !packIds.has(p.id));
     if (hasPossession || thrownByUs) {
-      const recvs = myPlayers.filter(p => p.id !== recoverId);
-      assignReceivers(recvs, loopSetterId, assignments);
-      if (recoverId)
-        assignments[recoverId] = { job: 'recover', markId: null, depthSlot: 0, radiusSlot: 0, pressure: 0 };
+      assignReceivers(rest, loopSetterId, assignments);
     } else {
-      assignMarks(
-        myPlayers.filter(p => p.id !== recoverId),
-        opponents,
-        null,
-        assignments,
-        profile.aggression,
-      );
-      if (recoverId)
-        assignments[recoverId] = { job: 'recover', markId: null, depthSlot: 0, radiusSlot: 0, pressure: 0 };
+      assignMarks(rest, opponents, null, assignments, profile.aggression);
+    }
+    // Re-assert the pack last so receiver/mark passes never overwrite it.
+    for (const id of packIds) {
+      assignments[id] = { job: 'recover', markId: null, depthSlot: 0, radiusSlot: 0, pressure: 0 };
     }
   } else if (heldByUs) {
     // OFFENSE: the holder is the carrier; the rest are receivers in slots.
