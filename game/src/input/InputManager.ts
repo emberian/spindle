@@ -335,6 +335,20 @@ export class InputManager {
     return this.keys.has('KeyG');
   }
 
+  /** Direct rigger drive: WASD → a world move direction along/around the
+   *  tube (x = down the tube toward the +x ring, z = lateral). The
+   *  orchestrator grapples the rigger that way so YOU steer your athlete.
+   *  Zero vector when nothing is pressed. */
+  get moveDir(): { x: number; y: number; z: number } {
+    let x = 0, z = 0;
+    if (this.keys.has('KeyW') || this.keys.has('ArrowUp'))    x += 1; // toward +x ring
+    if (this.keys.has('KeyS') || this.keys.has('ArrowDown'))  x -= 1; // back
+    if (this.keys.has('KeyA') || this.keys.has('ArrowLeft'))  z -= 1; // lateral
+    if (this.keys.has('KeyD') || this.keys.has('ArrowRight')) z += 1; // lateral
+    const m = Math.hypot(x, z);
+    return m > 0 ? { x: x / m, y: 0, z: z / m } : { x: 0, y: 0, z: 0 };
+  }
+
   /** User-controlled orbit camera state (mouse=rotate, wheel=zoom, C=follow).
    *  The camera only ever moves because the player moved it. */
   get cameraState(): { yaw: number; pitch: number; dist: number; follow: 'player' | 'ball' } {

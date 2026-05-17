@@ -175,16 +175,16 @@ export class Onboarding {
     type BodyLine = { text: string; accent?: string; after?: string };
     const lines: BodyLine[] = [
       { text: 'You are the cyan rigger under the ', accent: '▼ marker' },
-      { text: 'You cannot fly. You move by line.' },
+      { text: 'The camera follows you on its own.' },
       { text: '' },
-      { text: 'Hold ', accent: 'G', after: ' — auto-grapple toward the ring.' },
-      { text: 'No aiming: it hauls you goal-ward.' },
+      { text: 'Fly your rigger with ', accent: 'W A S D' },
+      { text: 'W = toward the ring, S = back, A/D = across.' },
       { text: '(RIGHT mouse = manual grapple, heavy snap.)' },
       { text: '' },
       { text: 'When you hold the bell the game ', accent: 'solves the shot' },
       { text: 'for you: a bold arc shows it thread the ring.' },
       { text: 'When it says ', accent: 'SHOT READY', after: ', press & release' },
-      { text: 'LEFT to launch. No shot? Hold G to get closer.' },
+      { text: 'LEFT to launch. No shot? Fly closer with WASD.' },
     ];
 
     for (const ln of lines) {
@@ -224,11 +224,10 @@ export class Onboarding {
     });
 
     const bindings: [string, string][] = [
-      ['G (hold)',  'Auto-grapple toward the ring — no aiming'],
+      ['W A S D',   'Fly your rigger (W=ring, S=back, A/D=across)'],
       ['LEFT MB',   'Launch the SOLVED shot (when SHOT READY)'],
       ['RIGHT MB',  'Manual grapple (heavy snap) · release = let go'],
-      ['W / S',     'Reel line in / out (fine control)'],
-      ['A / D',     'Spin (curl the bell)'],
+      ['G (hold)',  'Auto-fly straight toward the ring'],
       ['SHIFT',     'Push off a surface'],
       ['SPACE',     'Thrumbler nudge'],
     ];

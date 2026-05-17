@@ -90,14 +90,14 @@ const setCastPrompt = (m: CastMode): void => {
       '▼ SHOT READY — the arc threads the ring<br>' +
       '<span style="color:#f4f1ea;font-size:13px;letter-spacing:.1em">' +
       'press &amp; release <b>LEFT</b> to launch &nbsp;·&nbsp; ' +
-      'hold <b>G</b> = auto-grapple toward the ring</span>';
+      '<b>WASD</b> to fly your rigger</span>';
   } else {
     castPrompt.style.color = '#d4602a';
     castPrompt.style.textShadow = '0 0 14px #d4602aaa';
     castPrompt.innerHTML =
       '▼ YOU HAVE THE BELL — no shot from here<br>' +
       '<span style="color:#f4f1ea;font-size:13px;letter-spacing:.1em">' +
-      'hold <b>G</b> to auto-grapple toward the ring until a shot opens</span>';
+      'fly with <b>WASD</b> toward the ring until a shot opens</span>';
   }
 };
 
@@ -255,15 +255,24 @@ async function runMatch(
       const tl = Math.hypot(tv.x, tv.y, tv.z) || 1;
       p1in.aim = { x: tv.x / tl, y: tv.y / tl, z: tv.z / tl };
       p1in.throwCharge = Math.max(0, Math.min(1, (p1Sol.releaseSpeed - 9) / 25));
+      p1in.throwSpin = 0; // solved shot owns the trajectory; no stray spin
     } else if (!p1Sol && p1in.throwReleased) {
       p1in.throwReleased = false; // no solution → don't waste the cast
     }
-    // ── Assisted grapple-advance (hold G) ──────────────────────────────────
-    // No aiming: the orchestrator reuses the AI's planner to pick an anchor
-    // that hauls YOU toward your attack ring (+x for home). Manual RMB
-    // grapple still works (now with heavy anchor-snap) for deliberate moves.
-    if (p1 && input.wantsAssistGrapple) {
-      const tgt = { x: Math.max(-300, Math.min(300, p1.p.x + 150)), y: 0, z: 0 };
+    // ── Direct rigger drive (WASD) ─────────────────────────────────────────
+    // YOU steer your athlete: WASD picks a direction; the orchestrator
+    // reuses the AI's planner to grapple the rigger that way (you move by
+    // line, canon — but the line is auto-chosen so it's direct & legible).
+    // G is kept as an alias for "toward the ring". RMB = manual grapple.
+    const md = input.moveDir;
+    const drive = (md.x !== 0 || md.z !== 0);
+    if (p1 && (drive || input.wantsAssistGrapple)) {
+      const dir = drive ? md : { x: 1, y: 0, z: 0 }; // G ⇒ toward +x ring
+      const tgt = {
+        x: Math.max(-300, Math.min(300, p1.p.x + dir.x * 130)),
+        y: p1.p.y + dir.y * 90,
+        z: p1.p.z + dir.z * 90,
+      };
       const plan = planGrapple(p1 as never, tgt, snap as never);
       if (plan) {
         if (!p1.line) p1in.fireLineAt = plan.anchorPos;
