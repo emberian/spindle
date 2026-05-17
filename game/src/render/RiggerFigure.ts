@@ -265,7 +265,12 @@ export class RiggerFigure {
     // ── Limb cadence: amplitude AND tempo scale with speed/effort so a fast
     // rigger thrashes hard; a settling one stiffens (brace damps the swim).
     const swimGate = (1 - brace * 0.8);
-    const amp = (0.28 + strokeAmp * 0.95 + effort * 0.55) * swimGate;
+    const amp = (0.05 + strokeAmp * 1.05 + effort * 0.55) * swimGate;
+    // How hard the limbs are actually swimming. Near 0 when parked so the
+    // joint-flex oscillators below go quiet (no bobbing in place); when
+    // moving it reaches 1 and they pump fully as before. The slow spine
+    // idleSway is then the only idle motion — a faint, calm breath.
+    const swimAmt = THREE.MathUtils.clamp(amp, 0, 1);
     const s = Math.sin(strokeAng);
     const c = Math.cos(strokeAng);
 
@@ -276,8 +281,8 @@ export class RiggerFigure {
     const lBrace = -1.05;                       // forward, wide
     this.armL.set(
       THREE.MathUtils.lerp(lSwim, lBrace, brace),
-      armBend + (s * 0.5 + 0.5) * 0.3 + brace * 0.2,
-      -0.12 - c * 0.10 - brace * 0.55,
+      armBend + (s * 0.5 + 0.5) * 0.3 * swimAmt + brace * 0.2,
+      -0.12 - c * 0.10 * swimAmt - brace * 0.55,
     );
 
     // ── Right (grapple) arm — the worker. Three blended intents:
@@ -291,10 +296,10 @@ export class RiggerFigure {
     const haulBend   = THREE.MathUtils.lerp(0.10, 1.35, haul * 0.5 + 0.5);
     // Reach pose is the base; the haul cycle modulates it by reach amount.
     let rSwing = THREE.MathUtils.lerp(-s * amp * 0.7, reachSwing, reach);
-    let rBend  = THREE.MathUtils.lerp(armBend + (-s * 0.5 + 0.5) * 0.3, reachBend, reach);
+    let rBend  = THREE.MathUtils.lerp(armBend + (-s * 0.5 + 0.5) * 0.3 * swimAmt, reachBend, reach);
     rSwing = THREE.MathUtils.lerp(rSwing, haulSwing, reach * 0.7);
     rBend  = THREE.MathUtils.lerp(rBend,  haulBend,  reach * 0.7);
-    let rFlare = THREE.MathUtils.lerp(0.12 + c * 0.10, -0.05, reach);
+    let rFlare = THREE.MathUtils.lerp(0.12 + c * 0.10 * swimAmt, -0.05, reach);
     // Throw: wind-up cocks the arm way back+bent; release whips it forward.
     const wUp = Math.max(0, -wind), wRel = Math.max(0, wind);
     rSwing = THREE.MathUtils.lerp(rSwing, 1.7, wUp);     // cocked behind
@@ -313,11 +318,11 @@ export class RiggerFigure {
     const braceLeg = 0.95;                       // both legs forward to brake
     this.legL.set(
       THREE.MathUtils.lerp(lLeg, braceLeg, brace),
-      legBend + (-s * 0.5 + 0.5) * 0.35 + brace * 0.7,
+      legBend + (-s * 0.5 + 0.5) * 0.35 * swimAmt + brace * 0.7,
     );
     this.legR.set(
       THREE.MathUtils.lerp(rLeg, braceLeg, brace),
-      legBend + ( s * 0.5 + 0.5) * 0.35 + brace * 0.7,
+      legBend + ( s * 0.5 + 0.5) * 0.35 * swimAmt + brace * 0.7,
     );
   }
 

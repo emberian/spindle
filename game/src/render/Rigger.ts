@@ -283,11 +283,13 @@ class RiggerInstance {
       this.swingPhase += swingRate * dt;
     }
 
-    // Stroke phase advances with distance travelled (+ a slow idle baseline so
-    // a parked rigger still breathes/floats rather than freezing). Effort
-    // adds tempo so a hard-driving rigger's limbs cadence faster.
+    // Stroke phase advances with distance travelled. The idle baseline is now
+    // speed-scaled: a parked rigger only creeps the phase (with swimAmt≈0 the
+    // joints are quiet anyway, so this just stops any slow residual drift),
+    // ramping to the full ~1.4 rad/s cadence once it is actually moving.
+    // Effort adds tempo so a hard-driving rigger's limbs cadence faster.
     this.strokePhase += speed * dt * STROKE_PER_METRE * (1 + this.effort * 0.8)
-      + dt * 1.4;
+      + dt * (0.3 + Math.min(1, speed / 3) * 1.1);
     this.idlePhase += dt * IDLE_RATE;
 
     // ── Colours ─────────────────────────────────────────────────────────────

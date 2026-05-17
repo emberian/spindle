@@ -500,9 +500,10 @@ function decideNavTarget(
     if (mark) {
       const tRing = { x: defendRingX(player.team), y: 0, z: 0 };
       const toRing = vnorm(vsub(tRing, mark.p));
-      // pressure 1 → ~1.2 m onto the target (snatch range);
-      // pressure 0 → ~7 m goal-side screen.
-      const standoff = 7 - assignment.pressure * 5.8;
+      // Carrier shadower (pressure ≈0.9) → ~3 m hard shadow;
+      // secondary mark (≈0.45) → ~5.5 m jump-the-route;
+      // loose screen (≈0.25) → ~6.7 m holding shape, not on the ball.
+      const standoff = 8 - assignment.pressure * 5.4;
       const base = vadd(mark.p, vscale(toRing, standoff));
       // When pressing hard, bias the target a touch toward the live bell so
       // the marker actually arrives in clatter/snatch range, not behind it.

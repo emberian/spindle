@@ -267,13 +267,14 @@ function assignMarks(
     if (bestI < 0) break;
     const def = defenders.splice(bestI, 1)[0];
     const isCarrier = opp.id === bellHolderId;
-    // Carrier shadower presses hardest (snatch). Secondary threats get a
-    // close shadow; deeper-ranked opponents get a firm screen — but nobody
-    // sits passively any more.
+    // Only the carrier shadower presses hard (snatch drama). Everyone else
+    // holds defensive SHAPE — a moderate jump-the-route distance for the next
+    // threats, a loose screen for the rest — so the unit covers space instead
+    // of collapsing into a knot on the ball (was: whole line dogpiled).
     let pressure: number;
     if (isCarrier) pressure = Math.min(1, 0.85 + aggression * 0.15);
-    else if (rank <= 2) pressure = Math.min(1, 0.55 + aggression * 0.35);
-    else pressure = Math.min(0.85, 0.35 + aggression * 0.35);
+    else if (rank <= 2) pressure = Math.min(0.55, 0.28 + aggression * 0.30);
+    else pressure = Math.min(0.35, 0.12 + aggression * 0.23);
     assignments[def.id] = {
       job: 'mark',
       markId: opp.id,
