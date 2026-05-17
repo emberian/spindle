@@ -44,7 +44,7 @@ renderer.setClearColor(0x11131a, 1);
 renderer.toneMapping = THREE.ACESFilmicToneMapping;
 // Pull exposure down: at some cinematic angles the axis sunline + bloom
 // blew out to near-white and hurt legibility.
-renderer.toneMappingExposure = 0.68;
+renderer.toneMappingExposure = 0.85;
 app.appendChild(renderer.domElement);
 
 const scene = new THREE.Scene();

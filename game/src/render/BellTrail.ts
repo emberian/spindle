@@ -19,7 +19,7 @@ export function bellGlow(chime: number): number {
   // Exponential ramp: a true ring blazes; a clatter barely glows.
   // Tamed (was 0.25 + 2.95·…): at close/goal camera angles the old peak
   // blew the whole frame to white through bloom.
-  return 0.08 + 0.3 * Math.pow(chime, 2.2);
+  return 0.12 + 0.5 * Math.pow(chime, 2.2);
 }
 
 // ── geometry constants ────────────────────────────────────────────────────────
@@ -40,7 +40,7 @@ function makeMat(): THREE.MeshBasicMaterial {
   return new THREE.MeshBasicMaterial({
     vertexColors: true,
     transparent: true,
-    opacity: 0.5, // dimmer additive ribbon — was a screen-whiting beam up close
+    opacity: 0.78, // visible ribbon (bloom is tamed so this no longer whites out)
     blending: THREE.AdditiveBlending,
     depthWrite: false,
     side: THREE.DoubleSide,

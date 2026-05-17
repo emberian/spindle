@@ -13,9 +13,9 @@ import * as THREE from 'three';
 
 type V3 = { x: number; y: number; z: number };
 
-const CAM_Y = 95;       // constant height above the axis
-const CAM_Z = -250;     // constant side standoff
-const CAM_FOV = 56;     // constant
+const CAM_Y = 46;       // constant height above the axis
+const CAM_Z = -115;     // closer side standoff so the tube fills the frame
+const CAM_FOV = 58;     // constant
 const FOLLOW_LAMBDA = 4; // smooth glide along x — never jerky
 
 export class GameCamera {

@@ -82,7 +82,7 @@ export class PostFX {
   private finishPass: ShaderPass;
 
   // Baseline bloom — strong enough to make the trail/rings sing, not nuclear
-  private readonly BASE_STRENGTH  = 0.12; // near-off: no camera angle can white out the frame
+  private readonly BASE_STRENGTH  = 0.28; // visible glow, still well below white-out
   private readonly BASE_RADIUS    = 0.4;
   private readonly BASE_THRESHOLD = 0.7;  // only the very brightest pixels bloom at all
 
@@ -139,14 +139,13 @@ export class PostFX {
     this.bloom.radius    = this.BASE_RADIUS    + (this.LOOP_RADIUS    - this.BASE_RADIUS)    * ge;
     this.bloom.threshold = this.BASE_THRESHOLD + (this.LOOP_THRESHOLD - this.BASE_THRESHOLD) * ge;
 
-    // Scene dim: gentle until g>0.5, then drops the room
-    u.dim.value   = ge * 0.55;
-
-    // Desaturate: colour drains as bloom fills — the loop is all that matters
-    u.desat.value = ge * 0.80;
-
-    // Vignette: the frame closes in as the loop rises
-    u.vig.value   = ge;
+    // The Loop "stadium goes silent" dim/desat/vignette was built for the
+    // deleted cinematic loop-cam. With a plain follow camera it just made
+    // the game go near-black every few seconds ("weirdly dark"). Disabled —
+    // a whisper of vignette only; the room never darkens during play.
+    u.dim.value   = 0.0;
+    u.desat.value = 0.0;
+    u.vig.value   = ge * 0.12;
   }
 
   render(): void {
