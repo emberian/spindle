@@ -322,32 +322,31 @@ impl SimWorld {
         }
     }
 
-    fn reel_of<'a>(inp_map: &'a [(String, i32)], id: &str) -> i32 {
-        inp_map.iter().find(|(k, _)| k == id).map(|(_, r)| *r).unwrap_or(0)
+    fn reel_of(players: &[PlayerInput], id: &str) -> i32 {
+        players
+            .iter()
+            .find(|p| p.id == id)
+            .map(|p| p.reel)
+            .unwrap_or(0)
     }
 
     /// Advance one fixed sub-step `h` seconds. Returns events emitted this step.
     pub fn step(&mut self, frame: &InputFrame, h: f64) -> Vec<SimEvent> {
         self.events = vec![];
 
-        // Collect reel values before we borrow mutably below.
-        let reel_map: Vec<(String, i32)> = frame
-            .players
-            .iter()
-            .map(|p| (p.id.clone(), p.reel))
-            .collect();
-
-        // Apply inputs (throw / fire-line / pushoff / thrumbler).
-        // We clone the inputs so that borrow checker doesn't fight us.
-        let inputs: Vec<PlayerInput> = frame.players.clone();
-        for inp in &inputs {
+        // Apply inputs (throw / fire-line / pushoff / thrumbler). `frame`
+        // is borrowed disjointly from `self`, so we can iterate it
+        // directly — no per-tick clone of every PlayerInput.
+        for inp in &frame.players {
             self.apply_input(inp);
         }
 
-        // Step players.
+        // Step players. Reel values are read straight off `frame`
+        // (still borrowed), avoiding the per-tick Vec<(String,i32)> with
+        // its id-String clones.
         for w in &mut self.players {
             let was_grounded = w.body.grounded;
-            let reel = Self::reel_of(&reel_map, &w.id);
+            let reel = Self::reel_of(&frame.players, &w.id);
             step_player(&mut w.body, h, reel);
             if w.body.grounded && !was_grounded {
                 self.events.push(SimEvent::PlayerSkinned { id: w.id.clone() });
