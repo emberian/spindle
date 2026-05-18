@@ -39,6 +39,9 @@ mod ai;
 // Increment 5: the wasm-bindgen RigAi boundary — exposes the ported
 // AiSystem to TS so the browser runs the Rust AI (TS AI deleted).
 mod ai_wasm;
+// The native skill-eval harness — the fast measuring instrument for
+// ranking the planner algorithm zoo (replaces the deleted TS headless).
+mod skill_eval;
 // Increment 3 (swarm): the deterministic world + the wasm-bindgen facade.
 mod sim_world;
 mod wasm;

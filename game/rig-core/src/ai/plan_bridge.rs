@@ -11,10 +11,31 @@
 use super::types::{PlayerSim, SimState, TeamSide};
 use crate::math::Vec3;
 use crate::planner;
+use std::sync::atomic::{AtomicI32, Ordering};
 
 /// Re-export of the planner's `Plan` as the AI-facing `GrapplePlan`
 /// (TS `GrapplePlan`: anchor_pos, reel ∈ {-1,0}, projected_dist, is_spar).
 pub use crate::planner::Plan as GrapplePlan;
+
+/// Active planner algorithm class — the faithful restoration of the old
+/// TS `tune('planner', 0)` / `globalThis.__rigtune` knob (0 = MPC,
+/// 1 = RRT, 2 = CEM, and the explorable zoo beyond). Defaults to 0 so
+/// production / every existing test is byte-identical to before; only
+/// the skill-eval harness flips it, set-once-before-a-deterministic-run
+/// exactly like the original global (constant during a run ⇒
+/// determinism preserved).
+static PLANNER_CLASS: AtomicI32 = AtomicI32::new(0);
+
+/// Set the active planner class (eval / exploration only). Set before a
+/// run; constant during it.
+pub fn set_planner_class(class: i32) {
+    PLANNER_CLASS.store(class, Ordering::Relaxed);
+}
+
+/// Current planner class (default 0 = canonical MPC).
+pub fn planner_class() -> i32 {
+    PLANNER_CLASS.load(Ordering::Relaxed)
+}
 
 /// TS `sticky?: { pos; reel: -1|0 }` for the anti-dither hysteresis.
 #[derive(Clone, Copy, Debug)]
@@ -71,8 +92,9 @@ pub fn plan_grapple(
         pos: s.pos,
         reel: s.reel,
     });
-    // planner = 0 → MPC, the canonical deterministic default.
-    planner::plan_grapple(&pl, target, &st, avoid_defenders, sk, 0)
+    // Planner class from the knob (default 0 = canonical MPC; the
+    // skill-eval harness flips it to rank the algorithm zoo).
+    planner::plan_grapple(&pl, target, &st, avoid_defenders, sk, planner_class())
 }
 
 /// TS `sparPositions()` — the static spar lattice (axis spine + off-axis
