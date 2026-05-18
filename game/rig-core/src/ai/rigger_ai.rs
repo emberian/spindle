@@ -164,10 +164,10 @@ fn hard_trigger(
     m: &MatchState,
     player: &PlayerSim,
 ) -> bool {
-    let held_by = state.bell.held_by.clone();
-    let have_bell = held_by.as_deref() == Some(player.id.as_str());
+    let held_by = state.bell.held_by.as_deref();
+    let have_bell = held_by == Some(player.id.as_str());
     let contest_on = m.contest.is_some();
-    if commit.saw_held_by != held_by {
+    if commit.saw_held_by.as_deref() != held_by {
         return true;
     }
     if commit.saw_had_bell != have_bell {
