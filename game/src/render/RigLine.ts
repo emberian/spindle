@@ -34,13 +34,22 @@ const SAG_SEGMENTS = 24;
 // World-space line radii (m). DELIBERATELY THIN: a taut hauling cable reads
 // as a crisp stroke, not a rope. Eight of these must not merge into a blob,
 // so the radius is a fraction of the old 0.42 and there is no halo tube.
-const TAUT_RADIUS = 0.13;   // hauling: a taut, energised cable
-const SLACK_RADIUS = 0.085; // lazy line
-const P1_RADIUS_BOOST = 0.05;
+// Tethers are CONTEXT, not focus: the riggers + bell must dominate. These are
+// a fraction of even the previous "thin" values so 8 simultaneous hauls read
+// as faint guide-threads, never a glowing web.
+const TAUT_RADIUS = 0.075;  // hauling: a taut, energised cable (still recessive)
+const SLACK_RADIUS = 0.035; // slack/inactive: near-invisible thread
+const P1_RADIUS_BOOST = 0.035;
 
-// Small typed anchor sizes (m) — the old 0.9 "confusing diamond" is gone.
-const ANCHOR_SIZE = 0.34;
-const HAND_SIZE = 0.20;
+// Chord length (m) over which a tether fades toward minimum opacity: a long
+// haul spans the playspace and would dominate, so longer = more recessive.
+const LEN_FADE_NEAR = 30;   // ≤ this: full (already-low) strength
+const LEN_FADE_FAR  = 260;  // ≥ this: faded to the long-haul floor
+
+// Small typed anchor sizes (m) — unobtrusive context markers, shrunk further
+// so the node never competes with a rigger body or the bell.
+const ANCHOR_SIZE = 0.22;
+const HAND_SIZE = 0.13;
 
 // Fallback hand offset (figure-local) if Rigger hasn't published a hand yet.
 const HAND_FALLBACK_LOCAL = new THREE.Vector3(0.42, 1.55, 0.55);
@@ -114,10 +123,14 @@ class LineInstance {
     // Tether: one thin tube. NOT additive — a normal translucent stroke so
     // eight of them stay crisp and recessive instead of blooming into a
     // glowing mass that competes with the bell.
+    // vertexColors: lets us fade the tube toward the ANCHOR end (the rigger
+    // end stays readable as "this line belongs to that figure"; the far end
+    // dissolves so a long haul reads as a hint, not a hard cable).
     this.rope = new THREE.Mesh(
       new THREE.BufferGeometry(),
       new THREE.MeshBasicMaterial({
         color: PAL.cyan, transparent: true, opacity: 0, depthWrite: false,
+        vertexColors: true,
       }),
     );
     this.rope.frustumCulled = false;
@@ -158,7 +171,26 @@ class LineInstance {
   private rebuild(radius: number): void {
     const curve = new THREE.CatmullRomCurve3(_pts, false, 'catmullrom', 0);
     // 4 radial segments: a thin tube doesn't need 6, fewer verts for 8 tethers.
-    const g = new THREE.TubeGeometry(curve, SAG_SEGMENTS, radius, 4, false);
+    const RADIAL = 4;
+    const g = new THREE.TubeGeometry(curve, SAG_SEGMENTS, radius, RADIAL, false);
+    // Per-vertex brightness fade along the length: ~1 at the rigger (hand)
+    // end, fading to a faint tail at the anchor end so the line points back
+    // to its figure but never reads as a hard structural cable across the
+    // whole playspace. TubeGeometry orders verts ring-by-ring along the path.
+    const ringCount = SAG_SEGMENTS + 1;
+    const vpr = RADIAL + 1; // verts per ring
+    const total = ringCount * vpr;
+    const col = new Float32Array(total * 3);
+    for (let r = 0; r < ringCount; r++) {
+      const t = r / SAG_SEGMENTS;            // 0 = hand end, 1 = anchor end
+      // Stay bright over the first third, then ease down to a 0.15 tail.
+      const f = 0.15 + 0.85 * Math.pow(1 - THREE.MathUtils.smoothstep(t, 0.25, 1), 1.1);
+      for (let k = 0; k < vpr; k++) {
+        const i = (r * vpr + k) * 3;
+        col[i] = f; col[i + 1] = f; col[i + 2] = f;
+      }
+    }
+    g.setAttribute('color', new THREE.BufferAttribute(col, 3));
     this.rope.geometry = g;
     this.curGeo?.dispose();
     this.curGeo = g;
@@ -221,14 +253,24 @@ class LineInstance {
     const teamCol = ps.team === 'home' ? PAL.cyan : PAL.orange;
     // Tether colour: a clean team-tinted stroke. It NO LONGER runs hot toward
     // paper-white (that's the bell's job) — taut just nudges a little brighter
-    // and pulses faintly on the snap. Low opacity keeps it recessive so the
-    // bell trail is always the dominant glow even with 8 lines lit.
+    // and pulses faintly on the snap.
     const rm = this.rope.material as THREE.MeshBasicMaterial;
     rm.color.setHex(
-      taut ? blendHex(teamCol, PAL.paper, 0.15 + this.snapKick * 0.2)
+      taut ? blendHex(teamCol, PAL.paper, 0.12 + this.snapKick * 0.18)
            : teamCol,
     );
-    rm.opacity = taut ? 0.62 : 0.42;
+    // RECESSIVE: only a TAUT, actively-hauled line shows clearly; a slack /
+    // inactive line is near-invisible. Then fade further with chord length so
+    // a long haul spanning the field doesn't dominate the riggers + bell.
+    const lenT = THREE.MathUtils.clamp(
+      (chord - LEN_FADE_NEAR) / (LEN_FADE_FAR - LEN_FADE_NEAR), 0, 1,
+    );
+    const lenFade = 1 - lenT * 0.70;            // long haul → 30% strength
+    // Player↔player stays a touch more visible (that rigger↔rigger link is
+    // the coordination we DO want to read) but is still secondary.
+    const tautBase  = isPlayerAnchor ? 0.42 : 0.34;
+    const slackBase = 0.07;                     // slack ≈ invisible context
+    rm.opacity = (taut ? tautBase : slackBase) * lenFade;
 
     // ── Typed anchor: show ONLY the node matching anchorType ────────────────
     this.spar.visible = false;
@@ -243,8 +285,8 @@ class LineInstance {
       // rigger→rigger: a node welded to the live target figure + the hand
       // node. Two linked dots on a thin line = readable coordination.
       const em = this.endNode.material as THREE.MeshBasicMaterial;
-      em.color.setHex(blendHex(teamCol, PAL.paper, 0.55));
-      em.opacity = taut ? 0.95 : 0.6;
+      em.color.setHex(blendHex(teamCol, PAL.paper, 0.45));
+      em.opacity = (taut ? 0.6 : 0.3) * lenFade;
       this.endNode.position.copy(_to);
       this.endNode.scale.setScalar(aScale);
       this.endNode.visible = true;
@@ -254,8 +296,8 @@ class LineInstance {
         kind === 'ring' ? this.ring :
         this.skin; // 'skin' (and player-with-no-target fallback)
       const nm = node.material as THREE.MeshBasicMaterial;
-      nm.color.setHex(taut ? blendHex(teamCol, PAL.paper, 0.4) : teamCol);
-      nm.opacity = taut ? 0.8 : 0.45;
+      nm.color.setHex(taut ? blendHex(teamCol, PAL.paper, 0.3) : teamCol);
+      nm.opacity = (taut ? 0.5 : 0.18) * lenFade;
       node.position.copy(_to);
       node.rotation.set(t * 0.6, t * 0.8, 0);
       node.scale.setScalar(aScale);
@@ -265,8 +307,8 @@ class LineInstance {
     // Hand node: the line visibly LEAVES the rigger (small, dim — context,
     // not a focal point).
     const hm = this.hand.material as THREE.MeshBasicMaterial;
-    hm.color.setHex(blendHex(teamCol, PAL.paper, 0.3));
-    hm.opacity = taut ? 0.6 : 0.4;
+    hm.color.setHex(blendHex(teamCol, PAL.paper, 0.25));
+    hm.opacity = (taut ? 0.4 : 0.15) * lenFade;
     this.hand.position.copy(_from);
   }
 

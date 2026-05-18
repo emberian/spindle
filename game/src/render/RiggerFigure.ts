@@ -322,10 +322,11 @@ export class RiggerFigure {
     reach: number, idle: number,
     effort = 0, swingPhase = 0, brace = 0, wind = 0,
   ): void {
-    // ── Spine: lean + bank, plus an effort streamline (curl toward velocity)
-    // and a brace-up (chest rises, hips drop forward) when killing speed.
+    // ── Spine: lean + bank, plus an effort STREAMLINE (the whole body lines
+    // up along the velocity/grapple direction into an arrowed glide) and a
+    // brace-up (chest rises, hips drop forward) when killing speed.
     const idleSway = (1 - strokeAmp) * 0.05;
-    const streamline = effort * 0.45;          // tuck forward when driving hard
+    const streamline = effort * 0.30;          // gently align torso to travel
     const braceArch  = -brace * 0.55;          // arch back, plant against motion
     // Throw torque: wind-up coils the spine away, release whips it across.
     const windCoil = wind < 0 ? wind * 0.30 : wind * 0.22;
@@ -342,10 +343,13 @@ export class RiggerFigure {
       + haulTwist - windCoil * 1.4;
     this.shoulders.rotation.x = -lean * 0.25 - effort * 0.30 + brace * 0.35;
 
-    // ── Limb cadence: amplitude AND tempo scale with speed/effort so a fast
-    // rigger thrashes hard; a settling one stiffens (brace damps the swim).
-    const swimGate = (1 - brace * 0.8);
-    const amp = (0.05 + strokeAmp * 1.05 + effort * 0.55) * swimGate;
+    // ── Limb cadence: a SLOW SUBTLE STROKE only. The old code scaled the
+    // amplitude with effort (+0.55) so a fast rigger thrashed its legs and
+    // read as sprinting in mid-air — absurd in zero-g. Now effort does NOT
+    // feed amplitude at all; the stroke stays small, and effort tucks the
+    // limbs in (streamlined freefall glide), the opposite of pumping.
+    const swimGate = (1 - brace * 0.8) * (1 - effort * 0.7);
+    const amp = (0.05 + strokeAmp * 0.55) * swimGate;
     // How hard the limbs are actually swimming. Near 0 when parked so the
     // joint-flex oscillators below go quiet (no bobbing in place); when
     // moving it reaches 1 and they pump fully as before. The slow spine
@@ -356,13 +360,15 @@ export class RiggerFigure {
 
     // Left arm: swim stroke; a fast hard pump when effort is high. Under brace
     // it flares WIDE forward to kill momentum (an athlete's air-brake).
-    const armBend = 0.35 + strokeAmp * 0.45 + effort * 0.25;
-    const lSwim  =  s * amp * 0.7;
+    // Effort tucks the off (left) arm in tight against the body and trailing,
+    // completing the arrowed glide silhouette instead of a swimming pump.
+    const armBend = 0.35 + strokeAmp * 0.30 + effort * 0.55;
+    const lSwim  = (s * amp * 0.7) * (1 - effort) + effort * 0.55;
     const lBrace = -1.05;                       // forward, wide
     this.armL.set(
       THREE.MathUtils.lerp(lSwim, lBrace, brace),
       armBend + (s * 0.5 + 0.5) * 0.3 * swimAmt + brace * 0.2,
-      -0.12 - c * 0.10 * swimAmt - brace * 0.55,
+      -0.12 - c * 0.10 * swimAmt - brace * 0.55 - effort * 0.10,
     );
 
     // ── Right (grapple) arm — the worker. Three blended intents:
@@ -389,20 +395,24 @@ export class RiggerFigure {
     rFlare = THREE.MathUtils.lerp(rFlare, 0.35 * wind, Math.abs(wind));
     this.armR.set(rSwing, rBend, rFlare);
 
-    // ── Legs: scissor opposite the arms; on a hard swing they drive off
-    // (deep coil → extension); braced legs swing forward to plant the stop.
-    const legBend = 0.30 + strokeAmp * 0.55 + effort * 0.30;
-    const drive = haul * reach * 0.5;           // legs push as the arm hauls
-    const lLeg = -s * amp * 0.55 - drive;
-    const rLeg =  s * amp * 0.55 - drive;
+    // ── Legs: a faint scissor at rest, but as effort rises they TUCK and
+    // TRAIL together behind the body — an arrowed, gliding freefall posture.
+    // The old code ADDED effort to leg bend/scissor and a haul "drive" kick,
+    // which is what made the riggers pump their legs like sprinters. The
+    // drive kick is gone; the scissor amplitude is small and effort folds it
+    // away into a streamlined trail (legs swept back, lightly bent together).
+    const legBend = 0.20 + strokeAmp * 0.35 + effort * 0.18;
+    const trail = effort * -0.85;                // both legs sweep back/together
+    const lLeg = (-s * amp * 0.40) * (1 - effort) + trail;
+    const rLeg = ( s * amp * 0.40) * (1 - effort) + trail;
     const braceLeg = 0.95;                       // both legs forward to brake
     this.legL.set(
       THREE.MathUtils.lerp(lLeg, braceLeg, brace),
-      legBend + (-s * 0.5 + 0.5) * 0.35 * swimAmt + brace * 0.7,
+      legBend + (-s * 0.5 + 0.5) * 0.25 * swimAmt + brace * 0.7,
     );
     this.legR.set(
       THREE.MathUtils.lerp(rLeg, braceLeg, brace),
-      legBend + ( s * 0.5 + 0.5) * 0.35 * swimAmt + brace * 0.7,
+      legBend + ( s * 0.5 + 0.5) * 0.25 * swimAmt + brace * 0.7,
     );
   }
 

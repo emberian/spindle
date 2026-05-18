@@ -28,17 +28,21 @@ import { publishGrappleHand } from './RigGrapple';
 
 const MAX_RIGGERS = 12;
 
-// Speed (m/s) at which the stroke cycle reaches full amplitude.
-const STROKE_FULL_SPEED = 14;
-// Stroke phase advance per unit distance travelled (rad/m) — couples the swim
-// rhythm to actual motion so it never looks like a treadmill.
-const STROKE_PER_METRE = 0.5;
+// Speed (m/s) at which the (now SMALL, slow) idle-stroke reaches its modest
+// full amplitude. A moving rigger should look like a person GLIDING/HAULING
+// on a line in freefall, NOT a sprinter — so the stroke is a faint, slow
+// drift, not a speed-pumped leg thrash. Kept generous so even a slow drifter
+// shows only the gentle stroke and nothing kicks in at travel speed.
+const STROKE_FULL_SPEED = 6;
+// Stroke phase advance per unit distance travelled (rad/m). DRASTICALLY cut
+// from the old 0.5 so a fast haul does NOT spin the limbs faster (no
+// mid-air-jogging cadence) — the stroke stays a slow, subtle background sway.
+const STROKE_PER_METRE = 0.06;
 // Idle drift angular speed (rad/s).
 const IDLE_RATE = 1.1;
-// Speed (m/s) at which the athletic "effort" (streamline + hard cadence)
-// saturates. Lower than STROKE_FULL_SPEED so the figure reads as *working*
-// well before top speed. Tunable.
-const EFFORT_FULL_SPEED = 9;
+// Speed (m/s) at which "effort" saturates. Effort now drives ONLY the
+// streamline (arrowed, limbs tucked/trailing) — NOT cadence or leg amplitude.
+const EFFORT_FULL_SPEED = 7;
 // Decel (m/s²) magnitude (opposing velocity) at which the brace/settle pose
 // is fully expressed — an athlete planting a stop. Tunable.
 const BRACE_FULL_DECEL = 22;
@@ -59,7 +63,12 @@ function teamBase(team: string): number {
 
 function bodyColor(team: string, grounded: boolean): number {
   const base = teamBase(team);
-  return grounded ? lerpHex(base, PAL.dim, 0.65) : base;
+  // Lift the in-play body toward paper so each figure reads as a bright,
+  // distinct body against the calm (legibility WINS over darkness) while
+  // keeping the team hue. Grounded stays dimmed (out of play).
+  return grounded
+    ? lerpHex(base, PAL.dim, 0.65)
+    : lerpHex(base, PAL.paper, 0.30);
 }
 
 /** Frame-rate-independent exponential smoothing toward `target`. */
@@ -196,7 +205,13 @@ class RiggerInstance {
     const leanTarget = THREE.MathUtils.clamp(_accLocal.z * 0.05, -0.6, 0.6);
     const bankTarget = THREE.MathUtils.clamp(-_accLocal.x * 0.05, -0.5, 0.5);
 
-    const ampTarget = THREE.MathUtils.clamp(speed / STROKE_FULL_SPEED, 0, 1);
+    // Stroke amplitude is now CAPPED LOW and INVERTED vs effort: the faster a
+    // rigger travels the SLEEKER/STILLER it gets (streamlined glide), not the
+    // harder it pumps. A slow drift shows a small subtle stroke; at haul speed
+    // the stroke fades toward a near-still arrow.
+    const effortTarget = THREE.MathUtils.clamp(speed / EFFORT_FULL_SPEED, 0, 1);
+    const ampTarget = THREE.MathUtils.clamp(speed / STROKE_FULL_SPEED, 0, 1)
+      * (1 - effortTarget * 0.8) * 0.35;
     // Reach: active line OR clipped contact → extend grapple arm toward travel.
     // Optional emphasis (bell-carry / throw windup) lets the orchestrator push
     // the reach arm out further without touching the frozen sync() signature.
@@ -206,8 +221,9 @@ class RiggerInstance {
       emphasis,
     );
 
-    // ── Athletic effort: fast travel = streamlined, hard-pumping athlete.
-    const effortTarget = THREE.MathUtils.clamp(speed / EFFORT_FULL_SPEED, 0, 1);
+    // ── Effort (computed above) now drives the STREAMLINE only: body aligned
+    // to velocity/grapple direction with limbs tucked and trailing — a person
+    // flying/hauling on a line in freefall, never jogging.
 
     // ── Brace/settle: project acceleration onto the OPPOSITE of velocity.
     // A large component fighting the direction of travel = the rigger is
@@ -283,13 +299,13 @@ class RiggerInstance {
       this.swingPhase += swingRate * dt;
     }
 
-    // Stroke phase advances with distance travelled. The idle baseline is now
-    // speed-scaled: a parked rigger only creeps the phase (with swimAmt≈0 the
-    // joints are quiet anyway, so this just stops any slow residual drift),
-    // ramping to the full ~1.4 rad/s cadence once it is actually moving.
-    // Effort adds tempo so a hard-driving rigger's limbs cadence faster.
-    this.strokePhase += speed * dt * STROKE_PER_METRE * (1 + this.effort * 0.8)
-      + dt * (0.3 + Math.min(1, speed / 3) * 1.1);
+    // Stroke phase advances at a SLOW, near-constant tempo. The old code
+    // ramped cadence with speed AND effort (the "sprinting in mid-air" bug):
+    // a fast hauler whipped its limbs. Now it is a gentle ~0.45 rad/s drift
+    // with only a tiny distance contribution, and effort SLOWS it further
+    // (a streamlined glider is stiller, not faster).
+    this.strokePhase += dt * 0.45 * (1 - this.effort * 0.6)
+      + speed * dt * STROKE_PER_METRE;
     this.idlePhase += dt * IDLE_RATE;
 
     // ── Colours ─────────────────────────────────────────────────────────────
@@ -297,7 +313,10 @@ class RiggerInstance {
     const bodyCol = bodyColor(ps.team, ps.grounded);
     const accent = isP1 ? PAL.paper : (ROLE_TINT[ps.role] ?? lerpHex(base, PAL.paper, 0.4));
     const emissiveHex = isP1 ? base : (ps.grounded ? 0x000000 : base);
-    const emissiveInt = isP1 ? (ps.grounded ? 0.4 : 0.9) : (ps.grounded ? 0.0 : 0.28);
+    // Raised non-P1 in-play emissive 0.28 → 0.55 so each of the 8 riggers
+    // self-lights into a clearly legible body even on its shadow side, without
+    // blowing past bloom threshold (kept well under the P1 0.9).
+    const emissiveInt = isP1 ? (ps.grounded ? 0.4 : 0.9) : (ps.grounded ? 0.0 : 0.55);
     this.figure.setColors(bodyCol, accent, emissiveHex, emissiveInt);
 
     // ── Drive the pose ──────────────────────────────────────────────────────

@@ -361,8 +361,16 @@ export class Calm {
   }
 
   constructor(scene: THREE.Scene) {
-    // Fog: light axial fog to sell 640 m depth without blackout.
-    scene.fog = new THREE.Fog(C_BG, REG.L * 0.38, REG.L * 1.3);
+    // Fog: was Fog(C_BG, L*0.38=243m, L*1.3=832m) which fogged the PLAY
+    // VOLUME itself — riggers ~hundreds of m from the spectate cam dissolved
+    // into near-black haze (the top legibility bug). Push the NEAR plane far
+    // past the play volume (L*1.05 = 672m) and the FAR out (L*2.4 = 1536m)
+    // and warm/lighten the fog colour so only the truly distant vista fades —
+    // the playspace stays crisp and fully lit.
+    // Fog colour: the canon bg lifted toward a soft slate so the distant fade
+    // stays on-palette but isn't a black curtain.
+    const fogCol = new THREE.Color(C_BG).lerp(new THREE.Color(0x3a4660), 0.55);
+    scene.fog = new THREE.Fog(fogCol.getHex(), REG.L * 1.05, REG.L * 2.4);
 
     // ── Skin (open cylinder, viewed from inside) ────────────────────────────
     this.skinTex = makeSkinTexture();
@@ -458,18 +466,28 @@ export class Calm {
     this.group.add(this.freeGoal);
 
     // ── Lighting ─────────────────────────────────────────────────────────────
-    // Cool axial key — simulates the habitat's sunline along the axis
-    const axisKey = new THREE.DirectionalLight(0xc8e8f4, 1.6);
+    // Cool axial key — simulates the habitat's sunline along the axis.
+    // Raised 1.6 → 2.2 so the riggers' lit side reads as a clear bright body.
+    const axisKey = new THREE.DirectionalLight(0xd2ecf6, 2.2);
     axisKey.position.set(REG.L * 0.4, REG.R * 0.15, 0);
     scene.add(axisKey);
 
-    // Warm rim fill — suggests the land/ground below
-    const rimFill = new THREE.DirectionalLight(0xf0b060, 0.55);
+    // Warm rim fill — suggests the land/ground below. Raised 0.55 → 1.15 so
+    // the SHADOW side of each rigger is still a readable body, not a void.
+    const rimFill = new THREE.DirectionalLight(0xf3bd72, 1.15);
     rimFill.position.set(0, -REG.R, REG.R * 0.5);
     scene.add(rimFill);
 
-    // Ambient: enough that nothing goes fully black, but dim enough for contrast
-    scene.add(new THREE.AmbientLight(0x1a2535, 1.1));
+    // Second fill from camera-ish side so figures never present a black face
+    // to the default spectate cam (it sits off the −Z / +radial side).
+    const camFill = new THREE.DirectionalLight(0xbcd2e6, 0.7);
+    camFill.position.set(-REG.L * 0.15, REG.R * 0.4, -REG.R);
+    scene.add(camFill);
+
+    // Ambient: was 0x1a2535 @ 1.1 — near-black, so unlit riggers were
+    // silhouettes (the top bug). Substantially raised + warmed to a soft
+    // skylight so every figure has a legible base luminance everywhere.
+    scene.add(new THREE.AmbientLight(0x4a5872, 2.4));
 
     // Faith-end point light (cyan) — makes that side glow distinctly
     const faithLight = new THREE.PointLight(C_CYAN, 60, REG.L * 0.55, 1.4);

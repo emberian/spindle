@@ -61,8 +61,10 @@ const FinishShader = {
       float shadow = 1.0 - smoothstep(vigRadius * vigRadius,
                                        vigRadius * vigRadius + 0.4,
                                        r2);
-      // Constant base vignette even at vig=0: subtle, tasteful
-      float baseVig = 0.18;
+      // Constant base vignette even at vig=0: subtle, tasteful. Trimmed
+      // 0.18 → 0.10 so riggers toward the frame edges stay clearly legible
+      // (legibility wins over darkness) while still a tasteful lens shadow.
+      float baseVig = 0.10;
       float loopVig = vig * 0.72; // extra darkness during loop moment
       c.rgb *= mix(1.0, shadow, baseVig + loopVig);
 
@@ -82,9 +84,12 @@ export class PostFX {
   private finishPass: ShaderPass;
 
   // Baseline bloom — strong enough to make the trail/rings sing, not nuclear
-  private readonly BASE_STRENGTH  = 0.28; // visible glow, still well below white-out
+  private readonly BASE_STRENGTH  = 0.26; // visible glow, still well below white-out
   private readonly BASE_RADIUS    = 0.4;
-  private readonly BASE_THRESHOLD = 0.7;  // only the very brightest pixels bloom at all
+  // Threshold nudged 0.70 → 0.78: the scene is now brighter (legibility fix),
+  // so only the truly hot accents (goal rings, bell) bloom — figures stay
+  // crisp, high-contrast bodies rather than getting washed into glow.
+  private readonly BASE_THRESHOLD = 0.78;
 
   // Loop peak bloom — a mild lift, NOT a screen-whiting blaze. The old 3.8
   // (designed for the deleted loop-cam) was THE recurring blowout: every
