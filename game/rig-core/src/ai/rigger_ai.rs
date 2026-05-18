@@ -643,12 +643,43 @@ pub fn compute_player_input(
                 aim_dither,
             ));
             let pushoff = should_pushoff(player, state.bell.p);
+
+            // ── COMMIT ONCE, THEN RIDE THE LINE (the catch fix, AI side) ──
+            // Grappling now has latency: a fired claw takes flight time to
+            // land and the line then LOCKS to its anchor until released
+            // (sim_world). If we re-aimed a fresh predicted intercept every
+            // tick the sim would just ignore it (line committed) — but the
+            // worse failure the OLD code had was perpetually chasing a
+            // moving prediction and sliding past the real bell. So the dive
+            // now fires EXACTLY ONCE and then rides physics:
+            //   • No line visible  ⇒ FIRE the committed anchor (once).
+            //   • Line visible (claw in flight OR attached) ⇒ DO NOT
+            //     re-fire; keep reel = −1 + catch_intent and let the winch
+            //     carry us through the bell.
+            //   • Line visible but the bell has clearly ESCAPED the
+            //     committed approach ⇒ RELEASE to break off; the sim's
+            //     re-fire cooldown then elapses and a fresh commit can
+            //     re-acquire.
+            // `player.line` is the AI's snapshot view of its own rig — its
+            // mere presence means a claw is committed; this is the
+            // commit-once latch (no per-tick fireLineAt re-issue), kept
+            // deterministic (snapshot-driven, no rng, no wall clock).
+            let has_line = player.line.is_some();
+            let bell_escaped = vlen(to_bell) > 60.0;
+            let (fire, do_release) = if !has_line {
+                (partial.fire_line_at.unwrap_or(None), false)
+            } else if bell_escaped {
+                (None, true)
+            } else {
+                (None, false)
+            };
+
             return PlayerInput {
                 id: player.id.clone(),
                 aim: nav_aim,
-                fire_line_at: partial.fire_line_at.unwrap_or(None),
+                fire_line_at: fire,
                 reel: partial.reel.unwrap_or(-1),
-                release: partial.release.unwrap_or(false),
+                release: do_release || partial.release.unwrap_or(false),
                 pushoff: partial.pushoff.unwrap_or(false) || pushoff,
                 throw_charge: 0.0,
                 throw_released: false,
