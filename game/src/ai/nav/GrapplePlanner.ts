@@ -559,6 +559,100 @@ function planRRT(
   };
 }
 
+// ── CEM / MPPI planner (knob: __rigtune.planner === 2) ───────────────────────
+// A genuinely DIFFERENT algorithm class from greedy-MPC (enumerate) and
+// RRT (tree search): population-based stochastic optimisation. Keep a
+// categorical distribution over (anchor, reel); sample a population, roll
+// each through the true physics, keep the ELITES, refit the distribution
+// toward them, repeat. Converges on a confident action with smooth,
+// committed behaviour (the elite mass concentrates) rather than RRT's
+// per-tick tree churn. Deterministic (windowed hash-rng) + sticky.
+const CEM_ITERS = 4;
+const CEM_POP = 16;
+const CEM_ELITE = 4;
+const CEM_SMOOTH = 0.4; // dirichlet-ish prior so the dist never collapses
+
+function planCEM(
+  player: PlayerSim, target: Vec3, state: SimState,
+  opponents: Vec3[], teammates: Vec3[],
+  sticky?: { pos: Vec3; reel: -1 | 0 } | null,
+): GrapplePlan | null {
+  const pos = player.p, vel = player.v, omega = state.omega;
+  const toDir = (() => { const d = vsub(target, pos); const l = vlen(d); return l > 1e-6 ? vscale(d, 1 / l) : v3(1, 0, 0); })();
+  const anchors: { pos: Vec3; isSpar: boolean }[] = [];
+  for (const sp of SPARS) {
+    const dd = vlen(vsub(pos, sp));
+    if (dd < 2 || dd > 170) continue;
+    if (vdot(vnorm(vsub(sp, pos)), toDir) < -0.7) continue;
+    anchors.push({ pos: sp, isSpar: true });
+  }
+  for (const pl of state.players) {
+    if (pl.id === player.id || pl.team !== player.team) continue;
+    const dd = vlen(vsub(pos, pl.p));
+    if (dd < 3 || dd > 70) continue;
+    anchors.push({ pos: pl.p, isSpar: false });
+  }
+  if (anchors.length === 0) return null;
+  anchors.sort((a, b) =>
+    (vlen(vsub(a.pos, target)) - vlen(vsub(b.pos, target))) || (a.pos.x - b.pos.x));
+
+  const wMomV = wMom();
+  const wSpaceV = tune('wSpace', 0);
+  const DANGER = 6;
+  const cost = (r: { p: Vec3; v: Vec3; minDist: number; term: number }): number => {
+    let c = r.minDist - wMomV * r.term;
+    for (const o of opponents) { const od = vlen(vsub(r.p, o)); if (od < DANGER) c += (DANGER - od) * 3.5; }
+    if (wSpaceV > 0) {
+      let nearTm = Infinity;
+      for (const t of teammates) { const td = vlen(vsub(r.p, t)); if (td < nearTm) nearTm = td; }
+      if (nearTm < 18) c += (18 - nearTm) * wSpaceV;
+    }
+    return c;
+  };
+
+  const replanW = rrtReplanTicks();
+  const rng = hashRng(player.id, Math.floor(state.tick / replanW));
+  const A = anchors.length;
+  // Categorical weight per anchor (start goal-biased: nearer-target favoured).
+  const w = new Float64Array(A);
+  for (let i = 0; i < A; i++) w[i] = 1 / (1 + i);
+  let bestC = Infinity, bestAi = 0, bestReel: -1 | 0 = -1;
+
+  for (let it = 0; it < CEM_ITERS; it++) {
+    let wsum = 0; for (let i = 0; i < A; i++) wsum += w[i];
+    const samples: { ai: number; reel: -1 | 0; c: number }[] = [];
+    for (let m = 0; m < CEM_POP; m++) {
+      // sample an anchor index from the categorical weights
+      let u = rng() * wsum, ai = 0;
+      for (; ai < A - 1; ai++) { u -= w[ai]; if (u <= 0) break; }
+      const reel: -1 | 0 = rng() < 0.5 ? -1 : 0;
+      const r = rolloutPrimitive(pos, vel, anchors[ai].pos, omega, reel, target, RRT_PRIM_STEPS, PLAN_H);
+      const c = cost(r);
+      samples.push({ ai, reel, c });
+      if (c < bestC - 1e-9) { bestC = c; bestAi = ai; bestReel = reel; }
+    }
+    // Elites → refit the distribution toward what worked.
+    samples.sort((a, b) => a.c - b.c || a.ai - b.ai);
+    const nextW = new Float64Array(A).fill(CEM_SMOOTH);
+    for (let e = 0; e < Math.min(CEM_ELITE, samples.length); e++) nextW[samples[e].ai] += 1;
+    for (let i = 0; i < A; i++) w[i] = nextW[i];
+  }
+
+  let chosen = { pos: anchors[bestAi].pos, reel: bestReel, isSpar: anchors[bestAi].isSpar };
+
+  // Sticky hysteresis (same anti-dither as RRT/MPC).
+  if (sticky) {
+    const sd = vlen(vsub(pos, sticky.pos));
+    if (sd >= 2 && sd <= 180 && vlen(vsub(chosen.pos, sticky.pos)) > 4) {
+      const sr = rolloutPrimitive(pos, vel, sticky.pos, omega, sticky.reel, target, RRT_PRIM_STEPS, PLAN_H);
+      if (bestC >= cost(sr) - ANCHOR_SWITCH_MARGIN) {
+        chosen = { pos: sticky.pos, reel: sticky.reel, isSpar: Math.hypot(sticky.pos.y, sticky.pos.z) < 1 };
+      }
+    }
+  }
+  return { anchorPos: chosen.pos, reel: chosen.reel, projectedDist: bestC, isSpar: chosen.isSpar };
+}
+
 /**
  * Main planner entry: choose the best grapple anchor to approach `target`.
  *
@@ -589,10 +683,14 @@ export function planGrapple(
     .filter(p => p.id !== player.id && p.team === player.team)
     .map(p => p.p);
 
-  // STRATEGY SWITCH (playful exploration, knob-gated, MPC default). 1+ =
-  // RRT kinodynamic tree (multi-hop swoop chains); else the momentum-MPC.
-  // RRT may return null (found nothing better) → fall through to MPC.
-  if (tune('planner', 0) >= 1) {
+  // STRATEGY SWITCH (knob-gated, MPC default). 0 = momentum-MPC,
+  // 1 = RRT kinodynamic tree, 2 = CEM/MPPI population optimiser.
+  // Different ALGORITHM CLASSES, A/B'd under the same skill eval.
+  const pl = tune('planner', 0);
+  if (pl >= 2) {
+    const r = planCEM(player, target, state, opponents, teammates, sticky);
+    if (r) return r;
+  } else if (pl >= 1) {
     const r = planRRT(player, target, state, opponents, teammates, sticky);
     if (r) return r;
   }
