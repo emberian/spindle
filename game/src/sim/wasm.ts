@@ -5,7 +5,7 @@
 // The Rust core is the source of truth; the TS sim/ modules remain the
 // parity oracle (cargo known-answer test holds RNG bit-identical).
 
-import init, { RigSim } from '../../rig-core/pkg/rig_core.js';
+import init, { RigSim, RigAi } from '../../rig-core/pkg/rig_core.js';
 import type {
   SimState,
   InputFrame,
@@ -19,6 +19,31 @@ let ready: Promise<void> | null = null;
 export function wasmReady(): Promise<void> {
   if (!ready) ready = init().then(() => undefined);
   return ready;
+}
+
+// ── Rust AI boundary (RigAi) ──────────────────────────────────────────────────
+// The AI is the ported Rust `AiSystem` behind the wasm `RigAi` struct.
+// One persistent instance (it owns the director/commit caches across
+// ticks, exactly like the old TS AiSystem). Created lazily after init();
+// the sim is always constructed first (createWasmSim awaits wasmReady),
+// so the wasm module is initialised by the time the first AI tick runs.
+let aiInst: RigAi | null = null;
+function rigAi(): RigAi {
+  if (!aiInst) aiInst = new RigAi();
+  return aiInst;
+}
+/** One AI tick. JSON in (SimState/MatchState/TeamConfig[]) → InputFrame JSON. */
+export function aiTick(
+  simJson: string,
+  matchJson: string,
+  configsJson: string,
+  seed: number,
+): string {
+  return rigAi().tick(simJson, matchJson, configsJson, seed >>> 0);
+}
+/** Clear the AI's director + commitment caches (new inning). */
+export function aiReset(): void {
+  aiInst?.reset();
 }
 
 // snapshot_flat layout (see rig-core/src/wasm.rs header).

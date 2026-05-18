@@ -36,6 +36,9 @@ mod match_sm;
 // Orientation, TeamProfile). decide/* + roles/* + RiggerAI/Director/
 // AiSystem land on this in subsequent sub-increments.
 mod ai;
+// Increment 5: the wasm-bindgen RigAi boundary — exposes the ported
+// AiSystem to TS so the browser runs the Rust AI (TS AI deleted).
+mod ai_wasm;
 // Increment 3 (swarm): the deterministic world + the wasm-bindgen facade.
 mod sim_world;
 mod wasm;
