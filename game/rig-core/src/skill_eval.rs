@@ -654,11 +654,15 @@ mod tests {
     #[test]
     #[ignore = "exploration tool; run with --ignored --nocapture"]
     fn ranks_the_algorithm_zoo() {
-        // The instrument in action: rank the full planner zoo (0..=5).
-        // Native, so a real budget is cheap. We assert the eval is
-        // well-formed and print the ranking (with `--nocapture`);
-        // we do NOT hard-assert an ordering (that's the explorable part).
-        let budget = 2000;
+        // The instrument in action: rank the full planner menagerie
+        // (0..=9). Budget = 8000 ticks — the OFFENSE-RESOLVING regime
+        // (the old TS headless used 8000 and offense demonstrably
+        // emerged there; at 2000 the eval was near-sighted, scoring
+        // ~0 for everyone). ~17 min for all 10 — strictly an on-demand
+        // tool. We do NOT hard-assert an ordering (that's the
+        // explorable part); we DO print parts+raw so the offense
+        // signals (gateClears/scorePts/shotConv) are visible.
+        let budget = 8000;
         let out = [
             eval_skill("MPC", 0, 1234, budget),
             eval_skill("RRT", 1, 1234, budget),
@@ -666,6 +670,10 @@ mod tests {
             eval_skill("MPPI", 3, 1234, budget),
             eval_skill("SA", 4, 1234, budget),
             eval_skill("Beam", 5, 1234, budget),
+            eval_skill("MCTS", 6, 1234, budget),
+            eval_skill("PotFld", 7, 1234, budget),
+            eval_skill("RandSh", 8, 1234, budget),
+            eval_skill("Coord", 9, 1234, budget),
         ];
         for r in &out {
             println!(
