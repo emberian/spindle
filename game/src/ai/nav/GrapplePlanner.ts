@@ -194,6 +194,12 @@ export const SWOOP_ALIGN = SWOOP_ALIGN_D;
 /** Live-resolved swoop gate (used by the executor too). */
 export function swoopMinV(): number { return tune('swoopMinV', SWOOP_MIN_V_D); }
 export function swoopAlign(): number { return tune('swoopAlign', SWOOP_ALIGN_D); }
+/** RRT path active? (knob). When so, the executor holds the plan open-loop
+ *  for the replan window — real MPC commitment, not per-tick re-rolling. */
+export function rrtActive(): boolean { return tune('planner', 0) >= 1; }
+export function rrtReplanTicks(): number {
+  return Math.max(1, Math.round(tune('rrtReplan', 30)));
+}
 
 // Momentum reward weight — THE paradigm parameter. Old cost minimised
 // "distance to a point in 3 s while tethered" (myopic, momentum-blind, so
@@ -442,6 +448,7 @@ const RRT_PRIM_STEPS = 18; // ~1.2 s primitive → chains form over the horizon
 function planRRT(
   player: PlayerSim, target: Vec3, state: SimState,
   opponents: Vec3[], teammates: Vec3[],
+  sticky?: { pos: Vec3; reel: -1 | 0 } | null,
 ): GrapplePlan | null {
   const pos = player.p, omega = state.omega;
   const toTargetDir = (() => { const d = vsub(target, pos); const l = vlen(d); return l > 1e-6 ? vscale(d, 1 / l) : v3(1, 0, 0); })();
@@ -481,7 +488,13 @@ function planRRT(
     return c;
   };
 
-  const rng = hashRng(player.id, state.tick);
+  // TEMPORAL COMMITMENT (fix #1 for the thrash≈6000 flailing the eval
+  // caught): seed the tree per REPLAN WINDOW, not per tick. Within a window
+  // the sampled tree — and thus the executed first hop — is identical, so
+  // the rigger commits to a plan instead of re-rolling a different anchor
+  // every tick. rrtReplan ticks (~0.13 s @240 Hz). Knob-tunable.
+  const replanW = Math.max(1, Math.round(tune('rrtReplan', 30)));
+  const rng = hashRng(player.id, Math.floor(state.tick / replanW));
   const nodes: RrtNode[] = [{
     p: player.p, v: player.v, parent: -1,
     aPos: pos, reel: -1, isSpar: true, best: vlen(vsub(pos, target)),
@@ -513,6 +526,31 @@ function planRRT(
   let cur = bestIdx;
   while (nodes[cur].parent > 0) cur = nodes[cur].parent;
   const first = nodes[cur];
+
+  // STICKY HYSTERESIS (fix #2): across window boundaries, keep the
+  // previously-committed first hop unless a fresh plan clearly beats it —
+  // the same anti-dither discipline the MPC path uses, which RRT bypassed.
+  if (sticky) {
+    const sd = vlen(vsub(pos, sticky.pos));
+    const moved = vlen(vsub(first.aPos, sticky.pos));
+    if (sd >= 2 && sd <= 180 && moved > 4) {
+      const sr = rolloutPrimitive(
+        player.p, player.v, sticky.pos, omega, sticky.reel,
+        target, RRT_PRIM_STEPS, PLAN_H,
+      );
+      const stickyCost = cost({ p: sr.p, v: sr.v, minDist: Math.min(
+        vlen(vsub(player.p, target)), sr.minDist), term: sr.term });
+      if (bestCost >= stickyCost - ANCHOR_SWITCH_MARGIN) {
+        return {
+          anchorPos: sticky.pos,
+          reel: sticky.reel,
+          projectedDist: sr.minDist,
+          isSpar: Math.hypot(sticky.pos.y, sticky.pos.z) < 1,
+        };
+      }
+    }
+  }
+
   return {
     anchorPos: first.aPos,
     reel: first.reel,
@@ -555,7 +593,7 @@ export function planGrapple(
   // RRT kinodynamic tree (multi-hop swoop chains); else the momentum-MPC.
   // RRT may return null (found nothing better) → fall through to MPC.
   if (tune('planner', 0) >= 1) {
-    const r = planRRT(player, target, state, opponents, teammates);
+    const r = planRRT(player, target, state, opponents, teammates, sticky);
     if (r) return r;
   }
 

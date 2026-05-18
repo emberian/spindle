@@ -29,7 +29,8 @@ import { vnorm, vsub, vadd, vscale, vlen, vdot, v3 } from '../sim/vec';
 import type { PlayerSim, SimState, MatchState, PlayerInput } from '../sim/types';
 import type { TeamProfile } from '../league/teams';
 import type { DirectorState, PlayerAssignment } from './Director';
-import { planToInput, planGrapple, swoopMinV, swoopAlign } from './nav/GrapplePlanner';
+import { planToInput, planGrapple, swoopMinV, swoopAlign, rrtActive, rrtReplanTicks } from './nav/GrapplePlanner';
+import type { GrapplePlan } from './nav/GrapplePlanner';
 import { anchorPolicy } from './roles/Anchor';
 import { spinnerPolicy } from './roles/Spinner';
 import { faithwingPolicy } from './roles/Faithwing';
@@ -165,6 +166,12 @@ export interface PlayerCommit {
    *  carrier must move it along (canon: a slow bell is a foul) so play is
    *  catch → brief carry → pass to a chasing pack-mate → repeat. */
   holdTicks: number;
+  /** RRT open-loop plan cache: hold the planned hop for the replan window
+   *  (real MPC commitment — stops the per-tick anchor re-rolling the skill
+   *  eval caught as thrash≈6000). Only used on the RRT path. */
+  rrtPlan: GrapplePlan | null;
+  rrtPlanTick: number;
+  rrtPlanTarget: Vec3 | null;
 }
 
 export interface PlayerCommitCache {
@@ -292,6 +299,9 @@ export function computePlayerInput(
         sawRole: null,
         sawJob: null,
         holdTicks: 0,
+        rrtPlan: null,
+        rrtPlanTick: -1,
+        rrtPlanTarget: null,
       };
     }
 
@@ -769,7 +779,30 @@ function navigateTo(
     commit.lastAnchorPos !== null
       ? { pos: commit.lastAnchorPos, reel: commit.lastAnchorReel }
       : null;
-  const plan = planGrapple(player, target, state, true, sticky);
+  // RRT open-loop commitment: a kinodynamic plan is a multi-hop intention,
+  // not a per-tick reflex. Hold the planned hop for the replan window (or
+  // until the target jumps) — recompute only at window edges. This is the
+  // real fix for the thrash≈6000 flailing (per-tick re-rolling); plain MPC
+  // keeps its own per-tick + sticky behaviour (rrtActive() false).
+  let plan: GrapplePlan | null;
+  if (rrtActive()) {
+    const age = state.tick - commit.rrtPlanTick;
+    const tgtJump = commit.rrtPlanTarget
+      ? Math.hypot(target.x - commit.rrtPlanTarget.x,
+                   target.y - commit.rrtPlanTarget.y,
+                   target.z - commit.rrtPlanTarget.z)
+      : Infinity;
+    if (commit.rrtPlan && age >= 0 && age < rrtReplanTicks() && tgtJump < 25) {
+      plan = commit.rrtPlan; // execute the committed plan open-loop
+    } else {
+      plan = planGrapple(player, target, state, true, sticky);
+      commit.rrtPlan = plan;
+      commit.rrtPlanTick = state.tick;
+      commit.rrtPlanTarget = { x: target.x, y: target.y, z: target.z };
+    }
+  } else {
+    plan = planGrapple(player, target, state, true, sticky);
+  }
   if (plan) {
     commit.lastAnchorPos = plan.anchorPos;
     commit.lastAnchorReel = plan.reel;
