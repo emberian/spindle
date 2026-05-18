@@ -171,8 +171,38 @@ const ANCHOR_SWITCH_MARGIN = 6;
 // once a taut swing has built real speed roughly toward the goal, drop the
 // line and soar. Exported so the executor (RiggerAI) releases on the same
 // condition the planner's cost simulated → the plan and the act agree.
-export const SWOOP_MIN_V = 8;     // m/s — a swing worth releasing into
-export const SWOOP_ALIGN = 0.6;   // cos: velocity must point ~at the target
+// ── Live behaviour knobs (playful exploration, not locked in) ────────────────
+// These read window.__rigtune at call time so the behaviour space can be
+// roamed interactively from the watch view + telemetry, no rebuild/deploy
+// per experiment. ABSENT (tests, replay, normal play) ⇒ the documented
+// default, so determinism / replay / the gate are untouched — only an
+// explicitly-set dev override changes anything.
+//   window.__rigtune = { wMom: 0.6, swoopMinV: 8, swoopAlign: 0.6 }
+function tune(k: string, d: number): number {
+  const g = (globalThis as { __rigtune?: Record<string, unknown> }).__rigtune;
+  const v = g && g[k];
+  return typeof v === 'number' && Number.isFinite(v) ? v : d;
+}
+
+// Defaults. Swoop release gate: a free-swing only pays off if you LET GO
+// once it's fast and pointed ~at the goal (the slingshot). Exported so the
+// RiggerAI executor releases on the SAME condition the planner simulated.
+const SWOOP_MIN_V_D = 8;    // m/s — a swing worth releasing into
+const SWOOP_ALIGN_D = 0.6;  // cos: velocity must point ~at the target
+export const SWOOP_MIN_V = SWOOP_MIN_V_D;   // back-compat export (default)
+export const SWOOP_ALIGN = SWOOP_ALIGN_D;
+/** Live-resolved swoop gate (used by the executor too). */
+export function swoopMinV(): number { return tune('swoopMinV', SWOOP_MIN_V_D); }
+export function swoopAlign(): number { return tune('swoopAlign', SWOOP_ALIGN_D); }
+
+// Momentum reward weight — THE paradigm parameter. Old cost minimised
+// "distance to a point in 3 s while tethered" (myopic, momentum-blind, so
+// swooping never paid). New cost rewards ending fast & pointed at the goal
+// (the slingshot payoff). ~0.6 ≈ "10 m/s of useful speed ≈ 6 m closer".
+// Higher ⇒ more swoop/dynamism (bell stays central) but riggers blow past
+// catches; lower ⇒ more possession but tamer. Roam it live via __rigtune.
+const W_MOM_D = 0.6;
+function wMom(): number { return tune('wMom', W_MOM_D); }
 
 export interface GrapplePlan {
   /** The world-space anchor point to fire the line at. */
@@ -200,7 +230,7 @@ function simulateGrappleSwingDef(
   steps: number,
   h: number,
   opponents: { x: number; y: number; z: number }[],
-): { closestDist: number; minOppDist: number } {
+): { closestDist: number; minOppDist: number; term: number } {
   let p = { ...pos };
   let v = { ...vel };
   let restLen = vlen(vsub(p, anchorPos));
@@ -217,7 +247,7 @@ function simulateGrappleSwingDef(
       const sp = vlen(v);
       const toT = vsub(target, p);
       const dl = vlen(toT);
-      if (sp > SWOOP_MIN_V && dl > 1e-6 && vdot(v, toT) / (sp * dl) > SWOOP_ALIGN) {
+      if (sp > swoopMinV() && dl > 1e-6 && vdot(v, toT) / (sp * dl) > swoopAlign()) {
         released = true;
       }
     }
@@ -254,7 +284,13 @@ function simulateGrappleSwingDef(
     }
   }
 
-  return { closestDist, minOppDist };
+  // Terminal momentum toward the target — the slingshot payoff the OLD
+  // objective ignored. A swoop that ends fast & aimed scores well even if
+  // its closest pass wasn't tiny (next replan continues the arc).
+  const _toT = vsub(target, p);
+  const _dl = vlen(_toT);
+  const term = _dl > 1e-6 ? Math.max(0, vdot(v, vscale(_toT, 1 / _dl))) : 0;
+  return { closestDist, minOppDist, term };
 }
 
 /**
@@ -270,7 +306,7 @@ function simulateGrappleSwing(
   target: Vec3,
   steps: number,
   h: number,
-): number {
+): { closestDist: number; term: number } {
   let p = { ...pos };
   let v = { ...vel };
   let restLen = vlen(vsub(p, anchorPos));
@@ -291,7 +327,7 @@ function simulateGrappleSwing(
       const sp = vlen(v);
       const toT = vsub(target, p);
       const dl = vlen(toT);
-      if (sp > SWOOP_MIN_V && dl > 1e-6 && vdot(v, toT) / (sp * dl) > SWOOP_ALIGN) {
+      if (sp > swoopMinV() && dl > 1e-6 && vdot(v, toT) / (sp * dl) > swoopAlign()) {
         released = true;
       }
     }
@@ -326,7 +362,163 @@ function simulateGrappleSwing(
     if (dist < closestDist) closestDist = dist;
   }
 
-  return closestDist;
+  const _toT = vsub(target, p);
+  const _dl = vlen(_toT);
+  const term = _dl > 1e-6 ? Math.max(0, vdot(v, vscale(_toT, 1 / _dl))) : 0;
+  return { closestDist, term };
+}
+
+// ── Deterministic hash RNG (no signature change, replay-safe) ────────────────
+// Seeded from player id + tick (both deterministic) → reproducible sampling
+// for the RRT without threading rng or breaking the frozen planGrapple sig.
+function hashRng(id: string, tick: number): () => number {
+  let s = (2166136261 ^ tick) >>> 0;
+  for (let i = 0; i < id.length; i++) s = Math.imul(s ^ id.charCodeAt(i), 16777619) >>> 0;
+  return () => {
+    s ^= s << 13; s >>>= 0;
+    s ^= s >>> 17;
+    s ^= s << 5; s >>>= 0;
+    return s / 4294967296;
+  };
+}
+
+// One grapple PRIMITIVE rolled out → END state (for chaining in the RRT) plus
+// the branch's closest pass & terminal momentum. Same physics + swoop-release
+// as simulateGrappleSwing; returns where you END so primitives can compose
+// into multi-hop swoop chains.
+function rolloutPrimitive(
+  pos: Vec3, vel: Vec3, anchorPos: Vec3, omega: number,
+  reel: -1 | 0, target: Vec3, steps: number, h: number,
+): { p: Vec3; v: Vec3; minDist: number; term: number } {
+  let p = { ...pos };
+  let v = { ...vel };
+  let restLen = vlen(vsub(p, anchorPos));
+  let minDist = vlen(vsub(p, target));
+  let released = false;
+  for (let i = 0; i < steps; i++) {
+    const s: PointState = rk4Step({ p, v }, omega, h);
+    p = s.p; v = s.v;
+    if (reel === 0 && !released && i >= 4) {
+      const sp = vlen(v); const toT = vsub(target, p); const dl = vlen(toT);
+      if (sp > swoopMinV() && dl > 1e-6 && vdot(v, toT) / (sp * dl) > swoopAlign()) released = true;
+    }
+    if (!released) {
+      const d = vsub(p, anchorPos); const len = vlen(d);
+      if (len > 1e-6) {
+        const n = vscale(d, 1 / len);
+        const vRad = vdot(v, n);
+        if (len >= restLen && vRad > 0) v = vsub(v, vscale(n, vRad));
+        if (reel === -1 && len >= TETHER_MIN) {
+          const tl = Math.max(TETHER_MIN, restLen - REEL_RATE * h);
+          if (tl < restLen) {
+            const vrc = vdot(v, n);
+            const sc = restLen > 1e-6 ? restLen / tl : 1;
+            const vt = vsub(v, vscale(n, vrc));
+            v = vadd(vscale(vt, sc), vscale(n, vrc));
+            restLen = tl;
+          }
+        }
+      }
+    }
+    const dd = vlen(vsub(p, target));
+    if (dd < minDist) minDist = dd;
+  }
+  const toT = vsub(target, p); const dl = vlen(toT);
+  const term = dl > 1e-6 ? Math.max(0, vdot(v, vscale(toT, 1 / dl))) : 0;
+  return { p, v, minDist, term };
+}
+
+// ── RRT-style kinodynamic planner (knob: __rigtune.planner >= 1) ─────────────
+// A *tree of reachable states*: each edge is a real grapple primitive (fire
+// an anchor, reel/swing, swoop-release) rolled out through the true physics.
+// Goal-biased growth finds multi-hop swoop CHAINS (slingshot off one spar to
+// set up the next) the 1-cycle planner can't see; we execute the first
+// primitive of the best branch and re-grow next decision (RRT-with-replan).
+// Deterministic (hash-rng). Returns null → caller falls back to the MPC.
+interface RrtNode { p: Vec3; v: Vec3; parent: number; aPos: Vec3; reel: -1 | 0; isSpar: boolean; best: number; }
+const RRT_ITERS = 28;
+const RRT_PRIM_STEPS = 18; // ~1.2 s primitive → chains form over the horizon
+
+function planRRT(
+  player: PlayerSim, target: Vec3, state: SimState,
+  opponents: Vec3[], teammates: Vec3[],
+): GrapplePlan | null {
+  const pos = player.p, omega = state.omega;
+  const toTargetDir = (() => { const d = vsub(target, pos); const l = vlen(d); return l > 1e-6 ? vscale(d, 1 / l) : v3(1, 0, 0); })();
+
+  // Candidate anchors: lattice spars in range + teammates, forward-ish,
+  // ordered by nearness to the target (good next hop first).
+  const anchors: { pos: Vec3; isSpar: boolean }[] = [];
+  for (const sp of SPARS) {
+    const dd = vlen(vsub(pos, sp));
+    if (dd < 2 || dd > 170) continue;
+    if (vdot(vnorm(vsub(sp, pos)), toTargetDir) < -0.7) continue;
+    anchors.push({ pos: sp, isSpar: true });
+  }
+  for (const pl of state.players) {
+    if (pl.id === player.id || pl.team !== player.team) continue;
+    const dd = vlen(vsub(pos, pl.p));
+    if (dd < 3 || dd > 70) continue;
+    anchors.push({ pos: pl.p, isSpar: false });
+  }
+  if (anchors.length === 0) return null;
+  anchors.sort((a, b) =>
+    (vlen(vsub(a.pos, target)) - vlen(vsub(b.pos, target))) || (a.pos.x - b.pos.x));
+
+  const wMomV = wMom();
+  const wSpace = tune('wSpace', 0);
+  const DANGER = 6;
+  const cost = (n: { p: Vec3; v: Vec3; minDist: number; term: number }): number => {
+    let c = n.minDist - wMomV * n.term;
+    for (const o of opponents) { const od = vlen(vsub(n.p, o)); if (od < DANGER) c += (DANGER - od) * 3.5; }
+    if (wSpace > 0) {
+      // Spacing: penalise ending crowded onto a teammate → riggers spread
+      // and run distinct lanes; coordinated structure EMERGES from this.
+      let nearTm = Infinity;
+      for (const t of teammates) { const td = vlen(vsub(n.p, t)); if (td < nearTm) nearTm = td; }
+      if (nearTm < 18) c += (18 - nearTm) * wSpace;
+    }
+    return c;
+  };
+
+  const rng = hashRng(player.id, state.tick);
+  const nodes: RrtNode[] = [{
+    p: player.p, v: player.v, parent: -1,
+    aPos: pos, reel: -1, isSpar: true, best: vlen(vsub(pos, target)),
+  }];
+  let bestIdx = 0, bestCost = nodes[0].best;
+
+  for (let it = 0; it < RRT_ITERS; it++) {
+    // Expand the best-so-far node most of the time; explore a random node
+    // sometimes (the RRT exploration/exploitation balance).
+    const fromIdx = rng() < 0.7 ? bestIdx : (Math.floor(rng() * nodes.length) | 0);
+    const fn = nodes[fromIdx];
+    // Goal-biased anchor pick: u² favours the low-index (toward-target) ones.
+    const u = rng();
+    const ai = Math.min(anchors.length - 1, (u * u * anchors.length) | 0);
+    const a = anchors[ai];
+    const reel: -1 | 0 = rng() < 0.5 ? -1 : 0;
+    const r = rolloutPrimitive(fn.p, fn.v, a.pos, omega, reel, target, RRT_PRIM_STEPS, PLAN_H);
+    const branchBest = Math.min(fn.best, r.minDist);
+    const nd: RrtNode = {
+      p: r.p, v: r.v, parent: fromIdx, aPos: a.pos, reel, isSpar: a.isSpar, best: branchBest,
+    };
+    nodes.push(nd);
+    const c = cost({ p: r.p, v: r.v, minDist: branchBest, term: r.term });
+    if (c < bestCost - 1e-9) { bestCost = c; bestIdx = nodes.length - 1; }
+  }
+
+  if (bestIdx === 0) return null; // tree found nothing better → use MPC
+  // Backtrack to the FIRST primitive off the root.
+  let cur = bestIdx;
+  while (nodes[cur].parent > 0) cur = nodes[cur].parent;
+  const first = nodes[cur];
+  return {
+    anchorPos: first.aPos,
+    reel: first.reel,
+    projectedDist: nodes[bestIdx].best,
+    isSpar: first.isSpar,
+  };
 }
 
 /**
@@ -355,6 +547,28 @@ export function planGrapple(
     ? state.players.filter(p => p.team !== player.team).map(p => p.p)
     : [];
   const DEFENDER_DANGER = 6; // m — within this is "swung into coverage"
+  const teammates: Vec3[] = state.players
+    .filter(p => p.id !== player.id && p.team === player.team)
+    .map(p => p.p);
+
+  // STRATEGY SWITCH (playful exploration, knob-gated, MPC default). 1+ =
+  // RRT kinodynamic tree (multi-hop swoop chains); else the momentum-MPC.
+  // RRT may return null (found nothing better) → fall through to MPC.
+  if (tune('planner', 0) >= 1) {
+    const r = planRRT(player, target, state, opponents, teammates);
+    if (r) return r;
+  }
+
+  // Teammate-spacing weight: penalise a trajectory that ends crowded onto a
+  // teammate so riggers spread & run distinct lanes — coordinated team
+  // structure EMERGES from individual planning (knob: __rigtune.wSpace).
+  const wSpaceV = tune('wSpace', 0);
+  const spacingPen = (endRef: Vec3): number => {
+    if (wSpaceV <= 0) return 0;
+    let nearTm = Infinity;
+    for (const t of teammates) { const td = vlen(vsub(endRef, t)); if (td < nearTm) nearTm = td; }
+    return nearTm < 18 ? (18 - nearTm) * wSpaceV : 0;
+  };
 
   // Cost wrapper: projected distance to target + penalty for grazing a
   // defender. Keeps the planner from sailing the player into a mark.
@@ -362,11 +576,18 @@ export function planGrapple(
     anchor: Vec3,
     reel: -1 | 0,
   ): { projectedDist: number; cost: number } => {
+    // THE PARADIGM SHIFT. Old cost = "how close did I get to a point in 3 s
+    // while tethered" — myopic, momentum-blind, so a dead-stop winch always
+    // beat a swoop. New cost = trajectory quality: still want to get near,
+    // but REWARD ending with speed carrying toward the goal (the slingshot
+    // / swoop payoff that the receding-horizon replan then continues). This
+    // single objective makes swooping, slingshots and committed arcs emerge
+    // instead of inching — no special-casing.
     if (opponents.length === 0) {
-      const d = simulateGrappleSwing(
+      const r = simulateGrappleSwing(
         pos, vel, anchor, omega, reel, target, PLAN_STEPS, PLAN_H,
       );
-      return { projectedDist: d, cost: d };
+      return { projectedDist: r.closestDist, cost: r.closestDist - wMom() * r.term + spacingPen(anchor) };
     }
     const r = simulateGrappleSwingDef(
       pos, vel, anchor, omega, reel, target, PLAN_STEPS, PLAN_H, opponents,
@@ -375,7 +596,7 @@ export function planGrapple(
       r.minOppDist < DEFENDER_DANGER
         ? (DEFENDER_DANGER - r.minOppDist) * 3.5
         : 0;
-    return { projectedDist: r.closestDist, cost: r.closestDist + danger };
+    return { projectedDist: r.closestDist, cost: r.closestDist - wMom() * r.term + danger + spacingPen(anchor) };
   };
 
   const candidates: (GrapplePlan & { cost: number })[] = [];

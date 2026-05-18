@@ -29,7 +29,7 @@ import { vnorm, vsub, vadd, vscale, vlen, vdot, v3 } from '../sim/vec';
 import type { PlayerSim, SimState, MatchState, PlayerInput } from '../sim/types';
 import type { TeamProfile } from '../league/teams';
 import type { DirectorState, PlayerAssignment } from './Director';
-import { planToInput, planGrapple, SWOOP_MIN_V, SWOOP_ALIGN } from './nav/GrapplePlanner';
+import { planToInput, planGrapple, swoopMinV, swoopAlign } from './nav/GrapplePlanner';
 import { anchorPolicy } from './roles/Anchor';
 import { spinnerPolicy } from './roles/Spinner';
 import { faithwingPolicy } from './roles/Faithwing';
@@ -788,7 +788,7 @@ function navigateTo(
     const sp = vlen(player.v);
     const toT = vsub(target, player.p);
     const dl = vlen(toT);
-    if (sp > SWOOP_MIN_V && dl > 1e-6 && vdot(player.v, toT) / (sp * dl) > SWOOP_ALIGN) {
+    if (sp > swoopMinV() && dl > 1e-6 && vdot(player.v, toT) / (sp * dl) > swoopAlign()) {
       commit.lastAnchorPos = null; // released — don't re-pin the stale anchor
       const soarAim = vnorm(player.v);
       return { ...planToInput(null, soarAim), release: true };
