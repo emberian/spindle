@@ -610,9 +610,31 @@ impl SimWorld {
             // Ring crossing (may score, or emit BellMissed + go dead).
             self.check_ring(prev_x);
 
+            // OUT-OF-FIELD GUARD. check_ring only fires on a gate-PLANE
+            // crossing (prev_x inside → x outside). A bell that is already
+            // beyond ±GATE_X and flying further out — possible now that the
+            // powered hook lets a carrier throw from past the gate, and
+            // unbounded because axial-x is inertial (no Coriolis damping) —
+            // never triggers a crossing, so it would coast for the full
+            // MAX_FREE_TICKS (30 s) and run away (bx → thousands). A free
+            // bell past the playable tube is out of play NOW: dead ball,
+            // re-cast. Boundary GATE_X+30 = 350 (< BX_MAX 400; the ring
+            // kill at the plane handles legitimate misses earlier). Pure
+            // positional ⇒ deterministic; never touches in-field play.
+            if !self.bell_dead && self.bell.p.x.abs() > GATE_X + 30.0 {
+                let end = if self.bell.p.x >= 0.0 {
+                    RingEnd::PlusX
+                } else {
+                    RingEnd::MinusX
+                };
+                self.events.push(SimEvent::BellMissed { end });
+                self.bell_thrown_by = None;
+                self.bell_dead = true;
+            }
+
             // Dead-ball on excessive free flight (no catch, no ring): a bell
-            // that drifts forever would freeze the match. check_ring may have
-            // already killed it this tick.
+            // that drifts forever would freeze the match. check_ring or the
+            // out-of-field guard may have already killed it this tick.
             if !self.bell_dead {
                 self.free_ticks += 1;
                 if self.free_ticks > MAX_FREE_TICKS {
