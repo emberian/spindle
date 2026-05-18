@@ -164,6 +164,16 @@ const SKIN_BUFFER = 4;  // m inside skin — don't fire at skin if within this
 // genuinely better anchor (closer approach, defender avoidance) still wins.
 const ANCHOR_SWITCH_MARGIN = 6;
 
+// ── Swoop (the Xonotic-style swing→release) ──────────────────────────────────
+// A free-swing (reel=0) only pays off if you LET GO at the right moment and
+// fly with the carried momentum. The AI never released, so swinging always
+// scored worse than winching and was never chosen. These gate the release:
+// once a taut swing has built real speed roughly toward the goal, drop the
+// line and soar. Exported so the executor (RiggerAI) releases on the same
+// condition the planner's cost simulated → the plan and the act agree.
+export const SWOOP_MIN_V = 8;     // m/s — a swing worth releasing into
+export const SWOOP_ALIGN = 0.6;   // cos: velocity must point ~at the target
+
 export interface GrapplePlan {
   /** The world-space anchor point to fire the line at. */
   anchorPos: Vec3;
@@ -196,26 +206,38 @@ function simulateGrappleSwingDef(
   let restLen = vlen(vsub(p, anchorPos));
   let closestDist = vlen(vsub(p, target));
   let minOppDist = Infinity;
+  let released = false;
 
   for (let i = 0; i < steps; i++) {
     const s: PointState = rk4Step({ p, v }, omega, h);
     p = s.p;
     v = s.v;
 
-    const d = vsub(p, anchorPos);
-    const len = vlen(d);
-    if (len > 1e-6) {
-      const n = vscale(d, 1 / len);
-      const vRad = vdot(v, n);
-      if (len >= restLen && vRad > 0) v = vsub(v, vscale(n, vRad));
-      if (reel === -1 && len >= TETHER_MIN) {
-        const target_len = Math.max(TETHER_MIN, restLen - REEL_RATE * h);
-        if (target_len < restLen) {
-          const vRadCurrent = vdot(v, n);
-          const scale = restLen > 1e-6 ? restLen / target_len : 1;
-          const vTan = vsub(v, vscale(n, vRadCurrent));
-          v = vadd(vscale(vTan, scale), vscale(n, vRadCurrent));
-          restLen = target_len;
+    if (reel === 0 && !released && i >= 4) {
+      const sp = vlen(v);
+      const toT = vsub(target, p);
+      const dl = vlen(toT);
+      if (sp > SWOOP_MIN_V && dl > 1e-6 && vdot(v, toT) / (sp * dl) > SWOOP_ALIGN) {
+        released = true;
+      }
+    }
+
+    if (!released) {
+      const d = vsub(p, anchorPos);
+      const len = vlen(d);
+      if (len > 1e-6) {
+        const n = vscale(d, 1 / len);
+        const vRad = vdot(v, n);
+        if (len >= restLen && vRad > 0) v = vsub(v, vscale(n, vRad));
+        if (reel === -1 && len >= TETHER_MIN) {
+          const target_len = Math.max(TETHER_MIN, restLen - REEL_RATE * h);
+          if (target_len < restLen) {
+            const vRadCurrent = vdot(v, n);
+            const scale = restLen > 1e-6 ? restLen / target_len : 1;
+            const vTan = vsub(v, vscale(n, vRadCurrent));
+            v = vadd(vscale(vTan, scale), vscale(n, vRadCurrent));
+            restLen = target_len;
+          }
         }
       }
     }
@@ -253,6 +275,7 @@ function simulateGrappleSwing(
   let v = { ...vel };
   let restLen = vlen(vsub(p, anchorPos));
   let closestDist = vlen(vsub(p, target));
+  let released = false;
 
   for (let i = 0; i < steps; i++) {
     // Coriolis free-flight step.
@@ -260,26 +283,41 @@ function simulateGrappleSwing(
     p = s.p;
     v = s.v;
 
-    // Grapple constraint: remove separating radial velocity, preserve tangential.
-    const d = vsub(p, anchorPos);
-    const len = vlen(d);
-    if (len > 1e-6) {
-      const n = vscale(d, 1 / len);
-      const vRad = vdot(v, n);
-      if (len >= restLen && vRad > 0) {
-        // Taut — cancel outward radial component.
-        v = vsub(v, vscale(n, vRad));
+    // SWOOP: a reel=0 swing builds tangential speed; the moment it's fast
+    // and pointed ~at the target, RELEASE — fly free with the carried
+    // momentum (the slingshot). The cost then reflects the real swoop
+    // payoff, so the planner will actually choose to swing-and-soar.
+    if (reel === 0 && !released && i >= 4) {
+      const sp = vlen(v);
+      const toT = vsub(target, p);
+      const dl = vlen(toT);
+      if (sp > SWOOP_MIN_V && dl > 1e-6 && vdot(v, toT) / (sp * dl) > SWOOP_ALIGN) {
+        released = true;
       }
-      // Reel: shorten restLen, conserve angular momentum.
-      if (reel === -1 && len >= TETHER_MIN) {
-        const target_len = Math.max(TETHER_MIN, restLen - REEL_RATE * h);
-        if (target_len < restLen) {
-          const vRadCurrent = vdot(v, n);
-          const scale = restLen > 1e-6 ? restLen / target_len : 1;
-          // Scale tangential component.
-          const vTan = vsub(v, vscale(n, vRadCurrent));
-          v = vadd(vscale(vTan, scale), vscale(n, vRadCurrent));
-          restLen = target_len;
+    }
+
+    // Grapple constraint: only while still attached (not after release).
+    if (!released) {
+      const d = vsub(p, anchorPos);
+      const len = vlen(d);
+      if (len > 1e-6) {
+        const n = vscale(d, 1 / len);
+        const vRad = vdot(v, n);
+        if (len >= restLen && vRad > 0) {
+          // Taut — cancel outward radial component.
+          v = vsub(v, vscale(n, vRad));
+        }
+        // Reel: shorten restLen, conserve angular momentum.
+        if (reel === -1 && len >= TETHER_MIN) {
+          const target_len = Math.max(TETHER_MIN, restLen - REEL_RATE * h);
+          if (target_len < restLen) {
+            const vRadCurrent = vdot(v, n);
+            const scale = restLen > 1e-6 ? restLen / target_len : 1;
+            // Scale tangential component.
+            const vTan = vsub(v, vscale(n, vRadCurrent));
+            v = vadd(vscale(vTan, scale), vscale(n, vRadCurrent));
+            restLen = target_len;
+          }
         }
       }
     }
@@ -353,8 +391,18 @@ export function planGrapple(
     const toTarget = vnorm(vsub(target, pos));
     if (vdot(toSpar, toTarget) < -0.7) continue;
 
-    const sc = scorePlan(spar, -1);
-    candidates.push({ anchorPos: spar, reel: -1, projectedDist: sc.projectedDist, isSpar: true, cost: sc.cost });
+    // BOTH actions on every spar (the Xonotic-swoop fix): reel=-1 winches
+    // straight in (slow, dead-stop); reel=0 keeps the tether long and lets
+    // the taut swing + Coriolis WHIP the rigger around — momentum is
+    // preserved, so this builds & carries speed (a slingshot arc), exactly
+    // the swooping the AI never did (it was 100% winch). The cost oracle
+    // (closest approach over 3 s) naturally picks the swing when arcing
+    // gets there faster, the winch when it doesn't — so the AI now
+    // *discovers* swoops instead of inching.
+    const scReel = scorePlan(spar, -1);
+    candidates.push({ anchorPos: spar, reel: -1, projectedDist: scReel.projectedDist, isSpar: true, cost: scReel.cost });
+    const scSwing = scorePlan(spar, 0);
+    candidates.push({ anchorPos: spar, reel: 0, projectedDist: scSwing.projectedDist, isSpar: true, cost: scSwing.cost });
   }
 
   // ── Candidate 2: Skin anchor ───────────────────────────────────────────────

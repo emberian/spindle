@@ -29,7 +29,7 @@ import { vnorm, vsub, vadd, vscale, vlen, vdot, v3 } from '../sim/vec';
 import type { PlayerSim, SimState, MatchState, PlayerInput } from '../sim/types';
 import type { TeamProfile } from '../league/teams';
 import type { DirectorState, PlayerAssignment } from './Director';
-import { planToInput, planGrapple } from './nav/GrapplePlanner';
+import { planToInput, planGrapple, SWOOP_MIN_V, SWOOP_ALIGN } from './nav/GrapplePlanner';
 import { anchorPolicy } from './roles/Anchor';
 import { spinnerPolicy } from './roles/Spinner';
 import { faithwingPolicy } from './roles/Faithwing';
@@ -778,6 +778,23 @@ function navigateTo(
     // get re-pinned next time we DO need to swing.
     commit.lastAnchorPos = null;
   }
+  // SWOOP RELEASE (the executor agrees with the planner's simulated swoop):
+  // if we're on a taut line, the plan says keep swinging (reel=0), and we've
+  // built real speed pointed ~at the target — LET GO and soar with the
+  // carried momentum instead of re-firing. That's the Xonotic arc, and a
+  // carrier releasing here slings the bell out of the swing (the throw then
+  // inherits this velocity in the sim — adaptive, and it looks like hell).
+  if (player.line && player.line.taut && plan && plan.reel === 0) {
+    const sp = vlen(player.v);
+    const toT = vsub(target, player.p);
+    const dl = vlen(toT);
+    if (sp > SWOOP_MIN_V && dl > 1e-6 && vdot(player.v, toT) / (sp * dl) > SWOOP_ALIGN) {
+      commit.lastAnchorPos = null; // released — don't re-pin the stale anchor
+      const soarAim = vnorm(player.v);
+      return { ...planToInput(null, soarAim), release: true };
+    }
+  }
+
   const aim = plan ? vnorm(vsub(plan.anchorPos, player.p)) : v3(1, 0, 0);
   return planToInput(plan, aim);
 }
