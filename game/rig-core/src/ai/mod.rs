@@ -28,6 +28,9 @@ pub mod roles;
 // Port increment 4b decision-layer substrate: the cross-file shared
 // types of Director/RiggerAI/AiSystem (serialization point).
 pub mod decision_types;
+// Chamber-alive rebuild: active-inference + w-maxing controller substrate
+// (generative model, EFE pragmatic+epistemic terms, volume coverage).
+pub mod efe;
 // Port increment 4b: the decision integrator + orchestrator.
 pub mod director;
 pub mod rigger_ai;

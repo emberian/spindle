@@ -20,7 +20,8 @@ use super::decision_types::{
     difficulty_scaling, CastPosture, DifficultyScaling, DirectorState, Job, PlayerAssignment,
     PlayerCommit, PlayerCommitCache,
 };
-use super::gate_solve::solve_gate_throw;
+use super::efe;
+use super::gate_solve::{solve_gate_throw, THROW_MAX_SPEED, THROW_MIN_SPEED};
 use super::lead_predict::solve_lead_velocity;
 use super::orientation::{attack_ring_x, attack_sign, defend_ring_x, forward_progress};
 use super::plan_bridge::{plan_grapple, GrapplePlan, Sticky};
@@ -31,8 +32,7 @@ use super::roles::faithwing::faithwing_policy;
 use super::roles::freewing::freewing_policy;
 use super::roles::reach::reach_policy;
 use super::roles::spinner::spinner_policy;
-use super::throw_score::{score_throw, ThrowCandidate};
-use super::types::{Gate, MatchState, PlayerInput, PlayerSim, RiggerRole, RoleStyle, SimState};
+use super::types::{MatchState, PlayerInput, PlayerSim, RiggerRole, RoleStyle, SimState};
 use crate::math::Vec3;
 use crate::trajectory::{rk4_step, PointState};
 
@@ -571,40 +571,29 @@ fn decide_nav_target(
     rng: &mut AiRng,
     style: Option<RoleStyle>,
 ) -> Vec3 {
-    // Loose / in-flight bell pursuit (recover).
+    // RECOVER — WEAKEST USEFUL GRAPPLE toward the loose bell. The old code
+    // either stern-chased or aimed a single argmin lead point. Instead we
+    // predict the bell BAND (generative model) and go boldly for the band
+    // sample this rigger is MOST favorable to intercept — the broad
+    // reachable region, not a knife-edge point. This recovers skin-stuck
+    // bells (the predictor's skin bounce is in the band) and produces bold
+    // chamber-spanning swings instead of an unwinnable tail chase.
     if assignment.job == Job::Recover {
-        let b = &state.bell;
-        let dx = b.p.x - player.p.x;
-        let dy = b.p.y - player.p.y;
-        let dz = b.p.z - player.p.z;
-        let gap = (dx * dx + dy * dy + dz * dz).sqrt();
-        let recover_close_v = 20.0;
-        let t_lead = (gap / recover_close_v).max(0.15).min(2.0);
-        let mut st = PointState { p: b.p, v: b.v };
-        let h: f64 = 1.0 / 60.0;
-        let mut t_acc = 0.0_f64;
-        while t_acc < t_lead {
-            let step = h.min(t_lead - t_acc);
-            st = rk4_step(st, REG_OMEGA, step);
-            predict_skin_bounce(&mut st);
-            t_acc += step;
+        let band = efe::BellBand::predict(
+            state.bell.p, state.bell.v, state.omega, REG_R,
+        );
+        // close_v = a confident reel/swoop closing speed; high so the
+        // chosen sample is one we can actually get IN FRONT of.
+        let ip = band.best_intercept_for(player.p, 24.0);
+        // A tiny tuck toward the mid sample keeps us arriving INTO the
+        // path (not behind it) without committing to a single point.
+        let mid = band.mid().p;
+        let toward = vsub(mid, ip);
+        let tl = vlen(toward);
+        if tl > 1e-6 {
+            return vadd(ip, vscale(toward, (1.5_f64).min(tl) / tl));
         }
-        // RECOVER-NAV FIX (from exp-catch) — INTERCEPT, don't stern-chase.
-        // The old code tucked 6 m *behind* the predicted bell point along
-        // its velocity — on a ~20 m/s Coriolis bell that is an unwinnable
-        // tail chase (the rigger can never close from behind). Navigate to
-        // the predicted point itself with only a tiny tuck so the rigger
-        // arrives INTO the bell's path and the committed catch can take it.
-        let bs = st.v.x.hypot(st.v.y).hypot(st.v.z);
-        if bs > 1e-3 {
-            let tuck = 1.5;
-            return Vec3::new(
-                st.p.x - (st.v.x / bs) * tuck,
-                st.p.y - (st.v.y / bs) * tuck,
-                st.p.z - (st.v.z / bs) * tuck,
-            );
-        }
-        return Vec3::new(st.p.x, st.p.y, st.p.z);
+        return ip;
     }
 
     // CARRIER: actively gain ground toward OUR attacking ring
@@ -648,32 +637,146 @@ fn decide_nav_target(
         }
     }
 
-    // SUPPORT (offense, off-ball): cut into a distinct lane.
-    if assignment.job == Job::Support {
-        let sgn = director.attack_sign;
-        let style_radius = style.map(|s| s.radius).unwrap_or(0.5);
-        let style_angle = style.map(|s| s.angle).unwrap_or(0.5);
-        let cut_x = state.bell.p.x + sgn * (45.0 + style_radius * 55.0);
-        let ang = std::f64::consts::PI * (0.12 + style_angle * 1.4);
-        let r = 14.0 + style_radius * 30.0;
-        return Vec3::new(cut_x, r * ang.cos(), r * ang.sin());
+    // SUPPORT (offense, off-ball) and ZONE (defense, off-ball/help): these
+    // are exactly the agents with NO immediate pragmatic job — the ones
+    // that used to twitch on a single argmin slot. They now take an
+    // EPISTEMIC / COVERAGE action: among a FAN of broad candidate regions
+    // spanning the chamber volume, pick the WEAKEST = the region that
+    // minimizes Expected Free Energy (pragmatic responsiveness to the bell
+    // band + epistemic team-volume spread). This is the volume-play drive.
+    if assignment.job == Job::Support || assignment.job == Job::Zone {
+        return wmax_coverage_target(
+            player, state, director, assignment, style,
+        );
     }
 
-    // ZONE (defense, off-ball / help).
-    if assignment.job == Job::Zone {
-        let dx = defend_ring_x(player.team);
-        let sgn = attack_sign(player.team);
-        let style_radius = style.map(|s| s.radius).unwrap_or(0.5);
-        let style_angle = style.map(|s| s.angle).unwrap_or(0.0);
-        let guard_x = dx + sgn * (22.0 + style_radius * 30.0);
-        let ang = std::f64::consts::PI
-            * (0.15 + assignment.radius_slot * 1.3 + style_angle * 0.2);
-        let r = 16.0 + assignment.radius_slot * 34.0;
-        return Vec3::new(guard_x, r * ang.cos(), r * ang.sin());
+    // Otherwise defer to the role policy — but still pass off-ball,
+    // jobless role agents through the same w-maxing coverage selection so
+    // they span the volume instead of collapsing on the ball.
+    let base =
+        role_target(player, state, m, profile, director, assignment, rng, style);
+    let bell_held = state.bell.held_by.is_some();
+    let off_ball = !bell_held
+        || state.bell.held_by.as_deref() != Some(player.id.as_str());
+    if off_ball && assignment.job != Job::Receive {
+        // Blend the role's intent with the coverage region: keep the role's
+        // identity but pull it toward the under-covered, responsive part of
+        // the volume (weakest-sufficient: the broad region, not the slot).
+        let cov = wmax_coverage_target(
+            player, state, director, assignment, style,
+        );
+        return vadd(vscale(base, 0.45), vscale(cov, 0.55));
     }
+    base
+}
 
-    // Otherwise defer to the role policy.
-    role_target(player, state, m, profile, director, assignment, rng, style)
+/// WEAKEST-SUFFICIENT navigation for an off-ball / jobless agent.
+///
+/// Builds a FAN of broad candidate regions that span the chamber volume
+/// (a few forward-progress depths × a few cross-tube angles), scores each
+/// by Expected Free Energy, and returns the WEAKEST acceptable one — the
+/// region that keeps the most futures responsive and the team most spread.
+///
+/// EFE(cand) = pragmatic + epistemic:
+///   - pragmatic = expected "distance to be able to respond" to the
+///     predicted bell BAND from `cand` (low = stays useful across the
+///     range of bell futures), softened toward the attack direction so
+///     offense still flows forward.
+///   - epistemic = team volume coverage: a crowding penalty (don't
+///     collapse on teammates / the ball) + an axis-redundancy penalty
+///     (don't all stack at the same depth) ⇒ fill the empty volume.
+///
+/// "Weakest" = we deliberately bias toward the BROAD central candidate
+/// among those within a fitness band of the best EFE, not the razor argmin
+/// — that is what kills the twitch and produces bold spanning swings.
+fn wmax_coverage_target(
+    player: &PlayerSim,
+    state: &SimState,
+    _director: &DirectorState,
+    assignment: &PlayerAssignment,
+    style: Option<RoleStyle>,
+) -> Vec3 {
+    let team = player.team;
+    let skin_r = REG_R;
+    let omega = state.omega;
+    let sgn = attack_sign(team);
+
+    let band =
+        efe::BellBand::predict(state.bell.p, state.bell.v, omega, skin_r);
+    let others = efe::teammate_positions(player, state);
+    let others_fp: Vec<f64> = others
+        .iter()
+        .map(|p| forward_progress(team, p.x))
+        .collect();
+    let vm = efe::VolumeModel::new(team, crate::tuning::GATE_X, skin_r);
+
+    // Defense (Zone) anchors nearer our own ring; offense (Support / role)
+    // anchors around the bell and ahead toward the attack gate.
+    let defending = assignment.job == Job::Zone;
+    let anchor_x = if defending {
+        defend_ring_x(team) + sgn * 30.0
+    } else {
+        state.bell.p.x + sgn * 40.0
+    };
+
+    // Style gives each agent a STABLE distinct slice of the fan so the team
+    // naturally fans out (deterministic — committed style draw, no rng).
+    let s_ang = style.map(|s| s.angle).unwrap_or(0.5);
+    let s_rad = style.map(|s| s.radius).unwrap_or(0.5);
+
+    // Candidate FAN: 3 depths along the attack axis × 4 cross angles ×
+    // 2 radii — broad regions spanning the tube, not points.
+    let depths = [-70.0_f64, 10.0, 90.0];
+    let radii = [14.0_f64 + s_rad * 8.0, 30.0 + s_rad * 10.0];
+    let mut best: Option<Vec3> = None;
+    let mut best_efe = f64::INFINITY;
+
+    for (di, &dd) in depths.iter().enumerate() {
+        let cx = anchor_x + sgn * dd;
+        for k in 0..4 {
+            // Spread the four angles around the agent's stable style slice.
+            let ang = std::f64::consts::PI
+                * (0.15 + s_ang * 1.4 + k as f64 * 0.5);
+            for &rr in radii.iter() {
+                let r = rr.min(skin_r * 0.85);
+                let cand =
+                    Vec3::new(cx, r * ang.cos(), r * ang.sin());
+
+                // PRAGMATIC: responsiveness to the predicted bell band.
+                // Offense wants to be a favorable future interceptor;
+                // defense wants to be able to deny it. Same quantity.
+                let resp = band.expected_response_gap(cand, 22.0);
+                // Soften by forward intent so offense still flows up-field.
+                let fwd = forward_progress(team, cand.x);
+                let fwd_pull = if defending {
+                    0.0
+                } else {
+                    -(fwd / (crate::tuning::GATE_X.abs())) * 6.0
+                };
+                let pragmatic = resp + fwd_pull;
+
+                // EPISTEMIC: team volume coverage. Don't collapse on
+                // teammates; don't stack at one depth.
+                let crowd = vm.crowding_at(cand, &others);
+                let redun = vm.axis_redundancy(fwd, &others_fp);
+                let epistemic = crowd * 10.0 + redun * 6.0;
+
+                // Weakest-sufficient bias: prefer the central depth/radius
+                // (broader success-set, less committal) by a small bonus
+                // so among near-equal EFE the BROAD region wins.
+                let breadth_bonus = if di == 1 { -1.5 } else { 0.0 };
+
+                let total = pragmatic + epistemic + breadth_bonus;
+                if total < best_efe {
+                    best_efe = total;
+                    best = Some(cand);
+                }
+            }
+        }
+    }
+    best.unwrap_or_else(|| {
+        Vec3::new(anchor_x, 18.0, 0.0)
+    })
 }
 
 /// roleTarget (RiggerAI.ts:633-700).
@@ -878,7 +981,32 @@ fn navigate_to(
     plan_to_input(plan.as_ref(), aim)
 }
 
-/// decideThrow (RiggerAI.ts:841-1066). Mutates the commit in place.
+/// decide_throw — REBUILT as a w-maxing active-inference controller.
+///
+/// OLD (the dead-game bug): throw iff a near-exact closed-form gate
+/// solution threaded the ring with `arrive_rho <= GATE_RADIUS*0.6`
+/// (strongest possible precondition ⇒ they almost never threw), else fall
+/// to a precise argmax lead pass. Maximally over-specific.
+///
+/// NEW: a small ACTION REPERTOIRE of candidate releases is enumerated
+/// (gate closed-form seed, lead-pass seeds to each teammate, and a coarse
+/// world-direction fan at a few speeds). Each candidate's OUTCOME is
+/// predicted with the canon generative model (`efe::roll_forward` = the
+/// sacred Coriolis integrator + skin bounce). A candidate is FIT if its
+/// predicted outcome is good-enough across a WIDE band: it scores through
+/// our ring, OR it carries the bell forward toward the attack gate and is
+/// reachable by a teammate (a covered receiver), OR it just clearly
+/// advances the bell down the volume. Among FIT candidates we pick the
+/// **WEAKEST sufficient** one = the throw with the LARGEST TOLERANCE BAND:
+/// we perturb the release by a fan of aim errors and count how many
+/// perturbed releases STILL land a good-enough outcome. The throw whose
+/// success-set survives the most error wins — robust, not perfect. They
+/// throw whenever any fit candidate exists (often), not rarely+perfectly.
+///
+/// Determinism: pure geometry + the canon integrator. The only RNG draws
+/// are the SAME difficulty draws the frozen spec made (perturb_direction
+/// throw_variance, miss_open_chance gate, spin/charge jitter), kept so the
+/// determinism guards stay bit-identical in shape.
 #[allow(clippy::too_many_arguments)]
 fn decide_throw(
     player: &PlayerSim,
@@ -898,8 +1026,14 @@ fn decide_throw(
     let opponents: Vec<&PlayerSim> =
         state.players.iter().filter(|p| p.team != player.team).collect();
 
-    let ring_x = attack_ring_x(player.team);
+    let omega = state.omega;
+    let skin_r = REG_R;
+    let team = player.team;
+    let sgn = attack_sign(team);
+    let ring_x = attack_ring_x(team);
     let dist_to_ring = (ring_x - player.p.x).abs();
+    let attack_gate_fp = forward_progress(team, ring_x);
+    let my_fp = forward_progress(team, player.p.x);
 
     let posture_mul = match director.posture {
         CastPosture::Chase => 1.12,
@@ -908,206 +1042,218 @@ fn decide_throw(
     };
     let throw_speed = (18.0 + profile.aggression * 12.0) * posture_mul;
 
-    // ── PRIORITY 1: a REAL scoring throw through OUR ring. ────────────────────
+    // The sim launches v_bell = thrower.v + dir*speed. To realise a desired
+    // world launch v0 the player aims along (v0 - player.v) at charge for
+    // |v0 - player.v|. We work in world-launch space and convert at the end.
+    let throw_min = THROW_MIN_SPEED;
+    let throw_max = THROW_MAX_SPEED;
+
+    // Predicted teammate band — where each teammate will be over the
+    // generative horizon (so a "catchable" outcome means catchable by where
+    // they're GOING, not a stale slot). Cheap: one mid-horizon roll each.
+    let tm_future: Vec<(usize, Vec3)> = teammates
+        .iter()
+        .enumerate()
+        .map(|(i, tm)| {
+            let st = efe::roll_forward(tm.p, tm.v, omega, 0.9, skin_r);
+            (i, st.p)
+        })
+        .collect();
+
+    // ── Outcome quality of a world launch v0 (the PRAGMATIC evaluator). ──
+    // Roll the bell with the canon model from the release; return a scalar
+    // in roughly [0,1+] where >= GOOD_ENOUGH means "this is a good throw".
+    // Higher = better. No RNG.
+    let good_enough = 0.55_f64;
+    let eval_launch = |v0: Vec3| -> f64 {
+        // Roll far enough to see it cross the ring plane or settle.
+        let st = efe::roll_forward(player.p, v0, omega, 3.0, skin_r);
+        let end_fp = forward_progress(team, st.p.x);
+        let end_rho = st.p.y.hypot(st.p.z);
+
+        // (a) SCORING: did it pass our attack ring plane reasonably central?
+        // Detect a plane crossing by rolling in two halves and checking the
+        // sign of (ring_x - x). Cheap proxy: if it ends at/past the ring
+        // forward-progress AND the cross radius stayed catch-able.
+        let crossed_ring = end_fp >= attack_gate_fp - 2.0;
+        let central = end_rho <= REG_GATE_RADIUS * 1.6;
+        if crossed_ring && central {
+            return 1.0;
+        }
+
+        // (b) ADVANCE + CATCHABLE: bell ends meaningfully forward of us and
+        // near a teammate's predicted spot (a completable pass / coverage).
+        let gain = forward_progress(team, st.p.x) - my_fp;
+        let mut nearest_tm = f64::INFINITY;
+        for (_i, tp) in tm_future.iter() {
+            let d = (st.p.x - tp.x).hypot(st.p.y - tp.y).hypot(st.p.z - tp.z);
+            if d < nearest_tm {
+                nearest_tm = d;
+            }
+        }
+        // Reachable if a teammate is within a generous catch envelope of the
+        // bell's settle point (wide on purpose — weakest-sufficient).
+        let reach = (1.0 - (nearest_tm / 38.0)).clamp(0.0, 1.0);
+        let gain_norm = (gain / 120.0).clamp(-0.5, 1.0);
+
+        // Don't reward flinging it into the skin or behind us.
+        let skin_pen = if end_rho > skin_r * 0.96 { 0.25 } else { 0.0 };
+        let backward_pen = if gain < -20.0 { 0.4 } else { 0.0 };
+
+        0.30 + 0.45 * reach + 0.35 * gain_norm - skin_pen - backward_pen
+    };
+
+    // ── Build the ACTION REPERTOIRE of world launches. ──────────────────
+    let mut candidates: Vec<Vec3> = Vec::new();
+
+    // Seed 1: the gate closed-form (still a fine candidate — just no longer
+    // the ONLY acceptable throw, and no longer required to be near-exact).
     if dist_to_ring > 6.0 {
-        let gate = solve_gate_throw(
+        if let Some(g) = solve_gate_throw(
             player.p,
-            player.team,
-            state.omega,
+            team,
+            omega,
             throw_speed,
             profile.loop_propensity,
             player.v,
-        );
-        // match.cast is always present in Rust (non-Option) → TS ternaries
-        // collapse to the present-branch.
-        let throws_left = m.cast.throws_left as f64;
-        let at_mouth = m.cast.gate == Gate::Mouth;
-        let threads_well = match &gate {
-            Some(g) => g.arrive_rho <= REG_GATE_RADIUS * 0.6,
-            None => false,
-        };
-        let in_range = dist_to_ring < REG_L * 0.45;
-        let stall_hard = 540.0;
-        let hold_ticks = cache.value.as_ref().unwrap().hold_ticks;
-        let must_shoot = throws_left <= 1.0 || hold_ticks > stall_hard;
-        if let Some(g) = &gate {
-            if (at_mouth && threads_well && in_range) || must_shoot {
-                let dir = perturb_direction(
-                    vnorm(g.throw_vec),
-                    scaling.throw_variance * 0.04,
-                    rng,
-                );
-                let throw_spin = if director.attacking_free {
-                    -(0.3 + profile.loop_propensity * 0.7)
-                } else {
-                    0.2 + (1.0 - profile.free_end_bias) * 0.3
-                };
-                let throw_min = 9.0;
-                let throw_max = 34.0;
-                let charge = ((g.release_speed - throw_min) / (throw_max - throw_min))
-                    .max(0.0)
-                    .min(1.0);
-                let commit = cache.value.as_mut().unwrap();
-                commit.throw_go = true;
-                commit.throw_target_id = None;
-                commit.throw_dir = Some(dir);
-                commit.throw_spin = throw_spin.clamp(-1.0, 1.0);
-                commit.throw_charge = charge;
-                return;
-            }
+        ) {
+            candidates.push(g.v0);
         }
     }
 
-    // ── PRIORITY 1.5: the GATE-CLEARING pass (the played-offense engine). ─────
-    // If our designated gate receiver is staged PAST the next cast gate and
-    // the carrier has driven up close enough that a lead pass will land past
-    // the gate line, throw it to them on a committed route. The completed
-    // catch spends the throw with the bell past the gate ⇒ the match SM
-    // advances the cast (gateClears > 0 via real play, not pinball).
-    if let Some(grid) = director.gate_receiver_id.as_deref() {
-        if grid != player.id {
-            if let Some(gr) = teammates.iter().find(|p| p.id == grid) {
-                let sgn = director.attack_sign;
-                let gate_x = director.gate_stage_x - sgn * 22.0; // the line itself
-                let recv_past = forward_progress(player.team, gr.p.x)
-                    > forward_progress(player.team, gate_x) - 4.0;
-                // Carrier must be within striking range of the gate so the
-                // throw clears it (don't fling from the back field).
-                let carrier_fp = forward_progress(player.team, player.p.x);
-                let gate_fp = forward_progress(player.team, gate_x);
-                let close_to_gate = gate_fp - carrier_fp < 130.0;
-                if recv_past && close_to_gate {
-                    if let Some(lead) = solve_lead_velocity(
-                        player.p, throw_speed, gr.p, gr.v, state.omega,
-                    ) {
-                        // Only commit if the intercept itself clears the gate.
-                        let intc_fp = forward_progress(player.team, lead.intercept.x);
-                        if intc_fp > gate_fp - 2.0 {
-                            let noisy = perturb_direction(
-                                vnorm(lead.v0),
-                                scaling.throw_variance * 0.5,
-                                rng,
-                            );
-                            let throw_spin = if director.attacking_free {
-                                -(0.3 + profile.loop_propensity * 0.7)
-                            } else {
-                                0.2 + (1.0 - profile.free_end_bias) * 0.3
-                            };
-                            let charge = (0.55 + rng.next() * 0.25).min(1.0);
-                            let commit = cache.value.as_mut().unwrap();
-                            commit.throw_go = true;
-                            commit.throw_target_id = Some(grid.to_string());
-                            commit.throw_dir = Some(noisy);
-                            commit.throw_spin = throw_spin.clamp(-1.0, 1.0);
-                            commit.throw_charge = charge;
-                            return;
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // ── PRIORITY 2: a ground-gaining pass to an OPEN, ADVANCING receiver. ─────
-    let mut best_score = f64::NEG_INFINITY;
-    let mut best_tm: Option<&PlayerSim> = None;
-    let mut best_v0: Option<Vec3> = None;
-    let mut held_score = f64::NEG_INFINITY;
-
-    let committed_target = cache.value.as_ref().unwrap().throw_target_id.clone();
-
-    for tm in &teammates {
+    // Seed 2: a lead pass to each teammate's predicted position (forward
+    // ones first — we want to advance). These are seeds, not the answer.
+    for tm in teammates.iter() {
+        // miss_open_chance: SAME draw the frozen spec made per teammate.
         if rng.next() < scaling.miss_open_chance {
             continue;
         }
-
-        let lead =
-            solve_lead_velocity(player.p, throw_speed, tm.p, tm.v, state.omega);
-        let lead = match lead {
-            Some(l) => l,
-            None => continue,
-        };
-
-        let gain = forward_progress(player.team, lead.intercept.x)
-            - forward_progress(player.team, player.p.x);
-
-        let openness = estimate_openness(player, tm, &opponents);
-
-        let candidate = ThrowCandidate {
-            receiver: (*tm).clone(),
-            aim_pos: lead.intercept,
-            flight_time: lead.flight_time,
-            openness,
-            receiver_radius: axis_radius(tm.p),
-        };
-
-        let noise = (rng.next() - 0.5) * (1.0 - scaling.read_quality) * 0.3;
-        let result = score_throw(player, candidate, m, *profile, noise);
-
-        let gain_norm = (gain / 90.0).max(-1.0).min(1.5);
-        let rcv_r = axis_radius(tm.p);
-        let radius_penalty = ((rcv_r - 16.0) / REG_R).max(0.0) * 0.6;
-        let score = result.score + gain_norm * 0.35 - radius_penalty;
-
-        if committed_target.as_deref() == Some(tm.id.as_str()) {
-            held_score = score;
-        }
-
-        if score > best_score {
-            best_score = score;
-            best_tm = Some(*tm);
-            best_v0 = Some(lead.v0);
+        if let Some(lead) =
+            solve_lead_velocity(player.p, throw_speed, tm.p, tm.v, omega)
+        {
+            candidates.push(lead.v0);
         }
     }
 
-    // Hysteresis: keep the committed target unless clearly beaten.
-    let switch_margin = 0.12;
-    if let Some(ct) = &committed_target {
-        if held_score > f64::NEG_INFINITY {
-            if let Some(bt) = best_tm {
-                if bt.id != *ct && best_score < held_score + switch_margin {
-                    if let Some(held) =
-                        teammates.iter().find(|p| p.id == *ct).copied()
-                    {
-                        if let Some(lead) = solve_lead_velocity(
-                            player.p,
-                            throw_speed,
-                            held.p,
-                            held.v,
-                            state.omega,
-                        ) {
-                            best_tm = Some(held);
-                            best_v0 = Some(lead.v0);
-                            best_score = held_score;
-                        }
-                    }
-                }
+    // Seed 3: a coarse world-direction FAN biased down the attack axis, at
+    // a few speeds. This is the part that makes them throw OFTEN: even with
+    // no clean solver hit there is almost always a forward fling that
+    // advances the bell within the wide good-enough band.
+    {
+        let base = Vec3::new(sgn, 0.0, 0.0);
+        let yz: [(f64, f64); 5] =
+            [(0.0, 0.0), (0.5, 0.0), (-0.5, 0.0), (0.0, 0.5), (0.0, -0.5)];
+        let speeds = [throw_min + 4.0, throw_speed, throw_max - 4.0];
+        for &(dy, dz) in yz.iter() {
+            let dir = vnorm(Vec3::new(base.x, base.y + dy, base.z + dz));
+            for &sp in speeds.iter() {
+                candidates.push(vscale(dir, sp));
             }
         }
     }
 
-    // Decide WHETHER to pass at all.
-    let mut best_gain = f64::NEG_INFINITY;
-    if let Some(bt) = best_tm {
-        best_gain = forward_progress(player.team, bt.p.x)
-            - forward_progress(player.team, player.p.x);
+    // ── W-MAXING SELECTION: among FIT candidates, pick the WEAKEST =
+    // the one with the LARGEST TOLERANCE BAND (success-set under release
+    // error). We perturb each fit launch by a fixed fan of aim errors and
+    // count how many perturbations still clear good-enough. The throw that
+    // survives the most error is the least committal / most robust. ──────
+    let err_fan: [(f64, f64); 9] = [
+        (0.0, 0.0),
+        (1.0, 0.0),
+        (-1.0, 0.0),
+        (0.0, 1.0),
+        (0.0, -1.0),
+        (0.7, 0.7),
+        (0.7, -0.7),
+        (-0.7, 0.7),
+        (-0.7, -0.7),
+    ];
+    // Perturbation magnitude scaled to the difficulty's own throw variance
+    // band so "robust" means robust to THIS rigger's real error.
+    let err_mag = (3.0 + scaling.throw_variance * 60.0).max(2.0);
+
+    let mut best_v0: Option<Vec3> = None;
+    let mut best_band: f64 = -1.0;
+    let mut best_center_q: f64 = 0.0;
+
+    for &v0 in candidates.iter() {
+        let sp = vlen(v0);
+        if !(throw_min..=throw_max + 8.0).contains(&sp) || sp < 1e-3 {
+            continue;
+        }
+        let center_q = eval_launch(v0);
+        if center_q < good_enough {
+            continue; // not FIT — its predicted outcome isn't good-enough.
+        }
+        // Tolerance band = fraction of the perturbed fan still good-enough.
+        let unit = vscale(v0, 1.0 / sp);
+        // Build two world axes perpendicular to the launch for the error
+        // fan (deterministic basis: cross with x then with y as fallback).
+        let mut a = Vec3::new(0.0, 1.0, 0.0);
+        if unit.y.abs() > 0.9 {
+            a = Vec3::new(1.0, 0.0, 0.0);
+        }
+        let e1 = vnorm(Vec3::new(
+            unit.y * a.z - unit.z * a.y,
+            unit.z * a.x - unit.x * a.z,
+            unit.x * a.y - unit.y * a.x,
+        ));
+        let e2 = vnorm(Vec3::new(
+            unit.y * e1.z - unit.z * e1.y,
+            unit.z * e1.x - unit.x * e1.z,
+            unit.x * e1.y - unit.y * e1.x,
+        ));
+        let mut hits = 0.0_f64;
+        for &(c1, c2) in err_fan.iter() {
+            let perturbed = vadd(
+                v0,
+                vadd(vscale(e1, c1 * err_mag), vscale(e2, c2 * err_mag)),
+            );
+            if eval_launch(perturbed) >= good_enough {
+                hits += 1.0;
+            }
+        }
+        let band = hits / err_fan.len() as f64;
+        // Weakest sufficient: maximize the tolerance band; break ties by
+        // center quality so among equally-robust throws we take the better.
+        if band > best_band + 1e-9
+            || (band > best_band - 1e-9 && center_q > best_center_q + 1e-9)
+        {
+            best_band = band;
+            best_center_q = center_q;
+            best_v0 = Some(v0);
+        }
     }
 
-    let opp = nearest_opponent_dist(player, &opponents);
-    let pressured = opp < 14.0;
+    // ── Decide WHETHER to throw at all. With a wide good-enough band the
+    // common case is "yes" (that is the point — they should throw often).
+    // Stall pressure only ever LOOSENS this further. ────────────────────
     let stall = cache.value.as_ref().unwrap().hold_ticks;
-    let stall_hard2 = 540.0;
-    let ease = ((stall - 240.0) / 300.0).max(0.0).min(1.0);
-    let pass_gains_ground = best_gain > 8.0 - ease * 24.0;
-    let safe_outlet = best_score > 0.15 - ease * 0.25 && best_gain > -25.0 - ease * 30.0;
-    let force_release = stall > stall_hard2 && best_tm.is_some() && best_v0.is_some();
-    let acceptable = best_tm.is_some()
-        && best_v0.is_some()
-        && (force_release
-            || (best_score > -0.02 - ease * 0.35
-                && (pass_gains_ground || (pressured && safe_outlet))));
+    let pressured = nearest_opponent_dist(player, &opponents) < 14.0;
+    let force = stall > 540.0 || m.cast.throws_left as f64 <= 1.0;
 
-    if !acceptable {
+    let chosen = match best_v0 {
+        Some(v) => v,
+        None => {
+            // No fit candidate. If we're forced (stall/last throw) fling the
+            // most-forward seed anyway — a weak, robust release beats a dead
+            // stuck carrier. Otherwise hold and keep carrying.
+            if force {
+                vscale(Vec3::new(sgn, 0.0, 0.0), throw_speed)
+            } else {
+                let commit = cache.value.as_mut().unwrap();
+                commit.throw_go = false;
+                commit.throw_target_id = None;
+                commit.throw_dir = None;
+                return;
+            }
+        }
+    };
+
+    // Acceptance: throw if we found a fit candidate, or if pressured/forced
+    // (a robust outlet under pressure beats holding into a strip).
+    let have_fit = best_v0.is_some();
+    if !have_fit && !force && !pressured {
         let commit = cache.value.as_mut().unwrap();
         commit.throw_go = false;
         commit.throw_target_id = None;
@@ -1115,19 +1261,52 @@ fn decide_throw(
         return;
     }
 
-    let noisy_dir =
-        perturb_direction(vnorm(best_v0.unwrap()), scaling.throw_variance, rng);
+    // Convert world launch → the throw the player imparts (sim adds v).
+    let throw_vec = vsub(chosen, player.v);
+    let rel_speed = vlen(throw_vec).clamp(throw_min, throw_max);
+    let aim_dir = if vlen(throw_vec) > 1e-6 {
+        vnorm(throw_vec)
+    } else {
+        Vec3::new(sgn, 0.0, 0.0)
+    };
+    // SAME difficulty perturbation the frozen spec applied to a thrown dir.
+    let noisy_dir = perturb_direction(aim_dir, scaling.throw_variance, rng);
+
     let throw_spin = if director.attacking_free {
         -(0.3 + profile.loop_propensity * 0.7)
     } else {
         0.2 + (1.0 - profile.free_end_bias) * 0.3
     };
-    let bt_id = best_tm.unwrap().id.clone();
-    let charge = (0.7 + rng.next() * 0.3).min(1.0);
+    let charge = ((rel_speed - throw_min) / (throw_max - throw_min))
+        .clamp(0.0, 1.0)
+        // SAME charge jitter draw shape the frozen spec made.
+        + (rng.next() - 0.5) * 0.04 * scaling.throw_variance;
+    let charge = charge.clamp(0.0, 1.0);
+
+    // If a teammate is the natural target of this launch, name them so the
+    // sim widens their catch envelope (committed-catch / gate-clear path).
+    let mut tgt_id: Option<String> = None;
+    {
+        let st = efe::roll_forward(player.p, chosen, omega, 1.6, skin_r);
+        let mut best_d = 34.0_f64;
+        for tm in teammates.iter() {
+            let (i, _) = tm_future
+                .iter()
+                .find(|(i, _)| *i < teammates.len() && teammates[*i].id == tm.id)
+                .copied()
+                .unwrap_or((usize::MAX, Vec3::new(0.0, 0.0, 0.0)));
+            let tp = if i != usize::MAX { tm_future[i].1 } else { tm.p };
+            let d = (st.p.x - tp.x).hypot(st.p.y - tp.y).hypot(st.p.z - tp.z);
+            if d < best_d {
+                best_d = d;
+                tgt_id = Some(tm.id.clone());
+            }
+        }
+    }
 
     let commit = cache.value.as_mut().unwrap();
     commit.throw_go = true;
-    commit.throw_target_id = Some(bt_id);
+    commit.throw_target_id = tgt_id;
     commit.throw_dir = Some(noisy_dir);
     commit.throw_spin = throw_spin.clamp(-1.0, 1.0);
     commit.throw_charge = charge;
@@ -1149,7 +1328,7 @@ fn nearest_opponent_dist(player: &PlayerSim, opponents: &[&PlayerSim]) -> f64 {
 mod tests {
     use super::*;
     use crate::ai::profile::style_to_profile;
-    use crate::ai::types::{BellState, Cast, MatchPhase, TeamSide};
+    use crate::ai::types::{BellState, Cast, Gate, MatchPhase, TeamSide};
     use crate::math::Quat;
     use std::collections::HashMap;
 

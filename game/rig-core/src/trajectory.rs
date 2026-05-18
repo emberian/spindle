@@ -12,7 +12,7 @@ pub fn accel(p: Vec3, v: Vec3, omega: f64) -> Vec3 {
     )
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub struct PointState {
     pub p: Vec3,
     pub v: Vec3,
