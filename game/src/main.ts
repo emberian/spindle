@@ -10,6 +10,7 @@ import { Calm } from './render/Calm';
 import { BellTrail, bellGlow } from './render/BellTrail';
 import { PostFX } from './render/PostFX';
 import { GameCamera } from './render/Camera';
+import { initDebugViz, debugViz } from './render/DebugViz';
 import { Riggers } from './render/Rigger';
 import { RigLines } from './render/RigLine';
 import { AudioEngine } from './audio/AudioEngine';
@@ -37,6 +38,11 @@ import type { InputFrame, TeamSide, RiggerRole } from './sim/types';
 
 const app = document.getElementById('app')!;
 document.getElementById('boot')?.remove();
+
+// Single debug/viz toggle (backtick key). Defaults OFF — all rich
+// developer-only telemetry below (window.__rigai / __rigp) is constructed
+// lazily and ONLY when this is on, so it costs nothing in normal play.
+initDebugViz(app);
 
 const renderer = new THREE.WebGLRenderer({ antialias: true });
 renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
@@ -367,19 +373,22 @@ async function runMatch(
         setCastPrompt('none');
         showArc(null);
       }
-      // Diagnostic hook (cheap; lets a harness observe the HUMAN-play path:
-      // can P1 actually move, what is the camera framing, is input live).
-      const _iv = input.view;
-      (window as unknown as { __rigp?: unknown }).__rigp = {
-        tick: s.tick,
-        p1: p1r ? { x: p1r.p.x, y: p1r.p.y, z: p1r.p.z } : null,
-        p1v: p1r ? Math.hypot(p1r.v.x, p1r.v.y, p1r.v.z) : 0,
-        p1held: s.bell.heldBy === 'P1',
-        bx: s.bell.p.x, bheld: s.bell.heldBy,
-        cam: { x: camera.position.x, y: camera.position.y, z: camera.position.z },
-        reticle: _iv.reticleState, locked: _iv.pointerLocked, charge: _iv.chargeLevel,
-        phase: match.state.phase, sh: match.state.scoreHome, sa: match.state.scoreAway,
-      };
+      // Rich human-play diagnostic — gated behind the single debugViz flag.
+      // Lazily built ONLY when debug viz is on (zero per-frame object/field
+      // churn in normal play; the old code allocated this every frame).
+      if (debugViz()) {
+        const _iv = input.view;
+        (window as unknown as { __rigp?: unknown }).__rigp = {
+          tick: s.tick,
+          p1: p1r ? { x: p1r.p.x, y: p1r.p.y, z: p1r.p.z } : null,
+          p1v: p1r ? Math.hypot(p1r.v.x, p1r.v.y, p1r.v.z) : 0,
+          p1held: s.bell.heldBy === 'P1',
+          bx: s.bell.p.x, bheld: s.bell.heldBy,
+          cam: { x: camera.position.x, y: camera.position.y, z: camera.position.z },
+          reticle: _iv.reticleState, locked: _iv.pointerLocked, charge: _iv.chargeLevel,
+          phase: match.state.phase, sh: match.state.scoreHome, sa: match.state.scoreAway,
+        };
+      }
 
       if (!ended && match.state.winner !== null) {
         ended = true;
@@ -542,6 +551,10 @@ async function runWatch(
     if (match.state.winner !== null) return;
     const snap = sim.snapshot();
     const aiFrame = ai.tick(snap, match.state as never, cfgs, gameSeed);
+    // Rich AI telemetry bookkeeping — pure debug, feeds only window.__rigai.
+    // Gated behind the single debugViz flag so it is genuinely zero-cost
+    // (no snapshot capture, no per-player scans) in normal spectate play.
+    if (debugViz()) {
     dbgSnap = snap; dbgAi = aiFrame;
     dbgTotalTicks++;
     if (snap.bell.heldBy) dbgHeldTicks++;
@@ -578,6 +591,7 @@ async function runWatch(
         }
       });
     }
+    } // end debugViz() bookkeeping
     const frame: InputFrame = { tick: snap.tick, players: aiFrame.players };
     rec.push(frame);
     const evs = sim.step(frame);
@@ -641,8 +655,10 @@ async function runWatch(
         gate: match.state.cast.gate, throwsLeft: match.state.cast.throwsLeft,
         msg: match.state.message,
       };
-      // Per-player AI telemetry: are they MOVING, GRAPPLING, ACTING?
-      if (dbgSnap && dbgAi) {
+      // Rich per-player AI telemetry — gated behind the single debugViz
+      // flag. Built lazily and ONLY when debug viz is on: the per-frame
+      // object + per-player .map() allocation is zero cost in normal play.
+      if (debugViz() && dbgSnap && dbgAi) {
         const bp = dbgSnap.bell.p;
         (window as unknown as { __rigai?: unknown }).__rigai = {
           tick: dbgSnap.tick,
