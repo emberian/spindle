@@ -426,26 +426,33 @@ describe('GrapplePlanner: reachability', () => {
     // If plan is null, that's also fine (already close enough or no valid option).
   });
 
-  it('spar anchor positions are on the spin axis (y≈0, z≈0)', () => {
+  it('spar lattice = axis spine PLUS the off-axis clip ring (#3)', () => {
+    // #3: spars are no longer axis-only. The canon axis spine (y≈z≈0) AND
+    // an off-axis lattice (16 rings × 3) at radius R·0.62, mirroring
+    // render/Calm.ts makeSpars(), so the AI hooks the clip-points the
+    // player sees — the affordance that makes high radius reachable.
     const spars = sparPositions();
-    expect(spars.length).toBeGreaterThan(0);
-    for (const spar of spars) {
-      expect(Math.abs(spar.y)).toBeLessThan(1e-9);
-      expect(Math.abs(spar.z)).toBeLessThan(1e-9);
-    }
+    const R062 = REG.R * 0.62;
+    const axis = spars.filter(
+      (s) => Math.abs(s.y) < 1e-9 && Math.abs(s.z) < 1e-9,
+    );
+    const offAxis = spars.filter(
+      (s) => Math.abs(Math.sqrt(s.y * s.y + s.z * s.z) - R062) < 1e-6,
+    );
+    expect(axis.length).toBeGreaterThan(0);
+    expect(offAxis.length).toBe(16 * 3);
+    expect(spars.length).toBe(axis.length + offAxis.length);
   });
 
   it('plan with spar anchor uses a spar (isSpar=true)', () => {
-    // Player in free space, near axis — should prefer a spar.
+    // Near-axis player, on-axis target down-field — planner picks a spar
+    // to swing/route toward it.
     const player = makePlayer('p1', 'home', 'spinner', -50, 5, 0);
     const target = { x: 100, y: 0, z: 0 };
     const sim = makeSimState([player], 0);
     const plan = planGrapple(player, target, sim);
     expect(plan).not.toBeNull();
-    // The planner should find a spar (they are on the axis at y=0, z=0).
-    // Verify: anchor is close to axis.
-    const anchorRadius = Math.sqrt(plan!.anchorPos.y ** 2 + plan!.anchorPos.z ** 2);
-    expect(anchorRadius).toBeLessThan(1); // spars are at y=0, z=0
+    expect(plan!.isSpar).toBe(true); // the contract: a spar is chosen
   });
 });
 
