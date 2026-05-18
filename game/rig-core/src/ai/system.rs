@@ -15,7 +15,7 @@ use super::decision_types::{
 use super::director::run_director;
 use super::rigger_ai::compute_player_input;
 use super::rng::AiRng;
-use super::types::{InputFrame, MatchState, SimState};
+use super::types::{InputFrame, MatchState, SimState, TeamSide};
 use std::collections::HashMap;
 
 /// Director cache: one per team side (index.ts DirectorCache).
@@ -24,10 +24,33 @@ struct DirectorCache {
     last_updated_tick: f64,
 }
 
+/// Side discriminant used as part of cache keys. Mirrors the two
+/// `TeamSide` variants 1:1 (Home→0, Away→1) so cache identity is
+/// exactly what `format!("{:?}", side)` produced before, only without
+/// the per-tick String allocation.
+#[inline]
+fn side_tag(side: TeamSide) -> u8 {
+    match side {
+        TeamSide::Home => 0,
+        TeamSide::Away => 1,
+    }
+}
+
+/// Stable per-player commitment key. Replaces the per-tick
+/// `format!("{:?}-{}-{}", side, ci, id)` String allocation with a tuple
+/// that hashes/compares to the exact same logical identity, so which
+/// cache entry maps where is byte-for-byte unchanged.
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct CommitKey {
+    side: u8,
+    ci: usize,
+    player_id: String,
+}
+
 #[derive(Default)]
 pub struct AiSystem {
-    director_caches: HashMap<String, DirectorCache>,
-    commit_cache: HashMap<String, PlayerCommitCache>,
+    director_caches: HashMap<(u8, usize), DirectorCache>,
+    commit_cache: HashMap<CommitKey, PlayerCommitCache>,
 }
 
 impl AiSystem {
@@ -63,8 +86,8 @@ impl AiSystem {
             }
 
             // Director: update at ~2 Hz.
-            let cache_key = format!("{:?}-{}", cfg.side, ci);
-            let needs_director_update = match self.director_caches.get(&cache_key) {
+            let dir_key = (side_tag(cfg.side), ci);
+            let needs_director_update = match self.director_caches.get(&dir_key) {
                 None => true,
                 Some(dc) => tick - dc.last_updated_tick >= DIRECTOR_TICK_INTERVAL,
             };
@@ -78,7 +101,7 @@ impl AiSystem {
                     &mut dir_rng,
                 );
                 self.director_caches.insert(
-                    cache_key.clone(),
+                    dir_key,
                     DirectorCache {
                         state: new_state,
                         last_updated_tick: tick,
@@ -86,9 +109,12 @@ impl AiSystem {
                 );
             }
             let director_refreshed = needs_director_update;
-            // Clone the cached director plan for this window (the borrow
-            // checker can't hold &director_caches while &mut commit_cache).
-            let director = self.director_caches[&cache_key].state.clone();
+            // Borrow the cached director plan in-place. `director_caches`
+            // and `commit_cache` are disjoint fields, so an immutable
+            // borrow of the former coexists with the &mut entry borrow of
+            // the latter — no per-tick DirectorState clone needed.
+            let director = &self.director_caches[&dir_key].state;
+            let commit_cache = &mut self.commit_cache;
 
             for (pi, &p_idx) in team_players.iter().enumerate() {
                 let player = &sim_state.players[p_idx];
@@ -96,10 +122,12 @@ impl AiSystem {
                 let mut player_rng =
                     AiRng::make(seed, tick_u, (ci as u32) * 100 + pi as u32);
 
-                let commit_key =
-                    format!("{:?}-{}-{}", cfg.side, ci, player.id);
-                let commit = self
-                    .commit_cache
+                let commit_key = CommitKey {
+                    side: side_tag(cfg.side),
+                    ci,
+                    player_id: player.id.clone(),
+                };
+                let commit = commit_cache
                     .entry(commit_key)
                     .or_insert_with(|| PlayerCommitCache {
                         value: None,
@@ -111,7 +139,7 @@ impl AiSystem {
                     sim_state,
                     match_state,
                     &cfg.profile,
-                    &director,
+                    director,
                     cfg.difficulty,
                     &mut player_rng,
                     commit,
