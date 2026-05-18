@@ -21,7 +21,7 @@ use crate::tuning::{LINE_C, LINE_K, LINE_SLACK_BAND, LINE_SLACK_K};
 // ── public constants ──────────────────────────────────────────────────────────
 
 pub const TETHER_MIN: f64 = 3.0;
-pub const TETHER_MAX: f64 = 60.0;
+pub const TETHER_MAX: f64 = 70.0;
 pub const REEL_RATE: f64 = 14.0; // m/s of rope-length change
 
 // ── public types ─────────────────────────────────────────────────────────────
@@ -40,11 +40,18 @@ pub struct Body {
 /// When `anchor` passed to [`resolve_line`] is `Some(b)` the anchor is the
 /// moving player body `b`; `anchor_pos` is then unused.  When `anchor` is
 /// `None` the anchor is the static world point `anchor_pos`.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Line {
     pub anchor_pos: Vec3, // world-space anchor used for a static attachment
     pub rest_len: f64,
     pub taut: bool,
+    /// Identity of the player this line is bound to, if it was fired at a
+    /// player body (teammate OR opponent) within bind range. `None` ⇒ a
+    /// static world anchor (spar / skin / ring) at `anchor_pos` exactly as
+    /// before. When `Some(id)`, `sim_world::step` resolves that player's
+    /// CURRENT body each tick and passes it as the moving anchor so the
+    /// constraint is momentum-conserving (equal-and-opposite).
+    pub anchor_player: Option<String>,
 }
 
 // ── constraint solver ─────────────────────────────────────────────────────────
@@ -165,6 +172,7 @@ mod tests {
             anchor_pos: Vec3::new(0.0, 0.0, 0.0),
             rest_len: 20.0,
             taut: false,
+            anchor_player: None,
         };
         let v0 = p.v;
         resolve_line(&mut p, &mut line, None, 0, H);
@@ -186,6 +194,7 @@ mod tests {
             anchor_pos: Vec3::new(0.0, 0.0, 0.0),
             rest_len: 10.0,
             taut: false,
+            anchor_player: None,
         };
         resolve_line(&mut p, &mut line, None, 0, H);
         // Radial spring force is inward (−x) ⇒ outward speed must drop.
@@ -212,6 +221,7 @@ mod tests {
             anchor_pos: Vec3::new(0.0, 0.0, 0.0),
             rest_len: 10.0,
             taut: false,
+            anchor_player: None,
         };
         resolve_line(&mut p, &mut line, None, 0, H);
         // Pre-tension pulls gently inward (−x); never pushes outward (+x).
@@ -237,6 +247,7 @@ mod tests {
             anchor_pos: Vec3::new(0.0, 0.0, 0.0),
             rest_len: 12.0,
             taut: false,
+            anchor_player: None,
         };
 
         let m_a = 80.0_f64;
@@ -255,6 +266,73 @@ mod tests {
         assert!(p.v.x < 9.0, "player should decelerate outward");
     }
 
+    /// BLOCKER 1: a player-bound line must constrain AND conserve momentum
+    /// against a MOVING anchor (not just a momentarily-still one). Total
+    /// linear momentum is invariant under the equal-and-opposite spring,
+    /// the taut line actively pulls the two bodies together (separating
+    /// radial speed drops), and the moving anchor genuinely feels the
+    /// reaction.
+    #[test]
+    fn player_player_conserves_momentum_moving_anchor() {
+        // Anchor is itself moving (a teammate drifting on +x with some
+        // tangential y) while the rigger swings outbound on it.
+        let mut anchor_body = Body {
+            p: Vec3::new(2.0, 1.0, 0.0),
+            v: Vec3::new(3.5, -1.0, 0.0),
+            inv_mass: 1.0 / 80.0,
+        };
+        let mut p = Body {
+            p: Vec3::new(15.0, 0.0, 0.0),
+            v: Vec3::new(7.0, 2.0, 0.0),
+            inv_mass: 1.0 / 75.0,
+        };
+        let mut line = Line {
+            anchor_pos: Vec3::new(999.0, 999.0, 999.0), // must be IGNORED
+            rest_len: 11.0,
+            taut: false,
+            anchor_player: Some("teammate".into()),
+        };
+
+        let m_a = 80.0_f64;
+        let m_p = 75.0_f64;
+        let mom = |a: &Body, q: &Body| {
+            (
+                m_a * a.v.x + m_p * q.v.x,
+                m_a * a.v.y + m_p * q.v.y,
+            )
+        };
+        let (px0, py0) = mom(&anchor_body, &p);
+
+        // Separating radial speed before the solve (anchor → player).
+        let d0 = p.p.sub(anchor_body.p);
+        let n0 = d0.scale(1.0 / d0.len());
+        let vrad0 = p.v.sub(anchor_body.v).dot(n0);
+
+        // Run several steps so the taut spring actually does work.
+        for _ in 0..40 {
+            resolve_line(&mut p, &mut line, Some(&mut anchor_body), 0, H);
+        }
+
+        let (px1, py1) = mom(&anchor_body, &p);
+        assert!(
+            (px1 - px0).abs() < 1e-6 && (py1 - py0).abs() < 1e-6,
+            "linear momentum not conserved vs moving anchor: Δ = ({}, {})",
+            px1 - px0,
+            py1 - py0
+        );
+
+        let d1 = p.p.sub(anchor_body.p);
+        let n1 = d1.scale(1.0 / d1.len());
+        let vrad1 = p.v.sub(anchor_body.v).dot(n1);
+        assert!(
+            vrad1 < vrad0,
+            "taut line must arrest separation: vrad {} -> {}",
+            vrad0,
+            vrad1
+        );
+        assert!(line.taut, "stretched line must be taut and pulling");
+    }
+
     /// Reel now ONLY eases rest_len toward the target — it never teleports
     /// position and never rescales velocity. (The slingshot is verified to
     /// be EMERGENT via real free-flight integration in player.rs:
@@ -270,6 +348,7 @@ mod tests {
             anchor_pos: Vec3::new(0.0, 0.0, 0.0),
             rest_len: 20.0,
             taut: false,
+            anchor_player: None,
         };
 
         // One reel-in step: rest_len shrinks by exactly REEL_RATE·h.

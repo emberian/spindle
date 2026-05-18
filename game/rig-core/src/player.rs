@@ -144,6 +144,23 @@ fn apply_ramp(ramp: &mut Ramp) -> Vec3 {
 ///   4. Contact stick-spring (if clipped).
 ///   5. Soft grounding — penetration push-out + tangential friction bleed.
 pub fn step_player(pl: &mut PlayerBody, h: f64, reel: i32) {
+    step_player_anchored(pl, h, reel, None)
+}
+
+/// Same as [`step_player`] but with an explicit moving anchor body for a
+/// player↔player line. `anchor` is the CURRENT body of the player this
+/// line was fired at (teammate OR opponent); the rig constraint then
+/// applies an equal-and-opposite impulse to it (momentum-conserving
+/// slingshot / tether). When `anchor` is `None` the line uses its static
+/// world `anchor_pos` exactly as before (byte-identical). The caller
+/// (`sim_world::step`) is responsible for the deterministic disjoint
+/// split-borrow of the stepped player vs. the anchor player.
+pub fn step_player_anchored(
+    pl: &mut PlayerBody,
+    h: f64,
+    reel: i32,
+    mut anchor: Option<&mut Body>,
+) {
     // 1. Eased actuators — deliver the ramped Δv this tick.
     let dv = apply_ramp(&mut pl.pushoff_ramp).add(apply_ramp(&mut pl.thrumbler_ramp));
     pl.v = pl.v.add(dv);
@@ -161,14 +178,21 @@ pub fn step_player(pl: &mut PlayerBody, h: f64, reel: i32) {
         pl.v = next.v;
     }
 
-    // 3. Line constraint (static anchor only — None passed for anchor body).
+    // 3. Line constraint. A static-anchor line passes `None` (byte-identical
+    //    to before). A player-bound line passes the moving anchor body so the
+    //    spring is momentum-conserving (equal-and-opposite recoil on the
+    //    anchor). The anchor body is mutated in place; the caller writes the
+    //    recoil back onto the anchor player after the step.
     if let Some(ref mut line) = pl.line {
         let mut body = Body {
             p: pl.p,
             v: pl.v,
             inv_mass: pl.inv_mass,
         };
-        resolve_line(&mut body, line, None, reel, h);
+        match anchor.as_mut() {
+            Some(a) => resolve_line(&mut body, line, Some(*a), reel, h),
+            None => resolve_line(&mut body, line, None, reel, h),
+        }
         pl.p = body.p;
         pl.v = body.v;
     }
@@ -340,6 +364,7 @@ mod tests {
             anchor_pos: Vec3::new(0.0, 0.0, 0.0),
             rest_len: 20.0,
             taut: false,
+            anchor_player: None,
         });
 
         let mut max_step_jump = 0.0_f64;

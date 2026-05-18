@@ -1895,6 +1895,49 @@ fn route_spars(spars: &[Vec3], adj: &[Vec<usize>], start: usize, goal: usize) ->
     path
 }
 
+/// BLOCKER 2: the skin-anchor candidate predicate + point, factored out so
+/// it is unit-testable independent of the cost sort.
+///
+/// A skin anchor is offered when EITHER:
+///   (a) the rigger can winch INWARD off the wall — the original case
+///       (`!is_too_close_skin && target_radius < player_radius`); the
+///       generated point is along the PLAYER's radial, BYTE-IDENTICAL to
+///       the pre-fix behaviour so the non-skin candidate ordering for
+///       inward cases is unperturbed; OR
+///   (b) the TARGET itself is out in the skin shell (ρ ≥ R − SKIN_BUFFER)
+///       — a loose / dead bell pinned against the hull. This was
+///       previously unreachable (no skin anchor was generated). The point
+///       is projected along the TARGET's radial to R so the anchor sits
+///       adjacent to the wall-bound bell and a winch-out recovery swing
+///       re-engages it. Degenerate on-axis target ⇒ fall back to the
+///       player radial (deterministic, no NaN).
+///
+/// Returns `None` when no skin anchor is useful (caller skips Candidate 2).
+fn skin_anchor(pos: Vec3, target: Vec3) -> Option<Vec3> {
+    let player_radius = (pos.y * pos.y + pos.z * pos.z).sqrt();
+    let is_too_close_skin = player_radius > R - SKIN_BUFFER;
+    let target_radius = (target.y * target.y + target.z * target.z).sqrt();
+
+    let inward_case = !is_too_close_skin && target_radius < player_radius;
+    let target_in_shell = target_radius >= R - SKIN_BUFFER;
+    if !(inward_case || target_in_shell) {
+        return None;
+    }
+
+    // Inward case keeps the player-radial projection (pre-fix identical).
+    let (rad_y, rad_z, rad_len) = if inward_case {
+        (pos.y, pos.z, player_radius)
+    } else {
+        (target.y, target.z, target_radius)
+    };
+    let yz_len = if rad_len > 1e-6 { rad_len } else { 1.0 };
+    Some(Vec3::new(
+        pos.x,
+        (rad_y / yz_len) * R,
+        (rad_z / yz_len) * R,
+    ))
+}
+
 // ── Main planner entry — TS planGrapple (GP.ts:661-910) ──────────────────────
 /// Choose the best grapple anchor to approach `target`. `planner`: 0 = MPC,
 /// 1 = RRT, 2 = CEM. Returns None if already close enough (TS returns null).
@@ -2053,18 +2096,12 @@ pub fn plan_grapple(
         candidates.push((*spar, 0, pd_s, true, c_s));
     }
 
-    // Candidate 2: skin anchor (TS GP.ts:766-782).
-    let player_radius = (pos.y * pos.y + pos.z * pos.z).sqrt();
-    let is_too_close_skin = player_radius > R - SKIN_BUFFER;
-    let target_radius = (target.y * target.y + target.z * target.z).sqrt();
-    let skin_useful = !is_too_close_skin && target_radius < player_radius;
-    if skin_useful {
-        let yz_len = if player_radius > 1e-6 { player_radius } else { 1.0 };
-        let skin_point = Vec3::new(
-            pos.x,
-            (pos.y / yz_len) * R,
-            (pos.z / yz_len) * R,
-        );
+    // Candidate 2: skin anchor (TS GP.ts:766-782). Predicate + point are
+    // factored into `skin_anchor` so the BLOCKER-2 contract is testable
+    // without depending on the cost sort (spars are usually cheaper).
+    let skin_candidate = skin_anchor(pos, target);
+    let skin_useful = skin_candidate.is_some();
+    if let Some(skin_point) = skin_candidate {
         let (pd, c) = score_plan(skin_point, 0);
         candidates.push((skin_point, 0, pd, false, c));
     }
@@ -2332,6 +2369,86 @@ mod tests {
         };
         let state = SimState { omega: OMEGA, tick: 0, players: vec![player.clone()] };
         assert!(plan_grapple(&player, v(1.0, 0.0, 0.0), &state, true, None, 0).is_none());
+    }
+
+    /// BLOCKER 2: a target out in the skin shell (ρ ≥ R − SKIN_BUFFER)
+    /// must now generate a SKIN anchor candidate even though it is NOT a
+    /// pull-inward case (target_radius ≥ player_radius), so a rigger can
+    /// winch out and recover a wall-bound / dead bell. Before the fix
+    /// `skin_useful` was false here and no skin anchor was offered.
+    #[test]
+    fn skin_region_target_yields_skin_anchor() {
+        // Firer mid-tube, modest radius; the OLD predicate
+        // (target_radius < player_radius) is FALSE here because the
+        // target is way out in the shell at ρ ≈ R.
+        let player = PlayerSim {
+            id: "rigger-A".to_string(),
+            team: 0,
+            p: v(0.0, 12.0, 0.0),
+            v: v(0.0, 0.0, 0.0),
+        };
+        let state = SimState {
+            omega: OMEGA,
+            tick: 0,
+            players: vec![player.clone()],
+        };
+        // Dead bell stuck against the skin: ρ = R (≥ R − SKIN_BUFFER),
+        // displaced axially so direct_dist ≥ 3.
+        let target = v(20.0, R, 0.0);
+        let target_r = (target.y * target.y + target.z * target.z).sqrt();
+        assert!(
+            target_r >= R - SKIN_BUFFER && target_r >= player.p.len(),
+            "test setup: target must be in the shell AND not an inward pull"
+        );
+
+        // The skin-anchor CANDIDATE must now be generated for this shell
+        // target (pre-fix: `skin_useful` was false here ⇒ None ⇒ no skin
+        // candidate, so a wall-bound bell was unreachable).
+        let skin = skin_anchor(player.p, target)
+            .expect("shell target must yield a skin anchor candidate");
+        let skin_r = (skin.y * skin.y + skin.z * skin.z).sqrt();
+        assert!(
+            (skin_r - R).abs() < 1e-9,
+            "skin anchor must sit on the hull ρ=R, got ρ={}",
+            skin_r
+        );
+        // Projected along the TARGET's radial ⇒ adjacent to the stuck
+        // bell, so the winch-out recovery swing re-engages it.
+        let tr = (target.y * target.y + target.z * target.z).sqrt();
+        assert!(
+            (skin.y - target.y / tr * R).abs() < 1e-9
+                && (skin.z - target.z / tr * R).abs() < 1e-9
+                && skin.x == player.p.x,
+            "skin point must be on the target's radial at the firer's x"
+        );
+        // Deterministic and reachable (TETHER_MAX now covers axis→skin).
+        assert_eq!(skin, skin_anchor(player.p, target).unwrap());
+        let reach = player.p.sub(skin).len();
+        assert!(
+            reach <= crate::grapple::TETHER_MAX,
+            "skin anchor must be within tether reach ({} > {})",
+            reach,
+            crate::grapple::TETHER_MAX
+        );
+
+        // Pre-fix INWARD case stays byte-identical: a target deeper than
+        // the firer projects along the PLAYER's radial exactly as before.
+        let inward_pos = v(0.0, 30.0, 0.0);
+        let inward_tgt = v(0.0, 5.0, 0.0);
+        let s_in = skin_anchor(inward_pos, inward_tgt).unwrap();
+        assert!(
+            s_in.x == inward_pos.x && (s_in.y - R).abs() < 1e-9 && s_in.z == 0.0,
+            "inward skin anchor must be the unchanged player-radial point"
+        );
+
+        // The end-to-end planner still returns a deterministic finite plan.
+        let plan = plan_grapple(&player, target, &state, false, None, 0)
+            .expect("a shell target must still yield a recovery plan");
+        assert!(plan.anchor_pos.x.is_finite());
+        assert_eq!(
+            plan,
+            plan_grapple(&player, target, &state, false, None, 0).unwrap()
+        );
     }
 
     /// Sticky hysteresis path stays deterministic across planners.
