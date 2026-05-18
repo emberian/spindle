@@ -31,6 +31,11 @@ mod planner;
 mod scoring;
 mod contest;
 mod match_sm;
+// Progressive port increment 3: the AI substrate (coherent dependency
+// root for the src/ai/** port — shared frozen types, bit-exact ai_rng,
+// Orientation, TeamProfile). decide/* + roles/* + RiggerAI/Director/
+// AiSystem land on this in subsequent sub-increments.
+mod ai;
 // Increment 3 (swarm): the deterministic world + the wasm-bindgen facade.
 mod sim_world;
 mod wasm;
