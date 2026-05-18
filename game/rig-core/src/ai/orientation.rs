@@ -56,3 +56,17 @@ pub fn attacking_team(state: &SimState, m: &MatchState) -> TeamSide {
 pub fn forward_progress(team: TeamSide, x: f64) -> f64 {
     attack_sign(team) * x
 }
+
+/// OFFENSE REBUILD — signed world-x of a cast gate for `team` (mirrors
+/// match_sm::gate_x: GATE_ABS = GATE_X·{0.25,0.55,0.85}, signed by attack
+/// direction). The match advances the cast when a throw is SPENT (caught/
+/// bobbled) with the bell at/past this line in the attack direction, so
+/// the AI must drive + complete a pass past it to clear a gate.
+pub fn gate_world_x(team: TeamSide, g: super::types::Gate) -> f64 {
+    let frac = match g {
+        super::types::Gate::First => 0.25,
+        super::types::Gate::Deep => 0.55,
+        super::types::Gate::Mouth => 0.85,
+    };
+    attack_sign(team) * GATE_X * frac
+}

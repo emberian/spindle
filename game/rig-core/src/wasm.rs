@@ -270,6 +270,7 @@ fn parse_player_input(obj: &str) -> Option<PlayerInput> {
         throw_released,
         throw_spin,
         thrumbler,
+        catch_intent: parse_bool(obj, "catchIntent").unwrap_or(false),
     })
 }
 

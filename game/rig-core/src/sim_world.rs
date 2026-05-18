@@ -5,7 +5,10 @@
 //! Events are emitted each step and consumed by the match-rules layer.
 
 use crate::bell::{chime, step_bell, BellBody};
-use crate::collision::{apply_bobble, contest_clatter, skin_bounce, try_catch, CatchResult};
+use crate::collision::{
+    apply_bobble, contest_clatter, skin_bounce, strip_velocity as w_strip_velocity, try_catch_ex,
+    CatchResult, STRIP_RANGE,
+};
 use crate::loop_detector::{LoopTier, LoopTracker};
 use crate::math::{Quat, Vec3};
 use crate::player::{make_player, push_off, step_player, thrumbler, PlayerBody};
@@ -115,6 +118,8 @@ pub struct PlayerInput {
     pub throw_released: bool,
     pub throw_spin: f64,  // [-1,1]
     pub thrumbler: Vec3,  // small delta-v request (capped by budget)
+    /// Committed intended catcher of the live bell — widens catch envelope.
+    pub catch_intent: bool,
 }
 
 /// A complete frame of inputs (one tick from all controlled players).
@@ -202,6 +207,10 @@ pub struct SimWorld {
     pub pass_chain: Vec<String>,
     pub release_pos: Vec3,
     pub release_tick: u64,
+    /// OFFENSE REBUILD: consecutive ticks an opponent has crowded the
+    /// carrier inside STRIP_RANGE (deterministic strip hysteresis — a
+    /// strip is earned by sustained pressure, not an instant brush).
+    strip_press: u32,
     players: Vec<WorldPlayer>,
     loop_tracker: LoopTracker,
     rng: Rng,
@@ -227,6 +236,7 @@ impl SimWorld {
             pass_chain: vec![],
             release_pos: Vec3::new(0.0, 0.0, 0.0),
             release_tick: 0,
+            strip_press: 0,
             players: vec![],
             loop_tracker: LoopTracker::new(),
             rng: Rng::new(seed),
@@ -322,6 +332,14 @@ impl SimWorld {
         }
     }
 
+    fn catch_intent_of(players: &[PlayerInput], id: &str) -> bool {
+        players
+            .iter()
+            .find(|p| p.id == id)
+            .map(|p| p.catch_intent)
+            .unwrap_or(false)
+    }
+
     fn reel_of(players: &[PlayerInput], id: &str) -> i32 {
         players
             .iter()
@@ -379,6 +397,47 @@ impl SimWorld {
                     self.bell.p.y + self.bell.v.y * h,
                     self.bell.p.z + self.bell.v.z * h,
                 );
+
+                // OFFENSE REBUILD — contested possession: a defender who
+                // CROWDS the carrier (inside STRIP_RANGE) for STRIP_PRESS
+                // ticks rips the bell loose. The loose ball is tagged
+                // thrown_by = carrier, so the match layer / skill telemetry
+                // scores the defender's recovery as a real turnover &
+                // intercept (denial > 0; possession is fought for).
+                const STRIP_PRESS: u32 = 26; // ~0.11 s of sustained press
+                let carrier_team = self.players[idx].team;
+                let hp = self.players[idx].body.p;
+                let hv = self.players[idx].body.v;
+                let mut stripper: Option<usize> = None;
+                let mut best_d = STRIP_RANGE;
+                for (j, w) in self.players.iter().enumerate() {
+                    if w.team == carrier_team || w.body.grounded {
+                        continue;
+                    }
+                    let d = w.body.p.sub(hp).len();
+                    if d < best_d {
+                        best_d = d;
+                        stripper = Some(j);
+                    }
+                }
+                if let Some(j) = stripper {
+                    self.strip_press += 1;
+                    if self.strip_press >= STRIP_PRESS {
+                        let dv = w_strip_velocity(hv, self.players[j].body.v);
+                        let carrier_id = holder_id.clone();
+                        // Loose ball tagged thrown_by = carrier: whoever
+                        // recovers it next is scored relative to the
+                        // carrier's team — an opponent recovery is a real
+                        // intercept/turnover (denial), a teammate save
+                        // keeps the cast alive. No Contest phase (the
+                        // headless harness never resolves one).
+                        self.launch_bell(self.bell.p, dv, self.bell.w, Some(&carrier_id));
+                        self.bell_touched = true;
+                        self.strip_press = 0;
+                    }
+                } else {
+                    self.strip_press = 0;
+                }
             }
         } else if !self.bell_dead {
             let prev_x = self.bell.p.x;
@@ -413,7 +472,9 @@ impl SimWorld {
                     }
                 }
 
-                let result = try_catch(bell_p, bell_v, w.body.p, w.body.v, 1.0);
+                let committed = Self::catch_intent_of(&frame.players, &w.id);
+                let result =
+                    try_catch_ex(bell_p, bell_v, w.body.p, w.body.v, 1.0, committed);
                 match result {
                     CatchResult::Caught => {
                         self.bell_held_by = Some(w.id.clone());
@@ -650,6 +711,7 @@ mod tests {
             throw_released: tick == 5,
             throw_spin: 0.2,
             thrumbler: Vec3::new(0.0, 0.0, 0.0),
+            catch_intent: false,
         };
         let a1 = PlayerInput {
             id: "A1".to_string(),

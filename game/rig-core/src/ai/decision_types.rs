@@ -59,6 +59,12 @@ pub struct DirectorState {
     pub assignments: HashMap<String, PlayerAssignment>,
     /// Stable seeded jitter in [-1,1] for the Director window.
     pub style_noise: f64,
+    /// OFFENSE REBUILD — signed world-x just PAST the next cast gate. The
+    /// designated gate receiver stages here so a completed carry→pass
+    /// clears the gate (played progression, not pinball).
+    pub gate_stage_x: f64,
+    /// The receiver running the gate-clearing route this window.
+    pub gate_receiver_id: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]

@@ -349,6 +349,7 @@ mod conv {
                     throw_released: p.throw_released,
                     throw_spin: p.throw_spin,
                     thrumbler: p.thrumbler,
+                    catch_intent: p.catch_intent,
                 })
                 .collect(),
         }

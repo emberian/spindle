@@ -44,9 +44,21 @@ pub enum CatchResult {
     Miss,
 }
 
-/// A catch is physical: in arm's reach, closing, and slow enough relative to
-/// the catcher (skill widens the absorbable speed). Otherwise a bobble
-/// (partial damp + the bell loses trueness — an audible clatter).
+// ── OFFENSE REBUILD: committed-catch envelope ────────────────────────────────
+// The default snare (ARM_REACH/CATCH_SPEED_BASE) is reflex-only — it cannot
+// take a real played pass off a Coriolis bell, which is exactly why
+// possession never formed (heldFrac≈0.01, gateClears=0). A player who has
+// COMMITTED to the catch (carrier's intended receiver, recover pack, or a
+// defender stepping into a pick) reaches and absorbs much more: a real but
+// still skill-gated "tether-claw snare". Minimal + deterministic.
+pub const COMMIT_ARM_REACH: f64 = 7.0; // m — committed snare radius
+pub const COMMIT_CATCH_SPEED: f64 = 38.0; // m/s rel-speed absorbable when committed
+
+/// A catch is physical: in (effective) arm's reach, closing, and slow
+/// enough relative to the catcher. `committed` widens both the reach and
+/// the absorbable relative speed (a real, deliberate two-hand snare) so a
+/// played pass / pick actually completes. Otherwise a bobble (partial damp
+/// + the bell loses trueness — an audible clatter).
 pub fn try_catch(
     bell_pos: Vec3,
     bell_vel: Vec3,
@@ -54,23 +66,63 @@ pub fn try_catch(
     player_vel: Vec3,
     skill: f64,
 ) -> CatchResult {
+    try_catch_ex(bell_pos, bell_vel, player_pos, player_vel, skill, false)
+}
+
+pub fn try_catch_ex(
+    bell_pos: Vec3,
+    bell_vel: Vec3,
+    player_pos: Vec3,
+    player_vel: Vec3,
+    skill: f64,
+    committed: bool,
+) -> CatchResult {
+    let reach = if committed { COMMIT_ARM_REACH } else { ARM_REACH };
+    let absorb = if committed {
+        COMMIT_CATCH_SPEED
+    } else {
+        CATCH_SPEED_BASE
+    } * skill;
     let d = bell_pos.sub(player_pos);
     let gap = d.len();
-    if gap > ARM_REACH {
+    if gap > reach {
         return CatchResult::Miss;
     }
     let rel = bell_vel.sub(player_vel);
     let rel_speed = rel.len();
     // Closing speed: positive means the bell is approaching the player.
     let closing = if gap < 1e-6 { 1.0 } else { -rel.dot(d.norm()) };
-    if closing < -0.5 {
+    // A committed catcher can still claim a bell that is only drifting
+    // slowly away (they reach back for it); reflex catch cannot.
+    let closing_floor = if committed { -3.0 } else { -0.5 };
+    if closing < closing_floor {
         return CatchResult::Miss;
     }
-    if rel_speed <= CATCH_SPEED_BASE * skill {
+    if rel_speed <= absorb {
         CatchResult::Caught
+    } else if committed && rel_speed <= absorb * 1.6 {
+        // Committed but the ball is hot — controlled bobble, not a clean
+        // take, but it still TOUCHES (spends the throw → gate can advance).
+        CatchResult::Bobble
     } else {
         CatchResult::Bobble
     }
+}
+
+/// OFFENSE REBUILD: a defender within strip range of the bell-CARRIER rips
+/// the bell loose. Returns the loose-bell velocity (carrier's velocity plus
+/// a shove along the defender→away direction). Caller emits the turnover /
+/// loose-ball events; this is the only place a held bell is contested, so
+/// possession is genuinely fought for (denial > 0).
+pub const STRIP_RANGE: f64 = 3.4; // m — must crowd the carrier to strip
+
+pub fn strip_velocity(carrier_vel: Vec3, defender_vel: Vec3) -> Vec3 {
+    // Knock it off the carrier's line, biased by the defender's motion.
+    Vec3::new(
+        carrier_vel.x * 0.4 + defender_vel.x * 0.5,
+        carrier_vel.y * 0.4 + defender_vel.y * 0.5 + 1.5,
+        carrier_vel.z * 0.4 + defender_vel.z * 0.5,
+    )
 }
 
 /// Apply a bobble: kill most of the relative velocity (damp to 25%), then

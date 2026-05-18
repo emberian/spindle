@@ -38,7 +38,7 @@
 use super::decision_types::{
     CastPosture, DirectorState, Job, PlayerAssignment, DIRECTOR_TICK_INTERVAL,
 };
-use super::orientation::{attack_ring_x, attack_sign, defend_ring_x};
+use super::orientation::{attack_ring_x, attack_sign, defend_ring_x, gate_world_x};
 use super::profile::TeamProfile;
 use super::rng::AiRng;
 use super::score_ev::{p_fall, p_loop, p_rise};
@@ -614,6 +614,35 @@ pub fn run_director(
         }
     }
 
+    // OFFENSE REBUILD — gate progression target. Stage the gate receiver a
+    // little PAST the next cast-gate line (in attack dir) so a completed
+    // carry→pass spends the throw with the bell past the gate ⇒ the match
+    // clears it. Pick the deepest receiver as the gate runner (the existing
+    // deep-threat slot); fall back to any receiver.
+    let gate_lead = 22.0;
+    let gate_stage_x = gate_world_x(team_side, m.cast.gate) + a_sign * gate_lead;
+    // Deepest Receiver runs the gate route; deterministic id tie-break
+    // (HashMap iteration order is non-deterministic — must not fold over it).
+    let gate_receiver_id = {
+        let mut chosen: Option<String> = None;
+        let mut chosen_depth = f64::NEG_INFINITY;
+        for (id, a) in assignments.iter() {
+            if a.job != Job::Receive
+                || Some(id.as_str()) == loop_setter_id.as_deref()
+            {
+                continue;
+            }
+            if a.depth_slot > chosen_depth + 1e-9
+                || ((a.depth_slot - chosen_depth).abs() <= 1e-9
+                    && chosen.as_deref().map(|c| id.as_str() < c).unwrap_or(true))
+            {
+                chosen_depth = a.depth_slot;
+                chosen = Some(id.clone());
+            }
+        }
+        chosen
+    };
+
     DirectorState {
         attacking_free,
         attack_sign: a_sign,
@@ -631,6 +660,8 @@ pub fn run_director(
         recover_id,
         assignments,
         style_noise,
+        gate_stage_x,
+        gate_receiver_id,
     }
 }
 

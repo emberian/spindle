@@ -114,6 +114,58 @@ fn axis_radius(p: Vec3) -> f64 {
     (p.y * p.y + p.z * p.z).sqrt()
 }
 
+/// OFFENSE REBUILD — commit-to-catch signal. A player commits to taking
+/// the live (loose / in-flight) bell when it is theirs to take: they were
+/// not the last thrower, the bell is reasonably near, and EITHER they are
+/// the directed recover/receiver outlet OR the bell is genuinely closing
+/// on them (a defender stepping into a pass = a played pick). Deterministic
+/// (pure geometry off the committed assignment + bell kinematics).
+fn wants_catch(player: &PlayerSim, state: &SimState, assignment: &PlayerAssignment) -> bool {
+    if state.bell.held_by.is_some() {
+        return false;
+    }
+    if state.bell.thrown_by.as_deref() == Some(player.id.as_str()) {
+        return false;
+    }
+    let to_bell = vsub(state.bell.p, player.p);
+    let gap = vlen(to_bell);
+    if gap > 70.0 {
+        return false;
+    }
+    // Directed outlets always commit (recover pack, staged receiver).
+    if matches!(assignment.job, Job::Recover | Job::Receive | Job::Support) {
+        return true;
+    }
+    // Anyone else commits only if the bell is actually coming at them.
+    let bs = vlen(state.bell.v);
+    if bs < 1e-3 {
+        return gap < 12.0;
+    }
+    let closing = -vdot(state.bell.v, to_bell) / (bs * gap.max(1e-6));
+    closing > 0.2 && gap < 45.0
+}
+
+/// OFFENSE REBUILD — lead-intercept point of the live bell, so a committed
+/// catcher actually navigates onto the ball instead of a static slot.
+/// RK4 + skin-bounce predictor (same model the recover branch uses),
+/// horizon scaled by gap so it stays stable. No rng.
+fn bell_intercept(player: &PlayerSim, state: &SimState) -> Vec3 {
+    let b = &state.bell;
+    let gap = vlen(vsub(b.p, player.p));
+    let close_v = 22.0;
+    let t_lead = (gap / close_v).max(0.1).min(2.5);
+    let mut st = PointState { p: b.p, v: b.v };
+    let h: f64 = 1.0 / 60.0;
+    let mut t_acc = 0.0_f64;
+    while t_acc < t_lead {
+        let step = h.min(t_lead - t_acc);
+        st = rk4_step(st, REG_OMEGA, step);
+        predict_skin_bounce(&mut st);
+        t_acc += step;
+    }
+    st.p
+}
+
 /// estimateOpenness (RiggerAI.ts:192-219).
 fn estimate_openness(thrower: &PlayerSim, receiver: &PlayerSim, opponents: &[&PlayerSim]) -> f64 {
     let mut worst = 1.0_f64;
@@ -391,17 +443,38 @@ pub fn compute_player_input(
                     throw_released: true,
                     throw_spin: commit.throw_spin,
                     thrumbler: v3z(),
+                    catch_intent: false,
                 };
             }
         }
     }
 
+    // OFFENSE REBUILD — committed catch. If the live bell is ours to take,
+    // steer onto its lead-intercept and signal the sim to widen the catch
+    // envelope so a played pass actually completes (and defenders can pick).
+    let cur_assignment: PlayerAssignment = director
+        .assignments
+        .get(&player.id)
+        .cloned()
+        .unwrap_or(PlayerAssignment {
+            job: Job::Support,
+            mark_id: None,
+            depth_slot: 0.4,
+            radius_slot: 0.45,
+            pressure: 0.0,
+        });
+    let catch_intent = wants_catch(player, state, &cur_assignment);
+
     // Otherwise execute committed navigation toward the cached target.
     let (target, aim_dither) = {
         let commit = cache.value.as_ref().unwrap();
-        let target = match commit.nav_target {
-            Some(nt) => vadd(nt, commit.catch_offset),
-            None => player.p,
+        let target = if catch_intent {
+            bell_intercept(player, state)
+        } else {
+            match commit.nav_target {
+                Some(nt) => vadd(nt, commit.catch_offset),
+                None => player.p,
+            }
         };
         (target, commit.aim_dither)
     };
@@ -429,6 +502,7 @@ pub fn compute_player_input(
         throw_released: false,
         throw_spin: 0.0,
         thrumbler,
+        catch_intent,
     }
 }
 
@@ -515,9 +589,15 @@ fn decide_nav_target(
             predict_skin_bounce(&mut st);
             t_acc += step;
         }
+        // RECOVER-NAV FIX (from exp-catch) — INTERCEPT, don't stern-chase.
+        // The old code tucked 6 m *behind* the predicted bell point along
+        // its velocity — on a ~20 m/s Coriolis bell that is an unwinnable
+        // tail chase (the rigger can never close from behind). Navigate to
+        // the predicted point itself with only a tiny tuck so the rigger
+        // arrives INTO the bell's path and the committed catch can take it.
         let bs = st.v.x.hypot(st.v.y).hypot(st.v.z);
         if bs > 1e-3 {
-            let tuck = 6.0;
+            let tuck = 1.5;
             return Vec3::new(
                 st.p.x - (st.v.x / bs) * tuck,
                 st.p.y - (st.v.y / bs) * tuck,
@@ -628,6 +708,20 @@ fn role_target(
             reach_policy(player, state, m, profile, rng, style).target_pos
         }
     };
+
+    // OFFENSE REBUILD — the designated gate receiver stages just PAST the
+    // next cast gate, near the spin axis (low cross-radius) so the carrier
+    // can hit them and the completed pass clears the gate. This is the
+    // played progression route (carry → gate pass → advance).
+    if director.gate_receiver_id.as_deref() == Some(player.id.as_str())
+        && (assignment.job == Job::Receive || assignment.job == Job::Support)
+        && player.role != RiggerRole::Reach
+    {
+        // Hold a shallow on-axis post a touch beyond the gate line.
+        let r = 5.0;
+        let ang = std::f64::consts::PI * (0.5 + director.style_noise * 0.25);
+        return Vec3::new(director.gate_stage_x, r * ang.cos(), r * ang.sin());
+    }
 
     // Offensive receiver: override radius & axial depth from the Director slot.
     if (assignment.job == Job::Receive || assignment.job == Job::Support)
@@ -860,6 +954,56 @@ fn decide_throw(
                 commit.throw_spin = throw_spin.clamp(-1.0, 1.0);
                 commit.throw_charge = charge;
                 return;
+            }
+        }
+    }
+
+    // ── PRIORITY 1.5: the GATE-CLEARING pass (the played-offense engine). ─────
+    // If our designated gate receiver is staged PAST the next cast gate and
+    // the carrier has driven up close enough that a lead pass will land past
+    // the gate line, throw it to them on a committed route. The completed
+    // catch spends the throw with the bell past the gate ⇒ the match SM
+    // advances the cast (gateClears > 0 via real play, not pinball).
+    if let Some(grid) = director.gate_receiver_id.as_deref() {
+        if grid != player.id {
+            if let Some(gr) = teammates.iter().find(|p| p.id == grid) {
+                let sgn = director.attack_sign;
+                let gate_x = director.gate_stage_x - sgn * 22.0; // the line itself
+                let recv_past = forward_progress(player.team, gr.p.x)
+                    > forward_progress(player.team, gate_x) - 4.0;
+                // Carrier must be within striking range of the gate so the
+                // throw clears it (don't fling from the back field).
+                let carrier_fp = forward_progress(player.team, player.p.x);
+                let gate_fp = forward_progress(player.team, gate_x);
+                let close_to_gate = gate_fp - carrier_fp < 130.0;
+                if recv_past && close_to_gate {
+                    if let Some(lead) = solve_lead_velocity(
+                        player.p, throw_speed, gr.p, gr.v, state.omega,
+                    ) {
+                        // Only commit if the intercept itself clears the gate.
+                        let intc_fp = forward_progress(player.team, lead.intercept.x);
+                        if intc_fp > gate_fp - 2.0 {
+                            let noisy = perturb_direction(
+                                vnorm(lead.v0),
+                                scaling.throw_variance * 0.5,
+                                rng,
+                            );
+                            let throw_spin = if director.attacking_free {
+                                -(0.3 + profile.loop_propensity * 0.7)
+                            } else {
+                                0.2 + (1.0 - profile.free_end_bias) * 0.3
+                            };
+                            let charge = (0.55 + rng.next() * 0.25).min(1.0);
+                            let commit = cache.value.as_mut().unwrap();
+                            commit.throw_go = true;
+                            commit.throw_target_id = Some(grid.to_string());
+                            commit.throw_dir = Some(noisy);
+                            commit.throw_spin = throw_spin.clamp(-1.0, 1.0);
+                            commit.throw_charge = charge;
+                            return;
+                        }
+                    }
+                }
             }
         }
     }
@@ -1108,6 +1252,8 @@ mod tests {
             recover_id: None,
             assignments,
             style_noise: 0.3,
+            gate_stage_x: crate::tuning::GATE_X * 0.25,
+            gate_receiver_id: Some("H2".to_string()),
         }
     }
 

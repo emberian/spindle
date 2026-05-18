@@ -152,6 +152,11 @@ pub struct PlayerInput {
     pub throw_released: bool,
     pub throw_spin: f64,
     pub thrumbler: Vec3,
+    /// Offense rebuild: this player is the COMMITTED intended catcher of
+    /// the live bell (the carrier's throw target, or a defender committing
+    /// to a pick). The sim widens the catch envelope for committed catchers
+    /// so a played pass actually completes (gate-clearing offense).
+    pub catch_intent: bool,
 }
 
 impl PlayerInput {
@@ -169,6 +174,7 @@ impl PlayerInput {
             throw_released: false,
             throw_spin: 0.0,
             thrumbler: Vec3 { x: 0.0, y: 0.0, z: 0.0 },
+            catch_intent: false,
         }
     }
 }
