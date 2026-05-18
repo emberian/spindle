@@ -25,6 +25,10 @@ mod analysis;
 // loop that made every TS eval/optimizer intractable). Native speed here
 // unlocks deep MPPI/CEM/RL; parity oracle = the headless TS skill harness.
 mod planner;
+// Stage-1 keystone refactor: the composable CostTerm/Profile cost extraction
+// (pure behavior-preserving; planner.rs routes its cost arithmetic through
+// this). WASM-safe (no rayon/threads) — it is in the production cdylib path.
+mod planner_cost;
 // Progressive port increment 2 (swarm): match logic — 1:1 ports of
 // src/match/{Scoring,Contest,MatchStateMachine}.ts. scoring is the shared
 // base; contest and match_sm depend on it (wired via crate:: paths).
