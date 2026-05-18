@@ -41,6 +41,10 @@ mod ai;
 mod ai_wasm;
 // The native skill-eval harness — the fast measuring instrument for
 // ranking the planner algorithm zoo (replaces the deleted TS headless).
+// NATIVE-ONLY: it uses rayon (gated out of the wasm cdylib in
+// Cargo.toml) and has no place in the browser bundle anyway, so the
+// module itself is excluded from the wasm32 target.
+#[cfg(not(target_arch = "wasm32"))]
 mod skill_eval;
 // Increment 3 (swarm): the deterministic world + the wasm-bindgen facade.
 mod sim_world;

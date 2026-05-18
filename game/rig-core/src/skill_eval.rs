@@ -74,18 +74,30 @@ const CAP: Caps = Caps {
     shot_conv: 0.4,
     chain: 4.0,
 };
-// WT: prog .18, pass .15, intc .08, score .16, poss .07, calm .12,
-//     field .06, shotConv .10, chain .08  (Σ = 1.00)
+// WT (Σ = 1.00). `prog` is PARKED at weight 0: Fix A proved its ~0 is
+// NOT a measurement artifact — the gate-progression mechanic is
+// structurally never exercised in headless AI play (scoring is
+// by-design gate-decoupled; the re-arm resets cast every score/
+// turnover; the AI never pursues gate-climb as strategy). At its old
+// 0.18 it was the LARGEST weight on a signal that is 0 for all 9
+// competent planners and only positive for the worst one (RRT, via
+// thrash-chaos) — i.e. 18% dead/anti-signal. The other 8 weights are
+// the original values renormalised ×1/0.82 (mutual proportions
+// unchanged ⇒ competent-planner ranking and the Coordination
+// production default are provably unaffected; only the dilution and
+// RRT's undeserved bonus are removed). `prog`/`gateClears` are still
+// computed + printed for diagnostics; restore a real `prog` weight
+// when task #36 makes the AI actually pursue gate progression.
 const WT: [(&str, f64); 9] = [
-    ("prog", 0.18),
-    ("pass", 0.15),
-    ("intc", 0.08),
-    ("score", 0.16),
-    ("poss", 0.07),
-    ("calm", 0.12),
-    ("field", 0.06),
-    ("shotConv", 0.10),
-    ("chain", 0.08),
+    ("prog", 0.0),
+    ("pass", 0.15 / 0.82),
+    ("intc", 0.08 / 0.82),
+    ("score", 0.16 / 0.82),
+    ("poss", 0.07 / 0.82),
+    ("calm", 0.12 / 0.82),
+    ("field", 0.06 / 0.82),
+    ("shotConv", 0.10 / 0.82),
+    ("chain", 0.08 / 0.82),
 ];
 
 fn score_pts(k: scoring::ScoreKind) -> f64 {
@@ -418,7 +430,7 @@ fn one_match(
     let mut throws: HashMap<String, f64> = HashMap::new();
     let mut prev_held: Option<String> = None;
     let mut last_thrown_by: Option<String> = None;
-    let mut prev_gate: Option<ai::Gate> = None;
+    let mut prev_gate_ord: Option<i32> = None;
     let mut prev_fire: HashMap<String, Vec3> = HashMap::new();
 
     for _ in 0..max_ticks {
@@ -483,14 +495,6 @@ fn one_match(
         }
         prev_held = b.held_by.clone();
 
-        let g = ai_match.cast.gate;
-        if let Some(pg) = prev_gate {
-            if gate_ord(g) > gate_ord(pg) {
-                gate_clears += 1.0;
-            }
-        }
-        prev_gate = Some(g);
-
         // step the sim, then feed events + post-step state to the match SM.
         let sw_frame = conv::frame_ai_to_sw(&frame);
         let evs = sim.step(&sw_frame, H);
@@ -521,6 +525,25 @@ fn one_match(
             *scores.entry("turnover").or_insert(0.0) += 1.0;
             streak = 0.0;
         }
+
+        // Fix A: count a gate clear AFTER mat.consume() has processed
+        // this tick's events — consume is where cast.gate advances
+        // (on_throw_spent), so the old pre-consume read never observed
+        // a same-tick advance. Read post-consume, before the dead-ball
+        // re-arm; inning/turnover resets are gate DROPS (lower ord) so
+        // they correctly don't count as clears, and each genuine
+        // first→deep / deep→mouth advance is counted exactly once.
+        let g_ord = match mat.state().cast.gate {
+            Gate::First => 0,
+            Gate::Deep => 1,
+            Gate::Mouth => 2,
+        };
+        if let Some(pg) = prev_gate_ord {
+            if g_ord > pg {
+                gate_clears += 1.0;
+            }
+        }
+        prev_gate_ord = Some(g_ord);
 
         // re-arm a dead / inning-break ball (headless).
         if mat.state().winner.is_none() && mat.state().phase != MatchPhase::Live {
