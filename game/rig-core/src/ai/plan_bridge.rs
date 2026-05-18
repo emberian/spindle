@@ -11,7 +11,7 @@
 use super::types::{PlayerSim, SimState, TeamSide};
 use crate::math::Vec3;
 use crate::planner;
-use std::sync::atomic::{AtomicI32, Ordering};
+use std::cell::Cell;
 
 /// Re-export of the planner's `Plan` as the AI-facing `GrapplePlan`
 /// (TS `GrapplePlan`: anchor_pos, reel ∈ {-1,0}, projected_dist, is_spar).
@@ -31,17 +31,25 @@ pub use crate::planner::Plan as GrapplePlan;
 /// in the composed cost terms, which is what Coordination adds. The
 /// in-browser progression gate validates this default behaviorally.
 /// The skill-eval harness still flips this per deterministic run.
-static PLANNER_CLASS: AtomicI32 = AtomicI32::new(9);
+///
+/// Stored THREAD-LOCAL (not a process-global atomic) so the native
+/// parallel skill-eval can run independent matches with different
+/// classes on rayon threads without clobbering each other mid-match.
+/// Production wasm is single-threaded, so the thread-local default
+/// (9 = Coordination) is observationally identical to the old global.
+thread_local! {
+    static PLANNER_CLASS: Cell<i32> = const { Cell::new(9) };
+}
 
 /// Set the active planner class (eval / exploration only). Set before a
-/// run; constant during it.
+/// run; constant during it. Thread-local: affects only the calling thread.
 pub fn set_planner_class(class: i32) {
-    PLANNER_CLASS.store(class, Ordering::Relaxed);
+    PLANNER_CLASS.with(|c| c.set(class));
 }
 
 /// Current planner class (production default 9 = Coordination).
 pub fn planner_class() -> i32 {
-    PLANNER_CLASS.load(Ordering::Relaxed)
+    PLANNER_CLASS.with(|c| c.get())
 }
 
 /// TS `sticky?: { pos; reel: -1|0 }` for the anti-dither hysteresis.

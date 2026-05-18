@@ -592,10 +592,24 @@ fn one_match(
 /// Full skill eval for one planner class, averaged over the matchups.
 /// Native and fast — this is what makes the algorithm zoo rankable.
 pub fn eval_skill(label: &str, planner_class: i32, seed: u32, max_ticks: u64) -> Composite {
-    let mut subs: Vec<HashMap<&str, f64>> = Vec::new();
-    let mut raws: Vec<HashMap<&str, f64>> = Vec::new();
-    for (hs, hc, as_, ac) in MATCHUPS.iter() {
-        let (s, r) = one_match(planner_class, hs, hc, as_, ac, seed, max_ticks);
+    use rayon::prelude::*;
+    // Matches are fully independent (distinct matchup, shared seed/class).
+    // Run them in PARALLEL but collect into a Vec indexed by matchup
+    // position via `into_par_iter().collect()` — this preserves the
+    // serial matchup order EXACTLY, so all downstream float reductions
+    // (the `avg` sums below) happen in fixed match-index order. The
+    // thread-local PLANNER_CLASS (set by `one_match`'s `set_planner_class`)
+    // makes each task self-contained; no global is clobbered.
+    let results: Vec<(HashMap<&str, f64>, HashMap<&str, f64>)> = (0..MATCHUPS.len())
+        .into_par_iter()
+        .map(|i| {
+            let (hs, hc, as_, ac) = MATCHUPS[i];
+            one_match(planner_class, hs, hc, as_, ac, seed, max_ticks)
+        })
+        .collect();
+    let mut subs: Vec<HashMap<&str, f64>> = Vec::with_capacity(results.len());
+    let mut raws: Vec<HashMap<&str, f64>> = Vec::with_capacity(results.len());
+    for (s, r) in results {
         subs.push(s);
         raws.push(r);
     }
@@ -645,6 +659,39 @@ mod tests {
         set_planner_class(0);
     }
 
+    #[test]
+    fn parallel_eval_is_bit_identical_and_stable() {
+        // Determinism proof for the rayon parallelisation: a parallel
+        // `eval_skill` run must equal a SECOND parallel run bit-for-bit
+        // (composite .to_bits() + every part), regardless of thread
+        // scheduling. The fix that makes this hold: PLANNER_CLASS is
+        // thread-local (no cross-thread clobber) and the matchup results
+        // are collected in fixed match-index order (float sums never
+        // reorder). Cheap budget so it stays a CI gate.
+        let a = eval_skill("Coord", 9, 1234, 400);
+        let b = eval_skill("Coord", 9, 1234, 400);
+        assert_eq!(a.composite.to_bits(), b.composite.to_bits());
+        assert!(a.composite.is_finite());
+        assert_eq!(a.parts.len(), b.parts.len());
+        for ((ka, va), (kb, vb)) in a.parts.iter().zip(b.parts.iter()) {
+            assert_eq!(ka, kb);
+            assert_eq!(va.to_bits(), vb.to_bits());
+        }
+        assert_eq!(a.raw.len(), b.raw.len());
+        for ((ka, va), (kb, vb)) in a.raw.iter().zip(b.raw.iter()) {
+            assert_eq!(ka, kb);
+            assert_eq!(va.to_bits(), vb.to_bits());
+        }
+        // Stable across a third run AND across a different class run
+        // interleaved (proves concurrent-different-class safety: the
+        // thread-local means class 0 here cannot poison class 9 above).
+        let c0 = eval_skill("MPC", 0, 1234, 400);
+        let c = eval_skill("Coord", 9, 1234, 400);
+        assert_eq!(a.composite.to_bits(), c.composite.to_bits());
+        assert!(c0.composite.is_finite());
+        set_planner_class(0);
+    }
+
     // On-demand exploration tool, NOT a CI gate (the full 6-class zoo at
     // a real budget is ~155 s — like the old TS headless it must not tax
     // every CI run). Run it deliberately:
@@ -662,19 +709,32 @@ mod tests {
         // tool. We do NOT hard-assert an ordering (that's the
         // explorable part); we DO print parts+raw so the offense
         // signals (gateClears/scorePts/shotConv) are visible.
+        use rayon::prelude::*;
         let budget = 8000;
-        let out = [
-            eval_skill("MPC", 0, 1234, budget),
-            eval_skill("RRT", 1, 1234, budget),
-            eval_skill("CEM", 2, 1234, budget),
-            eval_skill("MPPI", 3, 1234, budget),
-            eval_skill("SA", 4, 1234, budget),
-            eval_skill("Beam", 5, 1234, budget),
-            eval_skill("MCTS", 6, 1234, budget),
-            eval_skill("PotFld", 7, 1234, budget),
-            eval_skill("RandSh", 8, 1234, budget),
-            eval_skill("Coord", 9, 1234, budget),
+        // The 10 classes are independent (thread-local planner class ⇒
+        // `eval_skill` is safe to call concurrently for different classes).
+        // Parallelise across them, but collect indexed so print order is
+        // fixed (class 0..=9). Nested rayon (this par + eval_skill's
+        // matchup par) is fine — rayon's work-stealing pool handles it.
+        let menagerie: [(&str, i32); 10] = [
+            ("MPC", 0),
+            ("RRT", 1),
+            ("CEM", 2),
+            ("MPPI", 3),
+            ("SA", 4),
+            ("Beam", 5),
+            ("MCTS", 6),
+            ("PotFld", 7),
+            ("RandSh", 8),
+            ("Coord", 9),
         ];
+        let out: Vec<Composite> = (0..menagerie.len())
+            .into_par_iter()
+            .map(|i| {
+                let (label, class) = menagerie[i];
+                eval_skill(label, class, 1234, budget)
+            })
+            .collect();
         for r in &out {
             println!(
                 "SKILL {:<4} composite={:>5}  parts={:?}  raw={:?}",

@@ -11,6 +11,12 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 wasm-bindgen = "0.2"
 
+# Native-only: parallelises the skill-eval harness (independent matches)
+# across cores so the GA/learning loop is tractable. Not pulled into the
+# wasm cdylib build path (skill_eval is a native test/tool module).
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+rayon = "1"
+
 [profile.release]
 opt-level = "s"
 lto = true
