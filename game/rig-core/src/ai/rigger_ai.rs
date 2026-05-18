@@ -166,6 +166,131 @@ fn bell_intercept(player: &PlayerSim, state: &SimState) -> Vec3 {
     st.p
 }
 
+/// LOOSE-BELL DECISIVE DIVE — time-to-intercept of the predicted bell band
+/// for an arbitrary world point, assuming a confident closing speed. This is
+/// the SAME canon RK4 + skin-bounce predictor (via `efe::BellBand`) the
+/// recover branch already uses; we only read its `best_intercept_for`
+/// shortfall. Lower = this position genuinely wins the race to the ball.
+/// Pure geometry, deterministic, no rng.
+fn dive_intercept_gap(from: Vec3, from_v: Vec3, state: &SimState) -> f64 {
+    let band =
+        efe::BellBand::predict(state.bell.p, state.bell.v, state.omega, REG_R);
+    // Closing speed credit: a committed powered-hook dive really does close
+    // fast; bias slightly by current inbound velocity so a rigger already
+    // driving at the ball is correctly judged the better racer.
+    let to_b = vsub(state.bell.p, from);
+    let bl = vlen(to_b);
+    let inbound = if bl > 1e-6 {
+        (vdot(from_v, to_b) / bl).max(0.0)
+    } else {
+        0.0
+    };
+    let close_v = 24.0 + inbound.min(14.0);
+    band.expected_response_gap(from, close_v)
+}
+
+/// Is THIS rigger the one (or the designated backup) that should decisively
+/// hard-dive the loose bell? True iff: the bell is loose, ours-to-take
+/// (`wants_catch`), AND either (a) the Director named us the recover lead
+/// (`recover_id`) — the closest — OR (b) among the recover pack we win a
+/// deterministic best-predicted-intercept comparison (id tie-break) as the
+/// single backup. NOT all 8: only the lead + one backup commit; the rest
+/// keep their coverage / mark / receive roles. Deterministic.
+fn is_dive_committer(
+    player: &PlayerSim,
+    state: &SimState,
+    director: &DirectorState,
+    assignment: &PlayerAssignment,
+) -> bool {
+    if state.bell.held_by.is_some() {
+        return false;
+    }
+    if !wants_catch(player, state, assignment) {
+        return false;
+    }
+    // The Director's nearest recover lead always commits.
+    if director.recover_id.as_deref() == Some(player.id.as_str()) {
+        return true;
+    }
+    // Otherwise: at most ONE backup, chosen as the recover-pack member
+    // (other than the lead) with the smallest predicted-intercept gap.
+    // Deterministic: gap compare, id tie-break, recover-job filter.
+    if assignment.job != Job::Recover {
+        return false;
+    }
+    let mut pack: Vec<&PlayerSim> = state
+        .players
+        .iter()
+        .filter(|p| {
+            p.team == player.team
+                && director
+                    .assignments
+                    .get(&p.id)
+                    .map(|a| a.job == Job::Recover)
+                    .unwrap_or(false)
+                && director.recover_id.as_deref() != Some(p.id.as_str())
+        })
+        .collect();
+    if pack.is_empty() {
+        return false;
+    }
+    pack.sort_by(|a, b| {
+        let ga = dive_intercept_gap(a.p, a.v, state);
+        let gb = dive_intercept_gap(b.p, b.v, state);
+        if (ga - gb).abs() > 1e-9 {
+            ga.partial_cmp(&gb).unwrap()
+        } else {
+            a.id.cmp(&b.id)
+        }
+    });
+    pack[0].id == player.id
+}
+
+/// THE DECISIVE POWERED-HOOK DIVE. Fire an anchor positioned BEYOND the
+/// predicted bell intercept along the rigger→intercept axis, then `reel=-1`
+/// so winching in physically drives the rigger THROUGH the ball (a hard
+/// committed dive, not an orbit). Returns the `PartialInput` directly so it
+/// fully DOMINATES the generic nav / coverage / w-max path. Pure geometry +
+/// the canon predictor; deterministic, no rng.
+fn decisive_dive_input(player: &PlayerSim, state: &SimState) -> (PartialInput, Vec3) {
+    let ip = bell_intercept(player, state);
+    let to_ip = vsub(ip, player.p);
+    let d = vlen(to_ip);
+    let dir = if d > 1e-6 {
+        vscale(to_ip, 1.0 / d)
+    } else {
+        // Degenerate (already on it): drive straight at the live bell.
+        let tb = vsub(state.bell.p, player.p);
+        let tl = vlen(tb);
+        if tl > 1e-6 {
+            vscale(tb, 1.0 / tl)
+        } else {
+            Vec3::new(attack_sign(player.team), 0.0, 0.0)
+        }
+    };
+    // Anchor BEYOND the intercept so reeling pulls us onto/through it. Keep
+    // the anchor inside the chamber (clamp cross-radius below the skin) so
+    // the powered hook has real purchase — the planner's own anchors stay
+    // legal; this is the AI-side committed override.
+    let beyond = 14.0_f64;
+    let mut anchor = vadd(ip, vscale(dir, beyond));
+    let arho = (anchor.y * anchor.y + anchor.z * anchor.z).sqrt();
+    let max_r = REG_R - 1.0;
+    if arho > max_r && arho > 1e-6 {
+        let s = max_r / arho;
+        anchor.y *= s;
+        anchor.z *= s;
+    }
+    let pi = PartialInput {
+        aim: Some(dir),
+        fire_line_at: Some(Some(anchor)),
+        reel: Some(-1),
+        release: Some(false),
+        pushoff: Some(false),
+    };
+    (pi, dir)
+}
+
 /// estimateOpenness (RiggerAI.ts:192-219).
 fn estimate_openness(thrower: &PlayerSim, receiver: &PlayerSim, opponents: &[&PlayerSim]) -> f64 {
     let mut worst = 1.0_f64;
@@ -293,6 +418,7 @@ pub fn compute_player_input(
                 rrt_plan: None,
                 rrt_plan_tick: -1.0,
                 rrt_plan_target: None,
+                dive_commit_tick: -1.0,
             });
         }
 
@@ -464,6 +590,76 @@ pub fn compute_player_input(
             pressure: 0.0,
         });
     let catch_intent = wants_catch(player, state, &cur_assignment);
+
+    // ── LOOSE-BELL DECISIVE DIVE (dominates coverage / w-max / nav) ───────
+    // The gawk-ring fix: when the bell is loose and ours-to-take, the
+    // single best-placed rigger (Director recover lead) + ONE deterministic
+    // backup BREAK OFF and hard-dive — a powered-hook winch driven THROUGH
+    // the predicted intercept (anchor beyond it, reel=-1, catch_intent).
+    // This pragmatic catch utility STRONGLY dominates the epistemic /
+    // weakest-sufficient terms for the committer(s) only; everyone else
+    // keeps their role (anti-all-dive). It LATCHES with hysteresis: once a
+    // rigger commits it stays committed (no per-tick flip-flop) until the
+    // bell is taken, it catches, or it is clearly beaten by another rigger.
+    {
+        let bell_loose = state.bell.held_by.is_none();
+        let already = cache
+            .value
+            .as_ref()
+            .map(|c| c.dive_commit_tick >= 0.0)
+            .unwrap_or(false);
+        // Hysteresis: keep committing if we already were AND the bell is
+        // still loose, ours-to-take, and reasonably near (not clearly
+        // beaten — gap blows out). Otherwise (re)select fresh.
+        let to_bell = vsub(state.bell.p, player.p);
+        let still_takeable = bell_loose
+            && state.bell.thrown_by.as_deref() != Some(player.id.as_str())
+            && vlen(to_bell) < 85.0;
+        let commit_dive = if already && still_takeable {
+            true
+        } else {
+            is_dive_committer(player, state, director, &cur_assignment)
+        };
+
+        if let Some(c) = cache.value.as_mut() {
+            if commit_dive {
+                if c.dive_commit_tick < 0.0 {
+                    c.dive_commit_tick = tick;
+                }
+            } else {
+                c.dive_commit_tick = -1.0;
+            }
+        }
+
+        if commit_dive {
+            let (partial, dir) = decisive_dive_input(player, state);
+            let aim_dither = cache
+                .value
+                .as_ref()
+                .map(|c| c.aim_dither)
+                .unwrap_or_else(v3z);
+            let nav_aim = vnorm(vadd(
+                partial.aim.unwrap_or(dir),
+                aim_dither,
+            ));
+            let pushoff = should_pushoff(player, state.bell.p);
+            return PlayerInput {
+                id: player.id.clone(),
+                aim: nav_aim,
+                fire_line_at: partial.fire_line_at.unwrap_or(None),
+                reel: partial.reel.unwrap_or(-1),
+                release: partial.release.unwrap_or(false),
+                pushoff: partial.pushoff.unwrap_or(false) || pushoff,
+                throw_charge: 0.0,
+                throw_released: false,
+                throw_spin: 0.0,
+                thrumbler: v3z(),
+                // Always signal committed-catch intent while diving so the
+                // sim widens the catch envelope (collision::try_catch_ex).
+                catch_intent: true,
+            };
+        }
+    }
 
     // Otherwise execute committed navigation toward the cached target.
     let (target, aim_dither) = {
@@ -1504,6 +1700,82 @@ mod tests {
                     && o.thrumbler.z.is_finite()
             );
         }
+    }
+
+    #[test]
+    fn loose_bell_closest_rigger_decisively_dives_not_hovers() {
+        // A loose bell + a clearly-closest rigger named the Director recover
+        // lead. Its decided input MUST be a committed powered-hook dive:
+        // fire_line_at SOME (an anchor toward an intercept-enabling point)
+        // + reel == -1 + catch_intent == true — NOT a hover/coverage frame
+        // (no anchor / reel 0).
+        let players = vec![
+            mk_player("H1", TeamSide::Home, RiggerRole::Spinner, Vec3::new(6.0, 4.0, 1.0)),
+            mk_player("H2", TeamSide::Home, RiggerRole::Faithwing, Vec3::new(-180.0, 6.0, -3.0)),
+            mk_player("A1", TeamSide::Away, RiggerRole::Anchor, Vec3::new(120.0, 5.0, 5.0)),
+        ];
+        let mut m = mk_match();
+        m.contest = None;
+        let mut dir = mk_director();
+        // Loose-bell director state: H1 is the nearest recover lead.
+        dir.bell_loose = true;
+        dir.has_possession = false;
+        dir.carrier_id = None;
+        dir.recover_id = Some("H1".to_string());
+        dir.gate_receiver_id = None;
+        dir.assignments.clear();
+        dir.assignments.insert(
+            "H1".to_string(),
+            PlayerAssignment {
+                job: Job::Recover,
+                mark_id: None,
+                depth_slot: 0.0,
+                radius_slot: 0.0,
+                pressure: 0.0,
+            },
+        );
+        dir.assignments.insert(
+            "H2".to_string(),
+            PlayerAssignment {
+                job: Job::Support,
+                mark_id: None,
+                depth_slot: 0.4,
+                radius_slot: 0.45,
+                pressure: 0.0,
+            },
+        );
+        let state = mk_state(players, None); // bell loose (held_by None)
+        let player = state.players[0].clone();
+        let mut rng = AiRng::make(424242, 100, 0);
+        let mut cache = PlayerCommitCache::default();
+        let out = compute_player_input(
+            &player, &state, &m, &style_to_profile("balanced", "medium"),
+            &dir, Difficulty::Pro, &mut rng, &mut cache, true, 30.0,
+        );
+        assert!(
+            out.fire_line_at.is_some(),
+            "committer must FIRE an anchor (decisive dive), got hover/no-anchor"
+        );
+        assert_eq!(out.reel, -1, "committer must WINCH IN (reel=-1) the dive");
+        assert!(out.catch_intent, "committer must signal catch_intent");
+        // Hysteresis latched.
+        assert!(
+            cache.value.as_ref().unwrap().dive_commit_tick >= 0.0,
+            "dive commitment must latch for hysteresis"
+        );
+        // A far-off non-pack teammate must NOT be diving (anti-all-dive).
+        let h2 = state.players[1].clone();
+        let mut rng2 = AiRng::make(424242, 100, 1);
+        let mut cache2 = PlayerCommitCache::default();
+        let out2 = compute_player_input(
+            &h2, &state, &m, &style_to_profile("balanced", "medium"),
+            &dir, Difficulty::Pro, &mut rng2, &mut cache2, true, 30.0,
+        );
+        assert!(
+            cache2.value.as_ref().unwrap().dive_commit_tick < 0.0,
+            "a non-committer teammate must NOT latch a dive (anti-all-dive)"
+        );
+        let _ = out2;
     }
 
     #[test]

@@ -130,6 +130,12 @@ pub struct PlayerCommit {
     pub rrt_plan: Option<GrapplePlan>,
     pub rrt_plan_tick: f64,
     pub rrt_plan_target: Option<Vec3>,
+    /// LOOSE-BELL DECISIVE-DIVE hysteresis. Once a rigger is selected as the
+    /// committer to hard-dive the loose bell it LATCHES this tick; it stays
+    /// the committer (no per-tick flip-flop with coverage / w-max) until the
+    /// bell is taken, it catches, or it is clearly beaten. -1 = not
+    /// committing. Deterministic (a tick count, no wall-clock).
+    pub dive_commit_tick: f64,
 }
 
 #[derive(Clone, Debug, Default)]
