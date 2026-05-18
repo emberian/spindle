@@ -31,6 +31,23 @@ const APERTURE = REG.gateRadius;     // 8 m: a score only counts inside this
  * the crossing time is exact; (y, z) are integrated with the same rk4
  * predictor the bell uses. Returns null if the bell isn't inbound in time.
  */
+// Exact mirror of sim Collision.skinBounce (RESTITUTION 0.55) — deterministic.
+const PRED_SKIN_RESTITUTION = 0.55;
+function predictSkinBounce(st: PointState): void {
+  const rho = Math.hypot(st.p.y, st.p.z);
+  if (rho < REG.R) return;
+  const ny = st.p.y / rho;
+  const nz = st.p.z / rho;
+  const vn = st.v.y * ny + st.v.z * nz;
+  if (vn > 0) {
+    st.v.y -= (1 + PRED_SKIN_RESTITUTION) * vn * ny;
+    st.v.z -= (1 + PRED_SKIN_RESTITUTION) * vn * nz;
+  }
+  const s = (REG.R - 1e-3) / rho;
+  st.p.y *= s;
+  st.p.z *= s;
+}
+
 function predictRingCrossing(
   bp: Vec3, bv: Vec3, defendX: number,
 ): { y: number; z: number; t: number } | null {
@@ -42,6 +59,9 @@ function predictRingCrossing(
   for (let acc = 0; acc < t; ) {
     const h = Math.min(H, t - acc);
     st = rk4Step(st, REG.omega, h);
+    predictSkinBounce(st); // model the wall (sim Collision.skinBounce) so a
+                           // skin-bouncing bell's ring crossing is predicted
+                           // where it really arrives, not through the wall.
     acc += h;
   }
   return { y: st.p.y, z: st.p.z, t };

@@ -46,6 +46,28 @@ import { attackSign, attackRingX, defendRingX, forwardProgress } from './Orienta
 
 export type Difficulty = 'rookie' | 'pro' | 'legend';
 
+// Predictor skin bounce — EXACT mirror of sim Collision.skinBounce
+// (RESTITUTION 0.55). A free bell lives near the skin most of the match;
+// integrating pure free Coriolis flight predicts it sailing THROUGH the
+// wall, so chasers are aimed at unreachable points outside the skin and
+// the bell just floats there with nobody able to converge. Deterministic,
+// no rng — same math the sim runs, so the prediction tracks reality.
+const PRED_SKIN_RESTITUTION = 0.55;
+function predictSkinBounce(st: PointState): void {
+  const rho = Math.hypot(st.p.y, st.p.z);
+  if (rho < REG.R) return;
+  const ny = st.p.y / rho;
+  const nz = st.p.z / rho;
+  const vn = st.v.y * ny + st.v.z * nz;
+  if (vn > 0) {
+    st.v.y -= (1 + PRED_SKIN_RESTITUTION) * vn * ny;
+    st.v.z -= (1 + PRED_SKIN_RESTITUTION) * vn * nz;
+  }
+  const s = (REG.R - 1e-3) / rho;
+  st.p.y *= s;
+  st.p.z *= s;
+}
+
 // ── C3: athletic micro-control (deterministic geometry, ZERO rng) ─────────────
 // Within this radius of the committed target the player stops gross grappling
 // (planGrapple itself no-ops < 3 m) and uses the thrumbler to fine-settle:
@@ -486,6 +508,9 @@ function decideNavTarget(
     for (let tAcc = 0; tAcc < tLead; ) {
       const h = Math.min(H, tLead - tAcc);
       st = rk4Step(st, REG.omega, h);
+      predictSkinBounce(st); // model the wall — the bell is near it 57% of
+                             // the time; pure free flight aims chasers THROUGH
+                             // the skin at unreachable points (the floating).
       tAcc += h;
     }
     // SMARTER CATCH: don't aim AT the bell (you arrive across its path at

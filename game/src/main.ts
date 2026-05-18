@@ -599,6 +599,7 @@ async function runWatch(
         (window as unknown as { __rigai?: unknown }).__rigai = {
           tick: dbgSnap.tick,
           held: dbgSnap.bell.heldBy,
+          bellR: Math.hypot(dbgSnap.bell.p.y, dbgSnap.bell.p.z),
           heldFrac: dbgTotalTicks ? +(dbgHeldTicks / dbgTotalTicks).toFixed(2) : 0,
           throws: { ...dbgThrows },
           scores: { ...dbgScores },
@@ -613,6 +614,7 @@ async function runWatch(
               reel: inp ? inp.reel : 0,
               thrown: inp && inp.throwReleased ? 1 : 0,
               dBell: Math.hypot(pl.p.x - bp.x, pl.p.y - bp.y, pl.p.z - bp.z),
+              r: Math.hypot(pl.p.y, pl.p.z),
             };
           }),
         };
