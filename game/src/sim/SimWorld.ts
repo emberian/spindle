@@ -50,6 +50,21 @@ export class SimWorld {
     this.players.push({ id, team, role, body: makePlayer(p) });
   }
 
+  /** Grip the bell to a player (cast start / re-arm). Mirrors the WASM
+   *  runtime's setBellHeld so the TS twin can drive full headless matches
+   *  (the fast in-process skill harness). Deterministic; no rng. */
+  setBellHeld(id: string): void {
+    const w = this.find(id);
+    if (!w) return;
+    this.bellHeldBy = id;
+    this.bellThrownBy = null;
+    this.bellTouched = true;
+    this.passChain = [];
+    this.bell.p = { ...w.body.p };
+    this.bell.v = { x: 0, y: 0, z: 0 };
+    this.bell.w = { x: 0, y: 0, z: 0 };
+  }
+
   /** Place the bell free with a velocity & spin (used by set/throw/tests). */
   launchBell(p: Vec3, v: Vec3, w: Vec3, thrownBy: string | null): void {
     this.bell.p = { ...p };
