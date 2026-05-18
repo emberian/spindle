@@ -19,12 +19,19 @@ pub use crate::planner::Plan as GrapplePlan;
 
 /// Active planner algorithm class — the faithful restoration of the old
 /// TS `tune('planner', 0)` / `globalThis.__rigtune` knob (0 = MPC,
-/// 1 = RRT, 2 = CEM, and the explorable zoo beyond). Defaults to 0 so
-/// production / every existing test is byte-identical to before; only
-/// the skill-eval harness flips it, set-once-before-a-deterministic-run
-/// exactly like the original global (constant during a run ⇒
-/// determinism preserved).
-static PLANNER_CLASS: AtomicI32 = AtomicI32::new(0);
+/// 1 = RRT, 2 = CEM, 3 = MPPI, 4 = SimAnneal, 5 = Beam, 6 = MCTS,
+/// 7 = PotentialField, 8 = RandomShooting, 9 = Coordination).
+///
+/// PRODUCTION DEFAULT = 9 (Coordination). The 8000-tick skill-eval
+/// ranked it 44.5 vs MPC 43.5 — the multi-agent cost terms
+/// (teammate-interference penalty + pass-setup attractor) measurably
+/// beat plain momentum-MPC, and it is the strategic substrate for the
+/// cost-term-composition / coordination work to come. The search
+/// METHOD was shown not to matter (RandomShooting == MPC); the win is
+/// in the composed cost terms, which is what Coordination adds. The
+/// in-browser progression gate validates this default behaviorally.
+/// The skill-eval harness still flips this per deterministic run.
+static PLANNER_CLASS: AtomicI32 = AtomicI32::new(9);
 
 /// Set the active planner class (eval / exploration only). Set before a
 /// run; constant during it.
@@ -32,7 +39,7 @@ pub fn set_planner_class(class: i32) {
     PLANNER_CLASS.store(class, Ordering::Relaxed);
 }
 
-/// Current planner class (default 0 = canonical MPC).
+/// Current planner class (production default 9 = Coordination).
 pub fn planner_class() -> i32 {
     PLANNER_CLASS.load(Ordering::Relaxed)
 }
@@ -92,7 +99,7 @@ pub fn plan_grapple(
         pos: s.pos,
         reel: s.reel,
     });
-    // Planner class from the knob (default 0 = canonical MPC; the
+    // Planner class from the knob (production default 9 = Coordination; the
     // skill-eval harness flips it to rank the algorithm zoo).
     planner::plan_grapple(&pl, target, &st, avoid_defenders, sk, planner_class())
 }
