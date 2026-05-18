@@ -25,8 +25,11 @@ export function bellGlow(chime: number): number {
 // ── geometry constants ────────────────────────────────────────────────────────
 const NORMAL_LEN = 300;   // segments to hold Coriolis arc
 const LOOP_LEN   = 600;   // hold full closed-orbit history in loop mode
-const HALF_W_BASE = 0.10; // half-width of ribbon at newest (metres — tune to ring scale)
-const HALF_W_LOOP = 0.20; // wider in loop mode for extra drama
+// Widened so the bell path is unmistakably the boldest stroke in the
+// chamber: now that rig tethers are thin (~0.13 m radius) the trail must
+// clearly out-mass them. The bell is the one object everyone plays for.
+const HALF_W_BASE = 0.20; // half-width of ribbon at newest (metres — tune to ring scale)
+const HALF_W_LOOP = 0.34; // wider in loop mode for extra drama
 // Speed (m/s, derived from sample spacing × assumed push cadence) at which
 // the trail reaches its full blaze width/heat. Tunable — lower = blazes
 // sooner. The push() cadence is the frame rate (~60 Hz) so we treat the
@@ -53,7 +56,9 @@ function makeMat(): THREE.MeshBasicMaterial {
   return new THREE.MeshBasicMaterial({
     vertexColors: true,
     transparent: true,
-    opacity: 0.78, // visible ribbon (bloom is tamed so this no longer whites out)
+    // Higher than the rig tethers (which are now thin & ≤0.62 opacity, non-
+    // additive) so the bell trail is always the dominant glow on screen.
+    opacity: 0.9, // visible ribbon (bloom is tamed so this no longer whites out)
     blending: THREE.AdditiveBlending,
     depthWrite: false,
     side: THREE.DoubleSide,

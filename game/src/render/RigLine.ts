@@ -1,30 +1,46 @@
 // Rig-line renderer — graphic-novel grapple line.
 //
-// THE core mechanic is the grapple: a rigger fires a line to a spar/teammate
-// and HAULS along it. That has to be unmistakable on screen. A 1 px
-// THREE.Line (hardware-capped width) was invisible at the lore-scale
-// spectate camera — "I don't see RIGGING". So the line is now a real
-// world-space TUBE with thickness, a bold ink edge, a bright bitten anchor
-// node and a node at the rigger's hand, so you can read: who fired, to
-// where, taut (hauling — thick/bright/straight) vs slack (lazy/dim/sagging),
-// and the reel snapping it in.
+// THE core mechanic is the grapple: a rigger fires a line to a spar/skin/
+// teammate and HAULS along it. With the powered hook ALL 8 riggers grapple
+// at once, so the OLD thick-bloomed-double-tube + fat 0.9 octahedron read
+// smeared 8 tethers into one glowing mass that fought the bell trail.
+//
+// This renderer is built for LEGIBILITY UNDER 8 SIMULTANEOUS TETHERS:
+//   - each tether is ONE thin, taut, crisp line (no 1.7× ink halo, low
+//     additive contribution) so eight of them stay separable and never
+//     out-glow the bell;
+//   - the anchor node is SMALL and shaped BY ANCHOR TYPE so a watcher can
+//     read WHAT was grappled at a glance:
+//       spar   → octahedron  (hard structural bite)
+//       skin   → flat ring   (free-space skin point)
+//       ring   → cube        (the goal ring)
+//       player → the tether runs all the way to the LIVE target rigger and
+//                gets a node at BOTH ends, so rigger→rigger coordination is
+//                visually unmistakable;
+//   - the bell + BellTrail stay the brightest, most saturated thing — the
+//     tethers are deliberately recessive against it.
 //
 // The line originates from the rigger's ANIMATED grapple hand (published by
-// Rigger.ts) so it stays welded to the posed reach-arm. Render-only; ~8
-// short tubes rebuilt per frame is trivial off the 240 Hz sim path.
+// Rigger.ts). Render-only; ~8 short tubes rebuilt per frame is trivial off
+// the 240 Hz sim path.
 
 import * as THREE from 'three';
-import type { PlayerSim } from '../sim/types';
+import type { PlayerSim, GrappleState } from '../sim/types';
 import { PAL } from '../ui/palette';
-import { INK } from './RiggerToon';
 import { grappleHand } from './RigGrapple';
 
 const SAG_SEGMENTS = 24;
 
-// World-space line radii (m) — tuned to read clearly at the wide lore camera.
-const TAUT_RADIUS = 0.42;   // hauling: a taut, energized cable
-const SLACK_RADIUS = 0.26;  // lazy rope
-const P1_RADIUS_BOOST = 0.12;
+// World-space line radii (m). DELIBERATELY THIN: a taut hauling cable reads
+// as a crisp stroke, not a rope. Eight of these must not merge into a blob,
+// so the radius is a fraction of the old 0.42 and there is no halo tube.
+const TAUT_RADIUS = 0.13;   // hauling: a taut, energised cable
+const SLACK_RADIUS = 0.085; // lazy line
+const P1_RADIUS_BOOST = 0.05;
+
+// Small typed anchor sizes (m) — the old 0.9 "confusing diamond" is gone.
+const ANCHOR_SIZE = 0.34;
+const HAND_SIZE = 0.20;
 
 // Fallback hand offset (figure-local) if Rigger hasn't published a hand yet.
 const HAND_FALLBACK_LOCAL = new THREE.Vector3(0.42, 1.55, 0.55);
@@ -80,13 +96,13 @@ function fillCatenary(a: THREE.Vector3, b: THREE.Vector3, sag: number): void {
 class LineInstance {
   readonly group = new THREE.Group();
 
-  private rope: THREE.Mesh;       // bright team-colour tube
-  private ink: THREE.Mesh;        // slightly fatter dark tube = bold ink edge
-  private anchor: THREE.Mesh;     // the bite point (bright, faceted)
-  private anchorCore: THREE.Mesh; // hot white core
-  private hand: THREE.Mesh;       // node where the line leaves the rigger
+  private rope: THREE.Mesh;        // thin team-colour tube (the tether)
+  private spar: THREE.Mesh;        // octahedron anchor (structural bite)
+  private skin: THREE.Mesh;        // flat ring anchor (free-space skin point)
+  private ring: THREE.Mesh;        // cube anchor (the goal ring)
+  private hand: THREE.Mesh;        // node where the line leaves the rigger
+  private endNode: THREE.Mesh;     // node at the FAR end for player↔player
   private curGeo: THREE.TubeGeometry | null = null;
-  private inkGeo: THREE.TubeGeometry | null = null;
 
   private active = false;
   private fire = 0;
@@ -95,71 +111,67 @@ class LineInstance {
   private snapKick = 0;
 
   constructor() {
-    this.ink = new THREE.Mesh(
-      new THREE.BufferGeometry(),
-      new THREE.MeshBasicMaterial({
-        color: INK, transparent: true, opacity: 0, depthWrite: false,
-      }),
-    );
-    this.ink.frustumCulled = false;
-    this.ink.renderOrder = 0;
-
+    // Tether: one thin tube. NOT additive — a normal translucent stroke so
+    // eight of them stay crisp and recessive instead of blooming into a
+    // glowing mass that competes with the bell.
     this.rope = new THREE.Mesh(
       new THREE.BufferGeometry(),
       new THREE.MeshBasicMaterial({
         color: PAL.cyan, transparent: true, opacity: 0, depthWrite: false,
-        // Additive so the tether GLOWS against the dark calm (the line was
-        // "too dark"). Safe: a thin ~0.4 m tube is a bounded emitter — the
-        // old blowout was huge additive markers / loop bloom, not this.
-        blending: THREE.AdditiveBlending,
       }),
     );
     this.rope.frustumCulled = false;
     this.rope.renderOrder = 1;
 
-    this.anchor = new THREE.Mesh(
-      new THREE.OctahedronGeometry(0.9, 0),
+    // Typed anchor nodes — small, additive (a single small node is a bounded
+    // emitter), only the one matching anchorType is shown per frame.
+    const anchorMat = () =>
       new THREE.MeshBasicMaterial({
         color: PAL.paper, transparent: true, opacity: 0,
         blending: THREE.AdditiveBlending, depthWrite: false,
-      }),
-    );
-    this.anchor.renderOrder = 2;
-    this.anchorCore = new THREE.Mesh(
-      new THREE.OctahedronGeometry(0.42, 0),
-      new THREE.MeshBasicMaterial({
-        color: PAL.paper, transparent: true, opacity: 0,
-        blending: THREE.AdditiveBlending, depthWrite: false,
-      }),
-    );
-    this.anchorCore.renderOrder = 3;
+      });
 
-    this.hand = new THREE.Mesh(
-      new THREE.SphereGeometry(0.45, 8, 6),
-      new THREE.MeshBasicMaterial({
-        color: PAL.paper, transparent: true, opacity: 0,
-        blending: THREE.AdditiveBlending, depthWrite: false,
-      }),
+    this.spar = new THREE.Mesh(new THREE.OctahedronGeometry(ANCHOR_SIZE, 0), anchorMat());
+    this.skin = new THREE.Mesh(
+      new THREE.TorusGeometry(ANCHOR_SIZE * 0.95, ANCHOR_SIZE * 0.22, 6, 14),
+      anchorMat(),
     );
+    this.ring = new THREE.Mesh(
+      new THREE.BoxGeometry(ANCHOR_SIZE * 1.3, ANCHOR_SIZE * 1.3, ANCHOR_SIZE * 1.3),
+      anchorMat(),
+    );
+    this.spar.renderOrder = 2;
+    this.skin.renderOrder = 2;
+    this.ring.renderOrder = 2;
+
+    this.hand = new THREE.Mesh(new THREE.SphereGeometry(HAND_SIZE, 8, 6), anchorMat());
     this.hand.renderOrder = 2;
+    // Far-end node — only lit for player↔player tethers, so rigger→rigger
+    // coordination reads as two clearly linked figures.
+    this.endNode = new THREE.Mesh(new THREE.SphereGeometry(HAND_SIZE * 1.25, 8, 6), anchorMat());
+    this.endNode.renderOrder = 2;
 
-    this.group.add(this.ink, this.rope, this.anchor, this.anchorCore, this.hand);
+    this.group.add(this.rope, this.spar, this.skin, this.ring, this.hand, this.endNode);
     this.group.visible = false;
   }
 
   private rebuild(radius: number): void {
     const curve = new THREE.CatmullRomCurve3(_pts, false, 'catmullrom', 0);
-    const g = new THREE.TubeGeometry(curve, SAG_SEGMENTS, radius, 6, false);
-    const gi = new THREE.TubeGeometry(curve, SAG_SEGMENTS, radius * 1.7, 6, false);
+    // 4 radial segments: a thin tube doesn't need 6, fewer verts for 8 tethers.
+    const g = new THREE.TubeGeometry(curve, SAG_SEGMENTS, radius, 4, false);
     this.rope.geometry = g;
-    this.ink.geometry = gi;
     this.curGeo?.dispose();
-    this.inkGeo?.dispose();
     this.curGeo = g;
-    this.inkGeo = gi;
   }
 
-  apply(ps: PlayerSim, isP1: boolean, now: number, dt: number): void {
+  /** @param targetPos live world pos of the grappled player, or null. */
+  apply(
+    ps: PlayerSim,
+    isP1: boolean,
+    now: number,
+    dt: number,
+    targetPos: THREE.Vector3 | null,
+  ): void {
     const ls = ps.line;
     if (!ls) {
       this.group.visible = false;
@@ -169,8 +181,14 @@ class LineInstance {
     }
     this.group.visible = true;
 
+    const kind = ls.anchorType;
+    const isPlayerAnchor = kind === 'player' && targetPos !== null;
+
     lineOrigin(ps, _from);
-    _to.set(ls.anchorPos.x, ls.anchorPos.y, ls.anchorPos.z);
+    // For a player anchor, draw to the LIVE target rigger so the link is
+    // unmistakable; otherwise to the bound anchor point.
+    if (isPlayerAnchor) _to.copy(targetPos as THREE.Vector3);
+    else _to.set(ls.anchorPos.x, ls.anchorPos.y, ls.anchorPos.z);
     const chord = _from.distanceTo(_to);
     const taut = ls.taut;
 
@@ -196,41 +214,59 @@ class LineInstance {
     const baseR = taut ? TAUT_RADIUS : SLACK_RADIUS;
     const radius = baseR
       + (isP1 ? P1_RADIUS_BOOST : 0)
-      + this.snapKick * 0.14
-      + (reelingIn ? 0.06 : 0);
+      + this.snapKick * 0.04
+      + (reelingIn ? 0.02 : 0);
     this.rebuild(radius);
 
     const teamCol = ps.team === 'home' ? PAL.cyan : PAL.orange;
-    // Taut = hauling: hot toward paper-white and pulses on the snap. Slack =
-    // lazy & dim. Opacity is high either way so the rope is always legible.
-    // Bright even slack (it was "too dark"): taut runs hot toward white,
-    // slack stays a vivid team colour rather than dimmed-out.
-    const ropeHex = taut
-      ? blendHex(teamCol, PAL.paper, 0.5 + this.snapKick * 0.3)
-      : blendHex(teamCol, PAL.paper, 0.18);
-    (this.rope.material as THREE.MeshBasicMaterial).color.setHex(ropeHex);
-    (this.rope.material as THREE.MeshBasicMaterial).opacity =
-      (taut ? 1.0 : 0.85) + (isP1 ? 0.0 : 0);
-    (this.ink.material as THREE.MeshBasicMaterial).opacity = taut ? 0.7 : 0.45;
+    // Tether colour: a clean team-tinted stroke. It NO LONGER runs hot toward
+    // paper-white (that's the bell's job) — taut just nudges a little brighter
+    // and pulses faintly on the snap. Low opacity keeps it recessive so the
+    // bell trail is always the dominant glow even with 8 lines lit.
+    const rm = this.rope.material as THREE.MeshBasicMaterial;
+    rm.color.setHex(
+      taut ? blendHex(teamCol, PAL.paper, 0.15 + this.snapKick * 0.2)
+           : teamCol,
+    );
+    rm.opacity = taut ? 0.62 : 0.42;
 
-    // Anchor bite-point — big & hot when taut (you're hauling on it), softer
-    // when slack. This is the "where the claw bit" read.
-    const an = this.anchor.material as THREE.MeshBasicMaterial;
-    const ac = this.anchorCore.material as THREE.MeshBasicMaterial;
-    an.color.setHex(taut ? blendHex(teamCol, PAL.paper, 0.55) : teamCol);
-    an.opacity = taut ? (isP1 ? 1.0 : 0.9) : 0.5;
-    ac.opacity = taut ? 0.95 : 0.25;
+    // ── Typed anchor: show ONLY the node matching anchorType ────────────────
+    this.spar.visible = false;
+    this.skin.visible = false;
+    this.ring.visible = false;
+    this.endNode.visible = false;
+
     const t = now * 0.001;
-    this.anchor.position.copy(_to);
-    this.anchor.rotation.set(t * 0.6, t * 0.8, 0);
-    const aScale = 1 + this.snapKick * 0.6;
-    this.anchor.scale.setScalar(aScale);
-    this.anchorCore.position.copy(_to);
+    const aScale = 1 + this.snapKick * 0.35;
 
-    // Hand node: the line visibly LEAVES the rigger.
+    if (isPlayerAnchor) {
+      // rigger→rigger: a node welded to the live target figure + the hand
+      // node. Two linked dots on a thin line = readable coordination.
+      const em = this.endNode.material as THREE.MeshBasicMaterial;
+      em.color.setHex(blendHex(teamCol, PAL.paper, 0.55));
+      em.opacity = taut ? 0.95 : 0.6;
+      this.endNode.position.copy(_to);
+      this.endNode.scale.setScalar(aScale);
+      this.endNode.visible = true;
+    } else {
+      const node =
+        kind === 'spar' ? this.spar :
+        kind === 'ring' ? this.ring :
+        this.skin; // 'skin' (and player-with-no-target fallback)
+      const nm = node.material as THREE.MeshBasicMaterial;
+      nm.color.setHex(taut ? blendHex(teamCol, PAL.paper, 0.4) : teamCol);
+      nm.opacity = taut ? 0.8 : 0.45;
+      node.position.copy(_to);
+      node.rotation.set(t * 0.6, t * 0.8, 0);
+      node.scale.setScalar(aScale);
+      node.visible = true;
+    }
+
+    // Hand node: the line visibly LEAVES the rigger (small, dim — context,
+    // not a focal point).
     const hm = this.hand.material as THREE.MeshBasicMaterial;
-    hm.color.setHex(blendHex(teamCol, PAL.paper, 0.4));
-    hm.opacity = taut ? 0.85 : 0.55;
+    hm.color.setHex(blendHex(teamCol, PAL.paper, 0.3));
+    hm.opacity = taut ? 0.6 : 0.4;
     this.hand.position.copy(_from);
   }
 
@@ -249,6 +285,7 @@ export class RigLines {
   private group = new THREE.Group();
   private p1Id: string | null = null;
   private lastNow = 0;
+  private _tgt = new THREE.Vector3();
 
   constructor(scene: THREE.Scene) {
     scene.add(this.group);
@@ -280,7 +317,18 @@ export class RigLines {
         this.group.add(inst.group);
         this.instances.set(ps.id, inst);
       }
-      inst.apply(ps, ps.id === this.p1Id, now, dt);
+      // Resolve a player-anchor to the LIVE target rigger position so a
+      // rigger→rigger tether connects two figures, not a stale point.
+      let targetPos: THREE.Vector3 | null = null;
+      const ls: GrappleState | null = ps.line;
+      if (ls && ls.anchorType === 'player' && ls.anchorRef) {
+        const tgt = players.find((p) => p.id === ls.anchorRef);
+        if (tgt) {
+          this._tgt.set(tgt.p.x, tgt.p.y, tgt.p.z);
+          targetPos = this._tgt;
+        }
+      }
+      inst.apply(ps, ps.id === this.p1Id, now, dt, targetPos);
     }
   }
 }
