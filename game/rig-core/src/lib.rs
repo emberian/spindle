@@ -21,6 +21,10 @@ mod grapple;
 mod loop_detector;
 mod player;
 mod analysis;
+// Progressive TS→Rust port, increment 1: the AI rollout kernel (the hot
+// loop that made every TS eval/optimizer intractable). Native speed here
+// unlocks deep MPPI/CEM/RL; parity oracle = the headless TS skill harness.
+mod planner;
 // Increment 3 (swarm): the deterministic world + the wasm-bindgen facade.
 mod sim_world;
 mod wasm;
