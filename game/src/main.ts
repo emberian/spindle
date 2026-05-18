@@ -511,6 +511,20 @@ async function runWatch(
   const dbgThrows: Record<string, number> = {};
   const dbgScores: Record<string, number> = {};
   let dbgHeldTicks = 0, dbgTotalTicks = 0;
+  // ── Skill signals (the better eval) ──────────────────────────────────────
+  // Skillful rig ≠ fast chaos. Track the things that distinguish purpose
+  // from flailing: completed PASSES (possession chains), INTERCEPTS (read
+  // defense), GATE CLEARS (the cast actually advances), and a chaos proxy:
+  // anchor THRASH (how often a rigger's fired anchor jumps — flailing vs
+  // committed swings).
+  const dbgTeamOf: Record<string, string> = {};
+  for (const r of WATCH_ROSTER) dbgTeamOf[r.id] = r.team;
+  let dbgPasses = 0, dbgIntercepts = 0, dbgGateClears = 0, dbgThrash = 0;
+  let dbgPrevHeld: string | null = null;
+  let dbgLastThrownBy: string | null = null;
+  let dbgPrevGate: string | null = null;
+  const dbgPrevFire: Record<string, { x: number; y: number; z: number }> = {};
+  const GATE_ORD: Record<string, number> = { first: 0, deep: 1, mouth: 2 };
 
   const reArm = (): void => {
     if (match.state.winner !== null || match.state.phase === 'live') return;
@@ -532,6 +546,28 @@ async function runWatch(
         dbgThrows[pl.id] = (dbgThrows[pl.id] ?? 0) + 1;
       }
     });
+    // Skill signals (transitions read off the deterministic snapshot).
+    {
+      const b = snap.bell;
+      if (b.heldBy && !dbgPrevHeld && dbgLastThrownBy && dbgLastThrownBy !== b.heldBy) {
+        if (dbgTeamOf[dbgLastThrownBy] === dbgTeamOf[b.heldBy]) dbgPasses++;
+        else dbgIntercepts++;
+      }
+      if (!b.heldBy && b.thrownBy) dbgLastThrownBy = b.thrownBy;
+      if (b.heldBy) dbgLastThrownBy = null;
+      dbgPrevHeld = b.heldBy;
+      const g = match.state.cast.gate;
+      if (dbgPrevGate !== null && GATE_ORD[g] > GATE_ORD[dbgPrevGate]) dbgGateClears++;
+      dbgPrevGate = g;
+      snap.players.forEach((pl, i) => {
+        const f = aiFrame.players[i] && aiFrame.players[i].fireLineAt;
+        if (f) {
+          const pf = dbgPrevFire[pl.id];
+          if (pf && Math.hypot(f.x - pf.x, f.y - pf.y, f.z - pf.z) > 8) dbgThrash++;
+          dbgPrevFire[pl.id] = { x: f.x, y: f.y, z: f.z };
+        }
+      });
+    }
     const frame: InputFrame = { tick: snap.tick, players: aiFrame.players };
     rec.push(frame);
     const evs = sim.step(frame);
@@ -603,6 +639,13 @@ async function runWatch(
           heldFrac: dbgTotalTicks ? +(dbgHeldTicks / dbgTotalTicks).toFixed(2) : 0,
           throws: { ...dbgThrows },
           scores: { ...dbgScores },
+          skill: {
+            passes: dbgPasses,
+            intercepts: dbgIntercepts,
+            gateClears: dbgGateClears,
+            thrash: dbgThrash,
+            ticks: dbgTotalTicks,
+          },
           players: dbgSnap.players.map((pl, i) => {
             const inp = dbgAi!.players[i];
             return {
