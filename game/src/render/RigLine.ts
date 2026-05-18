@@ -108,6 +108,10 @@ class LineInstance {
       new THREE.BufferGeometry(),
       new THREE.MeshBasicMaterial({
         color: PAL.cyan, transparent: true, opacity: 0, depthWrite: false,
+        // Additive so the tether GLOWS against the dark calm (the line was
+        // "too dark"). Safe: a thin ~0.4 m tube is a bounded emitter — the
+        // old blowout was huge additive markers / loop bloom, not this.
+        blending: THREE.AdditiveBlending,
       }),
     );
     this.rope.frustumCulled = false;
@@ -199,13 +203,15 @@ class LineInstance {
     const teamCol = ps.team === 'home' ? PAL.cyan : PAL.orange;
     // Taut = hauling: hot toward paper-white and pulses on the snap. Slack =
     // lazy & dim. Opacity is high either way so the rope is always legible.
+    // Bright even slack (it was "too dark"): taut runs hot toward white,
+    // slack stays a vivid team colour rather than dimmed-out.
     const ropeHex = taut
-      ? blendHex(teamCol, PAL.paper, 0.35 + this.snapKick * 0.3)
-      : blendHex(teamCol, PAL.dim, 0.35);
+      ? blendHex(teamCol, PAL.paper, 0.5 + this.snapKick * 0.3)
+      : blendHex(teamCol, PAL.paper, 0.18);
     (this.rope.material as THREE.MeshBasicMaterial).color.setHex(ropeHex);
     (this.rope.material as THREE.MeshBasicMaterial).opacity =
-      (taut ? 0.98 : 0.72) + (isP1 ? 0.02 : 0);
-    (this.ink.material as THREE.MeshBasicMaterial).opacity = taut ? 0.9 : 0.6;
+      (taut ? 1.0 : 0.85) + (isP1 ? 0.0 : 0);
+    (this.ink.material as THREE.MeshBasicMaterial).opacity = taut ? 0.7 : 0.45;
 
     // Anchor bite-point — big & hot when taut (you're hauling on it), softer
     // when slack. This is the "where the claw bit" read.
