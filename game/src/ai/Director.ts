@@ -352,22 +352,27 @@ function assignReceivers(
     // Alternate radius bands by role so wings keep their identity AND fan to
     // visibly distinct radii — widened so the spread reads on screen instead
     // of every rigger hugging the same band.
+    // #2 — formation pulled into the reachable near-axis corridor. Wide
+    // receivers (faithwing/anchor near the rim) pulled the bell out to the
+    // skin where nobody could get it. Roles keep their RELATIVE identity
+    // (freewing inner, anchor outer) but the whole spread sits where
+    // grapple-to-axis locomotion can actually contest it.
     let radiusSlot: number;
     switch (p.role) {
       case 'freewing':
-        radiusSlot = 0.16; // high / near-axis (Coriolis curve game)
+        radiusSlot = 0.12; // high / near-axis (Coriolis curve game)
         break;
       case 'faithwing':
-        radiusSlot = 0.68; // wide spinward
+        radiusSlot = 0.38; // spinward, but in the corridor
         break;
       case 'anchor':
-        radiusSlot = 0.85; // deep, near the rim
+        radiusSlot = 0.48; // the outer band — still reachable
         break;
       case 'spinner':
-        radiusSlot = 0.4;
+        radiusSlot = 0.28;
         break;
       default:
-        radiusSlot = 0.35 + 0.45 * frac;
+        radiusSlot = 0.22 + 0.26 * frac;
     }
     assignments[p.id] = {
       job: 'receive',

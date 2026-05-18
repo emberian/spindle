@@ -926,7 +926,13 @@ function decideThrow(
     // Reward forward progress strongly so the team always works down-axis;
     // a backward pass is only acceptable as a pressure-release safety valve.
     const gainNorm = Math.max(-1, Math.min(1.5, gain / 90));
-    const score = result.score + gainNorm * 0.35;
+    // KEEP THE BELL REACHABLE (#2): a pass to a high-radius receiver throws
+    // the bell out toward the skin where grapple-to-axis locomotion can't
+    // rendezvous and it just floats. Penalise receivers beyond a near-axis
+    // corridor so play stays where the chase pack can actually contest it.
+    const rcvR = axisRadius(tm.p);
+    const radiusPenalty = Math.max(0, (rcvR - 16) / REG.R) * 0.6;
+    const score = result.score + gainNorm * 0.35 - radiusPenalty;
 
     if (tm.id === commit.throwTargetId) heldScore = score;
 
