@@ -120,9 +120,11 @@ fn spar_ring_r() -> f64 {
     R * 0.62
 }
 
-/// All spar positions: the canon axis spine PLUS the off-axis clip lattice
-/// (identical to TS `sparPositions()`, GrapplePlanner.ts:46-64).
-pub fn spar_positions() -> Vec<Vec3> {
+/// The spar lattice depends only on compile-time constants (`L`, `R`,
+/// SPAR_* ), so it is identical on every call. Build it exactly once and
+/// hand out a shared slice on the hot path; the f64 values produced are
+/// bit-for-bit the same computation as before, just memoized.
+fn build_spar_positions() -> Vec<Vec3> {
     let mut out: Vec<Vec3> = Vec::new();
     let start = -L / 2.0;
     let count = spar_count();
@@ -138,6 +140,20 @@ pub fn spar_positions() -> Vec<Vec3> {
         }
     }
     out
+}
+
+fn spar_positions_cached() -> &'static [Vec3] {
+    use std::sync::OnceLock;
+    static SPARS: OnceLock<Vec<Vec3>> = OnceLock::new();
+    SPARS.get_or_init(build_spar_positions).as_slice()
+}
+
+/// All spar positions: the canon axis spine PLUS the off-axis clip lattice
+/// (identical to TS `sparPositions()`, GrapplePlanner.ts:46-64). Public
+/// signature preserved (owned `Vec`); internally backed by a one-time
+/// cached lattice.
+pub fn spar_positions() -> Vec<Vec3> {
+    spar_positions_cached().to_vec()
 }
 
 // ── Plan / input types (self-contained mirror of the TS interfaces) ──────────
@@ -241,7 +257,7 @@ fn build_anchors(
     player: &PlayerSim,
     state: &SimState,
 ) -> Vec<Anchor> {
-    let mut anchors: Vec<Anchor> = Vec::new();
+    let mut anchors: Vec<Anchor> = Vec::with_capacity(spars.len() + state.players.len());
     for sp in spars {
         let dd = pos.sub(*sp).len();
         if dd < 2.0 || dd > 170.0 {
@@ -355,7 +371,8 @@ fn plan_rrt(
     }
     sort_anchors(&mut anchors, target);
 
-    let mut nodes: Vec<RrtNode> = vec![RrtNode {
+    let mut nodes: Vec<RrtNode> = Vec::with_capacity(1 + RRT_ITERS as usize);
+    nodes.push(RrtNode {
         p: player.p,
         v: player.v,
         parent: -1,
@@ -363,7 +380,7 @@ fn plan_rrt(
         reel: -1,
         is_spar: true,
         best: pos.sub(target).len(),
-    }];
+    });
     let mut best_idx: usize = 0;
     let mut best_cost = nodes[0].best;
 
@@ -792,18 +809,18 @@ pub fn plan_grapple(
         .map(|p| p.p)
         .collect();
 
-    let spars = spar_positions();
+    let spars = spar_positions_cached();
 
     // Strategy switch (TS GP.ts:689-696): planner 2 = CEM, 1 = RRT, else MPC.
     if planner >= 2 {
         if let Some(r) =
-            plan_cem(player, target, state, &opponents, &teammates, sticky, &spars)
+            plan_cem(player, target, state, &opponents, &teammates, sticky, spars)
         {
             return Some(r);
         }
     } else if planner >= 1 {
         if let Some(r) =
-            plan_rrt(player, target, state, &opponents, &teammates, sticky, &spars)
+            plan_rrt(player, target, state, &opponents, &teammates, sticky, spars)
         {
             return Some(r);
         }
@@ -854,7 +871,7 @@ pub fn plan_grapple(
     let mut candidates: Vec<(Vec3, i32, f64, bool, f64)> = Vec::new();
 
     // Candidate 1: spar anchors (TS GP.ts:741-763).
-    for spar in &spars {
+    for spar in spars {
         let sdist = pos.sub(*spar).len();
         if sdist < 2.0 || sdist > 80.0 {
             continue;
@@ -908,7 +925,7 @@ pub fn plan_grapple(
         // Fallback: nearest spar (TS GP.ts:799-808).
         let mut nearest_spar = spars[0];
         let mut nearest_dist = f64::INFINITY;
-        for spar in &spars {
+        for spar in spars {
             let d = pos.sub(*spar).len();
             if d < nearest_dist {
                 nearest_dist = d;
@@ -937,14 +954,14 @@ pub fn plan_grapple(
 
     // Graph route for FAR targets (TS GP.ts:825-855).
     if best.2 > DIRECT_REACH {
-        let adj = spar_adjacency(&spars);
-        let goal_n = nearest_spar_idx(&spars, target);
+        let adj = spar_adjacency(spars);
+        let goal_n = nearest_spar_idx(spars, target);
         let d_to_goal = pos.sub(spars[goal_n]).len();
         let hop: usize = if d_to_goal <= HOP_MAX {
             goal_n
         } else {
-            let start_n = nearest_spar_idx(&spars, pos);
-            let path = route_spars(&spars, &adj, start_n, goal_n);
+            let start_n = nearest_spar_idx(spars, pos);
+            let path = route_spars(spars, &adj, start_n, goal_n);
             let mut h = goal_n;
             for node in path {
                 if pos.sub(spars[node]).len() > 4.0 {
