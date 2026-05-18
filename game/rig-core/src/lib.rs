@@ -25,6 +25,12 @@ mod analysis;
 // loop that made every TS eval/optimizer intractable). Native speed here
 // unlocks deep MPPI/CEM/RL; parity oracle = the headless TS skill harness.
 mod planner;
+// Progressive port increment 2 (swarm): match logic — 1:1 ports of
+// src/match/{Scoring,Contest,MatchStateMachine}.ts. scoring is the shared
+// base; contest and match_sm depend on it (wired via crate:: paths).
+mod scoring;
+mod contest;
+mod match_sm;
 // Increment 3 (swarm): the deterministic world + the wasm-bindgen facade.
 mod sim_world;
 mod wasm;
