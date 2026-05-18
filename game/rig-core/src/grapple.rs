@@ -15,6 +15,7 @@
 //! force this step (ω_n·h ≈ 0.018 ≪ 2 ⇒ unconditionally stable here).
 
 use crate::math::Vec3;
+use crate::tuning::{REEL_PULL_ACCEL, REEL_PULL_SPEED};
 use crate::tuning::{LINE_C, LINE_K, LINE_SLACK_BAND, LINE_SLACK_K};
 
 // ── public constants ──────────────────────────────────────────────────────────
@@ -78,13 +79,31 @@ pub fn resolve_line(
     }
     let n = d.scale(1.0 / len); // unit vector, anchor → player
 
-    // ── Reel: ONLY ease rest_len toward the target. No position set, no
-    //    velocity rescale — the slingshot must emerge from the spring. ──
+    // ── Reel: ease rest_len toward the target. ──
     if reel != 0 {
         let target = (line.rest_len + reel as f64 * REEL_RATE * h)
             .max(TETHER_MIN)
             .min(TETHER_MAX);
         line.rest_len = target;
+    }
+
+    // ── POWERED HOOK: reeling IN actively drags the rigger toward the
+    //    anchor. This is the rigger's PRIMARY propulsion — "the calm" is
+    //    weightless near the axis, so a passive radial spring on a
+    //    near-rest body produces ~no motion (the inert-chamber bug). The
+    //    winch is a motor: accel-capped velocity toward the anchor up to
+    //    a cruise speed; it only ever ADDS speed toward the anchor (never
+    //    brakes/pushes), so it composes cleanly with the taut spring
+    //    below and stays deterministic + unconditionally stable. Applies
+    //    even when slack (you reel up slack rope and get yanked). Pulls
+    //    against the anchor/structure — applied to the player only
+    //    (a powered actuator, not a momentum-conserving constraint). ──
+    if reel < 0 {
+        let to_anchor = n.scale(-1.0); // player → anchor
+        let inward = player.v.sub(a_v).dot(to_anchor); // current speed toward anchor
+        let deficit = (REEL_PULL_SPEED - inward).max(0.0); // pull only, never brake
+        let dv = deficit.min(REEL_PULL_ACCEL * h); // accel-capped (stable)
+        player.v = player.v.add(to_anchor.scale(dv));
     }
 
     let stretch = len - line.rest_len;

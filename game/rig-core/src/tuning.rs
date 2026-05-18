@@ -29,6 +29,20 @@ pub const LINE_SLACK_BAND: f64 = 0.6;
 /// Pre-tension stiffness inside the slack band (soft — ~1/12 of LINE_K).
 pub const LINE_SLACK_K: f64 = 120.0;
 
+/// POWERED HOOK (locomotion fix). The rig line is a Xonotic-style winch,
+/// not a passive pendulum rope: reeling-IN actively drags the rigger
+/// toward the anchor. Without this the riggers cannot self-propel —
+/// "the calm" is the near-axis WEIGHTLESS volume (centrifugal ≈ ω²r ≈
+/// 0.8 m/s² at play radius), so there is no gravity to pendulum against
+/// and a passive radial spring on a near-rest body produces ~no motion.
+/// The winch is the rigger's only real propulsion; it must be strong.
+/// `REEL_PULL_SPEED` = the cruise speed it drags you toward the anchor;
+/// `REEL_PULL_ACCEL` = how hard the motor accelerates you to it
+/// (accel-capped ⇒ deterministic + unconditionally stable, no spring
+/// stiffness blow-up). Reach cruise in ≈ SPEED/ACCEL ≈ 0.22 s.
+pub const REEL_PULL_SPEED: f64 = 26.0; // m/s toward the anchor while reeling in
+pub const REEL_PULL_ACCEL: f64 = 120.0; // m/s² winch acceleration toward anchor
+
 /// Soft-grounding penetration push-out spring (rho ≥ R).
 /// ω_n = sqrt(GROUND_K / 78) ≈ 8.0 rad/s ⇒ ω_n·h ≈ 0.033 ≪ 2.
 pub const GROUND_K: f64 = 5000.0;
