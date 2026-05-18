@@ -975,6 +975,785 @@ fn plan_beam(
     })
 }
 
+// ── MCTS planner (planner == 6) ──────────────────────────────────────────────
+// A proper UCT (Upper Confidence bounds applied to Trees) search over
+// multi-hop anchor sequences. The action set at every node is the SAME sorted
+// (anchor, reel) candidate set used by RRT/CEM (build_anchors + sort_anchors;
+// reel ∈ {-1,0}). A tree node holds the post-rollout simulated state (p, v)
+// reached by the path of actions from the root. Tree policy is UCB1 with
+// exploration constant MCTS_C; expansion adds one untried child; the rollout
+// (default policy) is a short random walk of further hops scored by
+// branch_cost. We run MCTS_ITERS iterations; depth is capped at MCTS_DEPTH
+// hops. We return the FIRST hop of the most-visited root child (the standard
+// robust-child MCTS recommendation).
+//
+// Cost→reward map: branch_cost is "lower is better" and unbounded; MCTS needs
+// a bounded reward in roughly [0,1] so UCB1's exploration term is well-scaled.
+// We map deterministically  reward = 1 / (1 + exp(cost / MCTS_REWARD_SCALE))
+// — a logistic squash. It is strictly monotone decreasing in cost (lower cost
+// ⇒ higher reward), bounded in (0,1), depends only on the deterministic cost,
+// and has no tunable offset (the constant cancels in argmax-by-visits / is
+// only a temperature on exploration). Backprop accumulates the SUM of these
+// rewards; the node value used by UCB1 is the running mean (sum / visits).
+const MCTS_ITERS: u32 = 64;
+const MCTS_C: f64 = 1.2;
+const MCTS_DEPTH: u32 = 4;
+const MCTS_REWARD_SCALE: f64 = 20.0;
+
+struct MctsNode {
+    p: Vec3,
+    v: Vec3,
+    parent: i32,
+    // Action taken from parent to reach this node (root: sentinel).
+    a_pos: Vec3,
+    reel: i32,
+    is_spar: bool,
+    run_min: f64,
+    depth: u32,
+    visits: u32,
+    value_sum: f64,
+    // Children created so far + count of actions already expanded. Actions are
+    // indexed (ai * 2 + reel_bit) over the sorted anchor list (deterministic).
+    children: Vec<usize>,
+    untried_next: usize,
+}
+
+fn mcts_cost_to_reward(cost: f64) -> f64 {
+    1.0 / (1.0 + (cost / MCTS_REWARD_SCALE).exp())
+}
+
+fn plan_mcts(
+    player: &PlayerSim,
+    target: Vec3,
+    state: &SimState,
+    opponents: &[Vec3],
+    teammates: &[Vec3],
+    sticky: Option<Sticky>,
+    spars: &[Vec3],
+) -> Option<Plan> {
+    let pos = player.p;
+    let vel = player.v;
+    let omega = state.omega;
+    let to_dir = to_target_dir(pos, target);
+
+    let mut anchors = build_anchors(pos, to_dir, spars, player, state);
+    if anchors.is_empty() {
+        return None;
+    }
+    sort_anchors(&mut anchors, target);
+    let a_n = anchors.len();
+    // Total discrete actions = anchors × {reel=-1, reel=0}.
+    let n_actions = a_n * 2;
+
+    let replan_w = rrt_replan_ticks();
+    let mut rng = HashRng::new(&player.id, state.tick.div_euclid(replan_w));
+
+    let mut nodes: Vec<MctsNode> = Vec::with_capacity(MCTS_ITERS as usize + 1);
+    nodes.push(MctsNode {
+        p: pos,
+        v: vel,
+        parent: -1,
+        a_pos: pos,
+        reel: -1,
+        is_spar: true,
+        run_min: pos.sub(target).len(),
+        depth: 0,
+        visits: 0,
+        value_sum: 0.0,
+        children: Vec::new(),
+        untried_next: 0,
+    });
+
+    // Decode action index → (anchor index, reel). Order: ai ascending, then
+    // reel=-1 before reel=0 (deterministic).
+    let decode = |act: usize| -> (usize, i32) {
+        (act / 2, if act % 2 == 1 { 0 } else { -1 })
+    };
+
+    for _ in 0..MCTS_ITERS {
+        // ---- Selection: descend by UCB1 until a node with an untried action
+        // or at depth cap. ----
+        let mut path: Vec<usize> = vec![0];
+        let mut cur = 0usize;
+        loop {
+            let depth = nodes[cur].depth;
+            let fully_expanded = nodes[cur].untried_next >= n_actions;
+            if depth >= MCTS_DEPTH || !fully_expanded {
+                break;
+            }
+            if nodes[cur].children.is_empty() {
+                break;
+            }
+            // UCB1 over children. Deterministic tie-break: higher score wins;
+            // on a numeric tie, lower child node index (= earlier action).
+            let parent_visits = nodes[cur].visits.max(1) as f64;
+            let mut best_child = nodes[cur].children[0];
+            let mut best_ucb = f64::NEG_INFINITY;
+            for &ci in &nodes[cur].children {
+                let cn = &nodes[ci];
+                let mean = if cn.visits > 0 {
+                    cn.value_sum / cn.visits as f64
+                } else {
+                    0.0
+                };
+                let explore = if cn.visits > 0 {
+                    MCTS_C * (parent_visits.ln() / cn.visits as f64).sqrt()
+                } else {
+                    f64::INFINITY
+                };
+                let ucb = mean + explore;
+                if ucb > best_ucb + 1e-12 {
+                    best_ucb = ucb;
+                    best_child = ci;
+                }
+            }
+            cur = best_child;
+            path.push(cur);
+        }
+
+        // ---- Expansion: if room, add one untried child via the next action
+        // index (deterministic order). ----
+        let mut leaf = cur;
+        if nodes[cur].depth < MCTS_DEPTH && nodes[cur].untried_next < n_actions {
+            let act = nodes[cur].untried_next;
+            nodes[cur].untried_next += 1;
+            let (ai, reel) = decode(act);
+            let (fp, fv, frun) = (nodes[cur].p, nodes[cur].v, nodes[cur].run_min);
+            let r = rollout_primitive(
+                fp, fv, anchors[ai].pos, omega, reel, target, RRT_PRIM_STEPS, PLAN_H,
+            );
+            let run_min = frun.min(r.min_dist);
+            let depth = nodes[cur].depth + 1;
+            let new_idx = nodes.len();
+            nodes.push(MctsNode {
+                p: r.p,
+                v: r.v,
+                parent: cur as i32,
+                a_pos: anchors[ai].pos,
+                reel,
+                is_spar: anchors[ai].is_spar,
+                run_min,
+                depth,
+                visits: 0,
+                value_sum: 0.0,
+                children: Vec::new(),
+                untried_next: 0,
+            });
+            nodes[cur].children.push(new_idx);
+            leaf = new_idx;
+            path.push(new_idx);
+        }
+
+        // ---- Simulation (default policy): random hops from the leaf state to
+        // the depth cap, all randomness from the windowed rng. The leaf's own
+        // running-min/term scores the rollout via branch_cost. ----
+        let mut sp = nodes[leaf].p;
+        let mut sv = nodes[leaf].v;
+        let mut run_min = nodes[leaf].run_min;
+        let mut term = {
+            // term toward target at the leaf state (so even a depth-cap leaf
+            // gets a meaningful momentum reward).
+            let to_t = target.sub(sp);
+            let dl = to_t.len();
+            if dl > 1e-6 {
+                sv.dot(to_t.scale(1.0 / dl)).max(0.0)
+            } else {
+                0.0
+            }
+        };
+        let mut d = nodes[leaf].depth;
+        while d < MCTS_DEPTH {
+            // Uniform random action over the discrete action set.
+            let ai = ((rng.next() * a_n as f64) as i64 as usize).min(a_n - 1);
+            let reel: i32 = if rng.next() < 0.5 { -1 } else { 0 };
+            let r = rollout_primitive(
+                sp, sv, anchors[ai].pos, omega, reel, target, RRT_PRIM_STEPS, PLAN_H,
+            );
+            sp = r.p;
+            sv = r.v;
+            run_min = run_min.min(r.min_dist);
+            term = r.term;
+            d += 1;
+        }
+        let cost = branch_cost(sp, run_min, term, opponents, teammates);
+        let reward = mcts_cost_to_reward(cost);
+
+        // ---- Backpropagation: add reward + visit along the visited path. ----
+        for &ni in &path {
+            nodes[ni].visits += 1;
+            nodes[ni].value_sum += reward;
+        }
+    }
+
+    // Recommendation: most-visited root child. Deterministic tie-break:
+    // visits desc, then mean value desc, then anchor x asc, then reel asc.
+    if nodes[0].children.is_empty() {
+        return None;
+    }
+    let mut best_child = nodes[0].children[0];
+    for &ci in &nodes[0].children {
+        let cn = &nodes[ci];
+        let bn = &nodes[best_child];
+        let cn_mean = if cn.visits > 0 { cn.value_sum / cn.visits as f64 } else { 0.0 };
+        let bn_mean = if bn.visits > 0 { bn.value_sum / bn.visits as f64 } else { 0.0 };
+        let better = if cn.visits != bn.visits {
+            cn.visits > bn.visits
+        } else if (cn_mean - bn_mean).abs() > 1e-12 {
+            cn_mean > bn_mean
+        } else if cn.a_pos.x != bn.a_pos.x {
+            cn.a_pos.x < bn.a_pos.x
+        } else {
+            cn.reel < bn.reel
+        };
+        if better {
+            best_child = ci;
+        }
+    }
+    let bc = &nodes[best_child];
+    let mut chosen_pos = bc.a_pos;
+    let mut chosen_reel = bc.reel;
+    let mut chosen_is_spar = bc.is_spar;
+    let mut chosen_pd = bc.run_min;
+    // Root-child cost for the sticky comparison: re-derive from the first hop.
+    let first_r = rollout_primitive(
+        pos, vel, chosen_pos, omega, chosen_reel, target, RRT_PRIM_STEPS, PLAN_H,
+    );
+    let best_c = branch_cost(
+        first_r.p,
+        pos.sub(target).len().min(first_r.min_dist),
+        first_r.term,
+        opponents,
+        teammates,
+    );
+
+    if let Some(st) = sticky {
+        let sd = pos.sub(st.pos).len();
+        if sd >= 2.0 && sd <= 180.0 && chosen_pos.sub(st.pos).len() > 4.0 {
+            let sr = rollout_primitive(
+                pos, vel, st.pos, omega, st.reel, target, RRT_PRIM_STEPS, PLAN_H,
+            );
+            let sticky_cost =
+                branch_cost(sr.p, sr.min_dist, sr.term, opponents, teammates);
+            if best_c >= sticky_cost - ANCHOR_SWITCH_MARGIN {
+                chosen_pos = st.pos;
+                chosen_reel = st.reel;
+                chosen_is_spar = st.pos.y.hypot(st.pos.z) < 1.0;
+                chosen_pd = sr.min_dist;
+            }
+        }
+    }
+    Some(Plan {
+        anchor_pos: chosen_pos,
+        reel: chosen_reel,
+        projected_dist: chosen_pd,
+        is_spar: chosen_is_spar,
+    })
+}
+
+// ── Potential-field planner (planner == 7) ───────────────────────────────────
+// NO search. Build an analytic navigation field at the player's position:
+//   • an ATTRACTOR pulling toward `target` (unit vector, gain PF_K_ATTRACT),
+//   • a REPULSOR from each opponent within PF_REPEL_RADIUS, magnitude
+//     PF_K_REPEL·(1/ρ − 1/R₀) along the away-from-opponent direction (the
+//     classic FIRAS repulsive potential gradient, clamped at the radius),
+//   • a SKIN repulsor pushing inward as the player's cylindrical radius
+//     ρ = √(y²+z²) approaches the hull R (gain PF_K_SKIN, active within
+//     PF_SKIN_BAND of R), directed along −(0,y,z)/ρ.
+// The summed field gradient g is the desired direction of travel. For each
+// (anchor,reel) candidate (same build_anchors set) we do ONE rollout_primitive
+// and score by how well the resulting swing DIRECTION (end velocity, falling
+// back to displacement) aligns with g, tie-broken toward low min_dist:
+//   score = PF_W_ALIGN · align  −  min_dist        (higher = better)
+// Pure, allocation-light, no RNG — determinism is structural.
+const PF_K_ATTRACT: f64 = 1.0;
+const PF_K_REPEL: f64 = 30.0;
+const PF_REPEL_RADIUS: f64 = 14.0;
+const PF_K_SKIN: f64 = 1.5;
+const PF_SKIN_BAND: f64 = 8.0;
+const PF_W_ALIGN: f64 = 25.0;
+
+fn potential_field_grad(pos: Vec3, target: Vec3, opponents: &[Vec3]) -> Vec3 {
+    // Attractor: unit pull toward target.
+    let mut g = to_target_dir(pos, target).scale(PF_K_ATTRACT);
+    // Opponent repulsors (FIRAS gradient, clamped at PF_REPEL_RADIUS).
+    for o in opponents {
+        let away = pos.sub(*o);
+        let rho = away.len();
+        if rho > 1e-6 && rho < PF_REPEL_RADIUS {
+            let mag = PF_K_REPEL * (1.0 / rho - 1.0 / PF_REPEL_RADIUS) / (rho * rho);
+            g = g.add(away.scale(mag / rho));
+        }
+    }
+    // Skin repulsor: push inward as ρ→R.
+    let rho_yz = (pos.y * pos.y + pos.z * pos.z).sqrt();
+    if rho_yz > R - PF_SKIN_BAND {
+        let depth = rho_yz - (R - PF_SKIN_BAND);
+        let inward = Vec3::new(0.0, -pos.y / rho_yz, -pos.z / rho_yz);
+        g = g.add(inward.scale(PF_K_SKIN * depth));
+    }
+    g
+}
+
+fn plan_potential_field(
+    player: &PlayerSim,
+    target: Vec3,
+    state: &SimState,
+    opponents: &[Vec3],
+    teammates: &[Vec3],
+    sticky: Option<Sticky>,
+    spars: &[Vec3],
+) -> Option<Plan> {
+    let pos = player.p;
+    let vel = player.v;
+    let omega = state.omega;
+    let to_dir = to_target_dir(pos, target);
+
+    let mut anchors = build_anchors(pos, to_dir, spars, player, state);
+    if anchors.is_empty() {
+        return None;
+    }
+    sort_anchors(&mut anchors, target);
+
+    let g = potential_field_grad(pos, target, opponents);
+    let g_len = g.len();
+    let g_hat = if g_len > 1e-6 {
+        g.scale(1.0 / g_len)
+    } else {
+        to_dir
+    };
+
+    // For each (anchor,reel): one rollout, score by field alignment − min_dist.
+    let mut best_score = f64::NEG_INFINITY;
+    let mut best_pos = anchors[0].pos;
+    let mut best_reel = -1i32;
+    let mut best_is_spar = anchors[0].is_spar;
+    let mut best_pd = f64::INFINITY;
+    let mut best_c = f64::INFINITY;
+    for a in &anchors {
+        for &reel in &[-1i32, 0i32] {
+            let r = rollout_primitive(
+                pos, vel, a.pos, omega, reel, target, RRT_PRIM_STEPS, PLAN_H,
+            );
+            // Swing direction: end velocity if it has magnitude, else net
+            // displacement from the start.
+            let vl = r.v.len();
+            let dir = if vl > 1e-6 {
+                r.v.scale(1.0 / vl)
+            } else {
+                let disp = r.p.sub(pos);
+                let dl = disp.len();
+                if dl > 1e-6 {
+                    disp.scale(1.0 / dl)
+                } else {
+                    g_hat
+                }
+            };
+            let align = dir.dot(g_hat);
+            let score = PF_W_ALIGN * align - r.min_dist;
+            let c = branch_cost(r.p, r.min_dist, r.term, opponents, teammates);
+            // Deterministic argmax: score desc, then cost asc, then anchor x
+            // asc, then reel asc.
+            let better = if score > best_score + 1e-12 {
+                true
+            } else if (score - best_score).abs() <= 1e-12 {
+                if c < best_c - 1e-12 {
+                    true
+                } else if (c - best_c).abs() <= 1e-12 {
+                    if a.pos.x != best_pos.x {
+                        a.pos.x < best_pos.x
+                    } else {
+                        reel < best_reel
+                    }
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+            if better {
+                best_score = score;
+                best_pos = a.pos;
+                best_reel = reel;
+                best_is_spar = a.is_spar;
+                best_pd = r.min_dist;
+                best_c = c;
+            }
+        }
+    }
+
+    let mut chosen_pos = best_pos;
+    let mut chosen_reel = best_reel;
+    let mut chosen_is_spar = best_is_spar;
+    let mut chosen_pd = best_pd;
+
+    if let Some(st) = sticky {
+        let sd = pos.sub(st.pos).len();
+        if sd >= 2.0 && sd <= 180.0 && chosen_pos.sub(st.pos).len() > 4.0 {
+            let sr = rollout_primitive(
+                pos, vel, st.pos, omega, st.reel, target, RRT_PRIM_STEPS, PLAN_H,
+            );
+            let sticky_cost =
+                branch_cost(sr.p, sr.min_dist, sr.term, opponents, teammates);
+            if best_c >= sticky_cost - ANCHOR_SWITCH_MARGIN {
+                chosen_pos = st.pos;
+                chosen_reel = st.reel;
+                chosen_is_spar = st.pos.y.hypot(st.pos.z) < 1.0;
+                chosen_pd = sr.min_dist;
+            }
+        }
+    }
+    Some(Plan {
+        anchor_pos: chosen_pos,
+        reel: chosen_reel,
+        projected_dist: chosen_pd,
+        is_spar: chosen_is_spar,
+    })
+}
+
+// ── Random-shooting planner (planner == 8) ───────────────────────────────────
+// The honest control / baseline. Sample RS_N (anchor, reel) pairs UNIFORMLY
+// from the same build_anchors candidate set via the windowed HashRng — NO
+// goal bias, NO categorical reweighting (deliberately dumber than CEM/MPPI's
+// w[i]=1/(1+i) proposal) — roll each out and return argmin branch_cost. This
+// tells us how much the structured planners actually buy over plain Monte
+// Carlo. Determinism: every draw is the windowed rng; ties broken
+// deterministically (cost, anchor x, reel).
+const RS_N: u32 = 48;
+
+fn plan_random_shooting(
+    player: &PlayerSim,
+    target: Vec3,
+    state: &SimState,
+    opponents: &[Vec3],
+    teammates: &[Vec3],
+    sticky: Option<Sticky>,
+    spars: &[Vec3],
+) -> Option<Plan> {
+    let pos = player.p;
+    let vel = player.v;
+    let omega = state.omega;
+    let to_dir = to_target_dir(pos, target);
+
+    let mut anchors = build_anchors(pos, to_dir, spars, player, state);
+    if anchors.is_empty() {
+        return None;
+    }
+    sort_anchors(&mut anchors, target);
+    let a_n = anchors.len();
+
+    let replan_w = rrt_replan_ticks();
+    let mut rng = HashRng::new(&player.id, state.tick.div_euclid(replan_w));
+
+    let mut best_c = f64::INFINITY;
+    let mut best_pos = anchors[0].pos;
+    let mut best_reel = -1i32;
+    let mut best_is_spar = anchors[0].is_spar;
+    let mut best_pd = f64::INFINITY;
+    for _ in 0..RS_N {
+        // Truly uniform anchor index (no u*u goal bias) and uniform reel.
+        let ai = ((rng.next() * a_n as f64) as i64 as usize).min(a_n - 1);
+        let reel: i32 = if rng.next() < 0.5 { -1 } else { 0 };
+        let r = rollout_primitive(
+            pos, vel, anchors[ai].pos, omega, reel, target, RRT_PRIM_STEPS, PLAN_H,
+        );
+        let c = branch_cost(r.p, r.min_dist, r.term, opponents, teammates);
+        let better = if c < best_c - 1e-12 {
+            true
+        } else if (c - best_c).abs() <= 1e-12 {
+            if anchors[ai].pos.x != best_pos.x {
+                anchors[ai].pos.x < best_pos.x
+            } else {
+                reel < best_reel
+            }
+        } else {
+            false
+        };
+        if better {
+            best_c = c;
+            best_pos = anchors[ai].pos;
+            best_reel = reel;
+            best_is_spar = anchors[ai].is_spar;
+            best_pd = r.min_dist;
+        }
+    }
+
+    let mut chosen_pos = best_pos;
+    let mut chosen_reel = best_reel;
+    let mut chosen_is_spar = best_is_spar;
+    let mut chosen_pd = best_pd;
+
+    if let Some(st) = sticky {
+        let sd = pos.sub(st.pos).len();
+        if sd >= 2.0 && sd <= 180.0 && chosen_pos.sub(st.pos).len() > 4.0 {
+            let sr = rollout_primitive(
+                pos, vel, st.pos, omega, st.reel, target, RRT_PRIM_STEPS, PLAN_H,
+            );
+            let sticky_cost =
+                branch_cost(sr.p, sr.min_dist, sr.term, opponents, teammates);
+            if best_c >= sticky_cost - ANCHOR_SWITCH_MARGIN {
+                chosen_pos = st.pos;
+                chosen_reel = st.reel;
+                chosen_is_spar = st.pos.y.hypot(st.pos.z) < 1.0;
+                chosen_pd = sr.min_dist;
+            }
+        }
+    }
+    Some(Plan {
+        anchor_pos: chosen_pos,
+        reel: chosen_reel,
+        projected_dist: chosen_pd,
+        is_spar: chosen_is_spar,
+    })
+}
+
+// ── Coordination planner (planner == 9) — the first multi-agent-aware arm ─────
+// Same candidate set + single rollout per (anchor,reel) as Random-Shooting,
+// but the selection cost is branch_cost AUGMENTED with two genuinely
+// joint-aware terms read from same-team entries of `state.players`:
+//
+//  (a) TEAMMATE-INTERFERENCE PENALTY. This is an explicit extension of the
+//      existing wSpace spacing-penalty machinery (see branch_cost / the
+//      spacing_pen closure: penalize ending within 18 m of a teammate). We
+//      keep that idea but make it path-aware. For each same-team teammate
+//      (id != self) we form two penalties:
+//        • end-proximity: if the swing END p is within COORD_INTERF_RADIUS of
+//          the teammate's CURRENT position, add
+//          (COORD_INTERF_RADIUS − d) · COORD_W_INTERF.
+//        • lane-crossing: approximate the teammate's likely swing lane as the
+//          segment from their current position along their current velocity
+//          for COORD_LANE_LEN seconds; if the player's swung path (sampled as
+//          the start→end chord) passes within COORD_LANE_RADIUS of that lane
+//          segment, add COORD_W_LANE · (COORD_LANE_RADIUS − sep). Segment-
+//          segment closest distance, fully analytic & deterministic.
+//
+//  (b) PASS-SETUP ATTRACTOR. Identify the most-FORWARD same-team teammate
+//      (largest x — toward the attacking goal in this rig frame) as the
+//      receiver. If, at the swing END, there is an open lane to the receiver
+//      — i.e. the end→receiver direction is not blocked by an opponent within
+//      COORD_LOS_RADIUS of that segment AND the end is within COORD_PASS_RANGE
+//      of the receiver — subtract a small bonus COORD_W_PASS (a NEGATIVE cost
+//      term, capped so it never dominates the primary min_dist objective).
+//
+// All terms are continuous, deterministic, read only Vec-ordered
+// state.players, and use no RNG beyond the windowed sampler shared with the
+// rollouts. Consts COORD_* below; defaults chosen so interference ≈ the
+// existing defender-danger scale (×3.5 over a few metres) and the pass bonus
+// is bounded well under a typical min_dist (tens of metres).
+const COORD_INTERF_RADIUS: f64 = 16.0;
+const COORD_W_INTERF: f64 = 1.5;
+const COORD_LANE_LEN: f64 = 1.0; // seconds of teammate velocity extrapolation
+const COORD_LANE_RADIUS: f64 = 8.0;
+const COORD_W_LANE: f64 = 0.9;
+const COORD_LOS_RADIUS: f64 = 6.0;
+const COORD_PASS_RANGE: f64 = 70.0;
+const COORD_W_PASS: f64 = 8.0;
+
+/// Closest distance between segment [a0,a1] and segment [b0,b1] (clamped,
+/// analytic, deterministic — the standard Ericson formulation).
+fn seg_seg_dist(a0: Vec3, a1: Vec3, b0: Vec3, b1: Vec3) -> f64 {
+    let d1 = a1.sub(a0);
+    let d2 = b1.sub(b0);
+    let r = a0.sub(b0);
+    let a = d1.dot(d1);
+    let e = d2.dot(d2);
+    let f = d2.dot(r);
+    let (mut s, mut t);
+    if a <= 1e-12 && e <= 1e-12 {
+        return a0.sub(b0).len();
+    }
+    if a <= 1e-12 {
+        s = 0.0;
+        t = (f / e).clamp(0.0, 1.0);
+    } else {
+        let c = d1.dot(r);
+        if e <= 1e-12 {
+            t = 0.0;
+            s = (-c / a).clamp(0.0, 1.0);
+        } else {
+            let b = d1.dot(d2);
+            let denom = a * e - b * b;
+            s = if denom > 1e-12 {
+                ((b * f - c * e) / denom).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            t = (b * s + f) / e;
+            if t < 0.0 {
+                t = 0.0;
+                s = (-c / a).clamp(0.0, 1.0);
+            } else if t > 1.0 {
+                t = 1.0;
+                s = ((b - c) / a).clamp(0.0, 1.0);
+            }
+        }
+    }
+    let cp1 = a0.add(d1.scale(s));
+    let cp2 = b0.add(d2.scale(t));
+    cp1.sub(cp2).len()
+}
+
+/// Distance from point `pt` to segment [s0,s1].
+fn point_seg_dist(pt: Vec3, s0: Vec3, s1: Vec3) -> f64 {
+    let d = s1.sub(s0);
+    let l2 = d.dot(d);
+    if l2 <= 1e-12 {
+        return pt.sub(s0).len();
+    }
+    let t = (pt.sub(s0).dot(d) / l2).clamp(0.0, 1.0);
+    pt.sub(s0.add(d.scale(t))).len()
+}
+
+fn plan_coordination(
+    player: &PlayerSim,
+    target: Vec3,
+    state: &SimState,
+    opponents: &[Vec3],
+    teammates: &[Vec3],
+    sticky: Option<Sticky>,
+    spars: &[Vec3],
+) -> Option<Plan> {
+    let pos = player.p;
+    let vel = player.v;
+    let omega = state.omega;
+    let to_dir = to_target_dir(pos, target);
+
+    let mut anchors = build_anchors(pos, to_dir, spars, player, state);
+    if anchors.is_empty() {
+        return None;
+    }
+    sort_anchors(&mut anchors, target);
+
+    // Same-team teammates (id != self), in deterministic Vec order, with both
+    // current position and velocity (for the lane extrapolation).
+    let mut tm: Vec<(Vec3, Vec3)> = Vec::new();
+    for pl in &state.players {
+        if pl.id == player.id || pl.team != player.team {
+            continue;
+        }
+        tm.push((pl.p, pl.v));
+    }
+    // Receiver = most-forward (max x) same-team teammate. Deterministic
+    // tie-break: larger x, then smaller y, then smaller z.
+    let mut receiver: Option<Vec3> = None;
+    for &(tp, _) in &tm {
+        receiver = Some(match receiver {
+            None => tp,
+            Some(cur) => {
+                let take = if tp.x != cur.x {
+                    tp.x > cur.x
+                } else if tp.y != cur.y {
+                    tp.y < cur.y
+                } else {
+                    tp.z < cur.z
+                };
+                if take {
+                    tp
+                } else {
+                    cur
+                }
+            }
+        });
+    }
+
+    // Augmented cost for one rollout result.
+    let coord_cost = |end_p: Vec3, run_min: f64, term: f64| -> f64 {
+        let mut c = branch_cost(end_p, run_min, term, opponents, teammates);
+        // (a) interference: end-proximity + lane-crossing.
+        for &(tp, tv) in &tm {
+            let dend = end_p.sub(tp).len();
+            if dend < COORD_INTERF_RADIUS {
+                c += (COORD_INTERF_RADIUS - dend) * COORD_W_INTERF;
+            }
+            // Teammate's likely swing lane: tp → tp + tv*COORD_LANE_LEN.
+            let lane_end = tp.add(tv.scale(COORD_LANE_LEN));
+            // Player's swung path approximated by the start→end chord.
+            let sep = seg_seg_dist(pos, end_p, tp, lane_end);
+            if sep < COORD_LANE_RADIUS {
+                c += (COORD_LANE_RADIUS - sep) * COORD_W_LANE;
+            }
+        }
+        // (b) pass-setup attractor: open lane to the forward receiver.
+        if let Some(rp) = receiver {
+            let to_rcv = rp.sub(end_p).len();
+            if to_rcv > 1e-6 && to_rcv < COORD_PASS_RANGE {
+                let mut blocked = false;
+                for o in opponents {
+                    if point_seg_dist(*o, end_p, rp) < COORD_LOS_RADIUS {
+                        blocked = true;
+                        break;
+                    }
+                }
+                if !blocked {
+                    // Bonus scaled by openness (closer ⇒ stronger), capped at
+                    // COORD_W_PASS so it never overwhelms min_dist.
+                    let openness = 1.0 - to_rcv / COORD_PASS_RANGE;
+                    c -= COORD_W_PASS * openness;
+                }
+            }
+        }
+        c
+    };
+
+    let mut best_c = f64::INFINITY;
+    let mut best_pos = anchors[0].pos;
+    let mut best_reel = -1i32;
+    let mut best_is_spar = anchors[0].is_spar;
+    let mut best_pd = f64::INFINITY;
+    for a in &anchors {
+        for &reel in &[-1i32, 0i32] {
+            let r = rollout_primitive(
+                pos, vel, a.pos, omega, reel, target, RRT_PRIM_STEPS, PLAN_H,
+            );
+            let c = coord_cost(r.p, r.min_dist, r.term);
+            let better = if c < best_c - 1e-12 {
+                true
+            } else if (c - best_c).abs() <= 1e-12 {
+                if a.pos.x != best_pos.x {
+                    a.pos.x < best_pos.x
+                } else {
+                    reel < best_reel
+                }
+            } else {
+                false
+            };
+            if better {
+                best_c = c;
+                best_pos = a.pos;
+                best_reel = reel;
+                best_is_spar = a.is_spar;
+                best_pd = r.min_dist;
+            }
+        }
+    }
+
+    let mut chosen_pos = best_pos;
+    let mut chosen_reel = best_reel;
+    let mut chosen_is_spar = best_is_spar;
+    let mut chosen_pd = best_pd;
+
+    if let Some(st) = sticky {
+        let sd = pos.sub(st.pos).len();
+        if sd >= 2.0 && sd <= 180.0 && chosen_pos.sub(st.pos).len() > 4.0 {
+            let sr = rollout_primitive(
+                pos, vel, st.pos, omega, st.reel, target, RRT_PRIM_STEPS, PLAN_H,
+            );
+            let sticky_cost = coord_cost(sr.p, sr.min_dist, sr.term);
+            if best_c >= sticky_cost - ANCHOR_SWITCH_MARGIN {
+                chosen_pos = st.pos;
+                chosen_reel = st.reel;
+                chosen_is_spar = st.pos.y.hypot(st.pos.z) < 1.0;
+                chosen_pd = sr.min_dist;
+            }
+        }
+    }
+    Some(Plan {
+        anchor_pos: chosen_pos,
+        reel: chosen_reel,
+        projected_dist: chosen_pd,
+        is_spar: chosen_is_spar,
+    })
+}
+
 // ── Defender-aware swing sim (TS GP.ts:229-300) ──────────────────────────────
 struct SwingDef {
     closest_dist: f64,
@@ -1218,8 +1997,10 @@ pub fn plan_grapple(
     let spars = spar_positions_cached();
 
     // Strategy switch (TS GP.ts:689-696): planner 2 = CEM, 1 = RRT, else MPC.
-    // Extended arms: 3 = MPPI, 4 = SimAnneal, 5 = Beam. Arms 0/1/2 keep their
-    // exact original code path (this is a pure prepended dispatch).
+    // Extended arms: 3 = MPPI, 4 = SimAnneal, 5 = Beam, 6 = MCTS,
+    // 7 = PotentialField, 8 = RandomShooting, 9 = Coordination. Arms 0/1/2
+    // keep their exact original code path (this is a pure prepended dispatch);
+    // any id ≥ 10 (or any arm that returns None) falls through to MPC.
     match planner {
         3 => {
             if let Some(r) =
@@ -1239,6 +2020,34 @@ pub fn plan_grapple(
             if let Some(r) =
                 plan_beam(player, target, state, &opponents, &teammates, sticky, spars)
             {
+                return Some(r);
+            }
+        }
+        6 => {
+            if let Some(r) =
+                plan_mcts(player, target, state, &opponents, &teammates, sticky, spars)
+            {
+                return Some(r);
+            }
+        }
+        7 => {
+            if let Some(r) = plan_potential_field(
+                player, target, state, &opponents, &teammates, sticky, spars,
+            ) {
+                return Some(r);
+            }
+        }
+        8 => {
+            if let Some(r) = plan_random_shooting(
+                player, target, state, &opponents, &teammates, sticky, spars,
+            ) {
+                return Some(r);
+            }
+        }
+        9 => {
+            if let Some(r) = plan_coordination(
+                player, target, state, &opponents, &teammates, sticky, spars,
+            ) {
                 return Some(r);
             }
         }
@@ -1663,10 +2472,13 @@ mod tests {
                 let again =
                     plan_grapple(&player, target, &state, true, None, planner);
                 assert_eq!(base, again, "planner {} tick {}", planner, tick);
-                // A high planner id (>=6) must fall back to MPC == planner 0.
+                // A high planner id (>=10) must fall back to MPC == planner 0
+                // (6..=9 are now real arms; 10+ keeps the MPC fallback).
                 if planner == 0 {
-                    let hi = plan_grapple(&player, target, &state, true, None, 9);
-                    assert_eq!(base, hi, "planner 9 should fall back to MPC");
+                    let hi = plan_grapple(&player, target, &state, true, None, 10);
+                    assert_eq!(base, hi, "planner 10 should fall back to MPC");
+                    let hi2 = plan_grapple(&player, target, &state, true, None, 42);
+                    assert_eq!(base, hi2, "planner 42 should fall back to MPC");
                 }
             }
         }
@@ -1685,6 +2497,154 @@ mod tests {
         for planner in 3..=5 {
             assert!(plan_grapple(&player, v(1.0, 0.0, 0.0), &state, true, None, planner)
                 .is_none());
+        }
+    }
+
+    // ── Newest planner classes: MCTS (6), PotentialField (7),
+    //    RandomShooting (8), Coordination (9) ──────────────────────────────
+
+    /// Determinism: same inputs ⇒ identical Plan for classes 6..=9, tested
+    /// twice with AND without a sticky anchor (±sticky).
+    #[test]
+    fn coord_planners_are_deterministic() {
+        for planner in 6..=9 {
+            let (player, state, target) = demo_state(99);
+            let a = plan_grapple(&player, target, &state, true, None, planner);
+            let b = plan_grapple(&player, target, &state, true, None, planner);
+            assert_eq!(a, b, "planner {} not deterministic", planner);
+
+            let st = Some(Sticky { pos: v(40.0, 0.0, 0.0), reel: -1 });
+            let c = plan_grapple(&player, target, &state, true, st, planner);
+            let d = plan_grapple(&player, target, &state, true, st, planner);
+            assert_eq!(c, d, "planner {} sticky not deterministic", planner);
+
+            // A different tick window stays self-consistent too.
+            let (p2, s2, t2) = demo_state(123);
+            let e = plan_grapple(&p2, t2, &s2, true, st, planner);
+            let f = plan_grapple(&p2, t2, &s2, true, st, planner);
+            assert_eq!(e, f, "planner {} tick123 not deterministic", planner);
+        }
+    }
+
+    /// Finite/sane Plan: reel ∈ {-1,0}, finite anchor + projected_dist for
+    /// classes 6..=9.
+    #[test]
+    fn coord_planners_produce_finite_plans() {
+        for planner in 6..=9 {
+            let (player, state, target) = demo_state(123);
+            let plan = plan_grapple(&player, target, &state, true, None, planner)
+                .expect("a far target should yield a plan");
+            assert!(plan.anchor_pos.x.is_finite());
+            assert!(plan.anchor_pos.y.is_finite());
+            assert!(plan.anchor_pos.z.is_finite());
+            assert!(plan.projected_dist.is_finite());
+            assert!(
+                plan.reel == -1 || plan.reel == 0,
+                "planner {} reel {}",
+                planner,
+                plan.reel
+            );
+        }
+    }
+
+    /// Already-close → None holds for classes 6..=9 too.
+    #[test]
+    fn coord_planners_none_when_close() {
+        let player = PlayerSim {
+            id: "x".to_string(),
+            team: 0,
+            p: v(0.0, 0.0, 0.0),
+            v: v(0.0, 0.0, 0.0),
+        };
+        let state = SimState { omega: OMEGA, tick: 0, players: vec![player.clone()] };
+        for planner in 6..=9 {
+            assert!(plan_grapple(&player, v(1.0, 0.0, 0.0), &state, true, None, planner)
+                .is_none());
+        }
+    }
+
+    /// Regression pin: adding arms 6..=9 must not perturb classes 0..=5 — for
+    /// several ticks each class is byte-identical to a re-run, and ids ≥ 10
+    /// still fall back to MPC (== planner 0).
+    #[test]
+    fn classes_0_through_5_unaffected_by_coord_arms() {
+        for tick in [50i64, 99, 123, 7, 256] {
+            let (player, state, target) = demo_state(tick);
+            let mpc = plan_grapple(&player, target, &state, true, None, 0);
+            for planner in 0..=5 {
+                let a = plan_grapple(&player, target, &state, true, None, planner);
+                let b = plan_grapple(&player, target, &state, true, None, planner);
+                assert_eq!(a, b, "planner {} tick {} unstable", planner, tick);
+            }
+            for hi in [10i32, 11, 99, 1000] {
+                let h = plan_grapple(&player, target, &state, true, None, hi);
+                assert_eq!(mpc, h, "planner {} should fall back to MPC", hi);
+            }
+        }
+    }
+
+    /// MCTS cost→reward map: strictly decreasing in cost, bounded in (0,1).
+    #[test]
+    fn mcts_reward_map_is_monotone_and_bounded() {
+        let mut prev = f64::INFINITY;
+        for k in -50..=50 {
+            let cost = k as f64 * 4.0;
+            let r = mcts_cost_to_reward(cost);
+            assert!(r > 0.0 && r < 1.0, "reward {} out of (0,1)", r);
+            assert!(r < prev, "reward not strictly decreasing in cost");
+            prev = r;
+        }
+    }
+
+    /// Coordination is genuinely joint-aware: introducing a teammate sitting
+    /// on the swing path / interfering changes the chosen Plan relative to
+    /// the structure-blind Random-Shooting baseline on the same candidates.
+    /// (Not a parity claim — just that the coordination terms have effect.)
+    #[test]
+    fn coordination_terms_have_effect() {
+        let player = PlayerSim {
+            id: "rigger-A".to_string(),
+            team: 0,
+            p: v(0.0, 12.0, 0.0),
+            v: v(2.0, 0.0, 0.0),
+        };
+        // A same-team mate parked right in the typical swing corridor, plus
+        // a forward receiver to trigger the pass-setup attractor.
+        let mate = PlayerSim {
+            id: "rigger-B".to_string(),
+            team: 0,
+            p: v(40.0, 6.0, 2.0),
+            v: v(1.0, 0.0, 0.0),
+        };
+        let receiver = PlayerSim {
+            id: "rigger-C".to_string(),
+            team: 0,
+            p: v(100.0, 0.0, 0.0),
+            v: v(0.0, 0.0, 0.0),
+        };
+        let opp = PlayerSim {
+            id: "mark-Z".to_string(),
+            team: 1,
+            p: v(55.0, 5.0, 0.0),
+            v: v(0.0, 0.0, 0.0),
+        };
+        let state = SimState {
+            omega: OMEGA,
+            tick: 99,
+            players: vec![player.clone(), mate, receiver, opp],
+        };
+        let target = v(120.0, 0.0, 0.0);
+        let coord = plan_grapple(&player, target, &state, true, None, 9)
+            .expect("coordination should yield a plan");
+        let coord2 = plan_grapple(&player, target, &state, true, None, 9)
+            .expect("coordination should yield a plan");
+        assert_eq!(coord, coord2, "coordination not deterministic w/ teammates");
+        // Both coordination and the baseline must still be sane plans.
+        let base = plan_grapple(&player, target, &state, true, None, 8)
+            .expect("random-shooting should yield a plan");
+        for p in [coord, base] {
+            assert!(p.anchor_pos.x.is_finite() && p.projected_dist.is_finite());
+            assert!(p.reel == -1 || p.reel == 0);
         }
     }
 }
