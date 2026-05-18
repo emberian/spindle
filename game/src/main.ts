@@ -520,6 +520,10 @@ async function runWatch(
   const dbgTeamOf: Record<string, string> = {};
   for (const r of WATCH_ROSTER) dbgTeamOf[r.id] = r.team;
   let dbgPasses = 0, dbgIntercepts = 0, dbgGateClears = 0, dbgThrash = 0;
+  // Pass-chain craft: longest run of consecutive completed passes within a
+  // single possession (resets on turnover / score). Stringing passes is
+  // skill; a one-and-done huck is not.
+  let dbgPassStreak = 0, dbgPassStreakMax = 0;
   let dbgPrevHeld: string | null = null;
   let dbgLastThrownBy: string | null = null;
   let dbgPrevGate: string | null = null;
@@ -550,8 +554,14 @@ async function runWatch(
     {
       const b = snap.bell;
       if (b.heldBy && !dbgPrevHeld && dbgLastThrownBy && dbgLastThrownBy !== b.heldBy) {
-        if (dbgTeamOf[dbgLastThrownBy] === dbgTeamOf[b.heldBy]) dbgPasses++;
-        else dbgIntercepts++;
+        if (dbgTeamOf[dbgLastThrownBy] === dbgTeamOf[b.heldBy]) {
+          dbgPasses++;
+          dbgPassStreak++;
+          if (dbgPassStreak > dbgPassStreakMax) dbgPassStreakMax = dbgPassStreak;
+        } else {
+          dbgIntercepts++;
+          dbgPassStreak = 0; // possession lost — chain broken
+        }
       }
       if (!b.heldBy && b.thrownBy) dbgLastThrownBy = b.thrownBy;
       if (b.heldBy) dbgLastThrownBy = null;
@@ -579,12 +589,14 @@ async function runWatch(
     if (upd && upd.scored) {
       const kd = upd.scored.kind;
       dbgScores[kd] = (dbgScores[kd] ?? 0) + 1;
+      dbgPassStreak = 0; // possession resolved — chain ends
       audio.event(
         kd === 'loop' ? 'score_loop' : kd === 'rise' || kd === 'curl' ? 'score_rise'
           : kd === 'ground' ? 'score_ground' : 'score_fall',
       );
     } else if (upd && upd.turnover) {
       dbgScores['turnover'] = (dbgScores['turnover'] ?? 0) + 1;
+      dbgPassStreak = 0;
       audio.event('turnover');
     }
     reArm();
@@ -644,6 +656,7 @@ async function runWatch(
             intercepts: dbgIntercepts,
             gateClears: dbgGateClears,
             thrash: dbgThrash,
+            passStreakMax: dbgPassStreakMax,
             ticks: dbgTotalTicks,
           },
           players: dbgSnap.players.map((pl, i) => {

@@ -16,9 +16,16 @@
 import { test, expect, type Page } from '@playwright/test';
 
 // Normalisation caps (a component hits 1.0 at "clearly good for one match").
-const CAP = { gate: 6, pass: 6, intc: 8, score: 30, poss: 0.3, thrashK: 300, skinPct: 80 };
+const CAP = {
+  gate: 6, pass: 6, intc: 8, score: 30, poss: 0.3, thrashK: 300, skinPct: 80,
+  // v2.1 — purpose signals: shots that convert (not heaves) & strung passes.
+  shotConv: 0.4, chain: 4,
+};
 // Weights — sum to 1. Argue with these; this IS the skill model.
-const WT = { prog: 0.22, pass: 0.20, intc: 0.10, score: 0.18, poss: 0.08, calm: 0.14, field: 0.08 };
+const WT = {
+  prog: 0.18, pass: 0.15, intc: 0.08, score: 0.16, poss: 0.07,
+  calm: 0.12, field: 0.06, shotConv: 0.10, chain: 0.08,
+};
 const SCORE_PTS: Record<string, number> = { fall: 2, rise: 5, loop: 7, curl: 5, ground: 1 };
 // A few distinct matchups (home-row, away-row in the spectate picker) so a
 // score is not one team-pairing's fluke.
@@ -56,22 +63,32 @@ async function oneMatch(
   const held = (last?.heldFrac as number) ?? 0;
   const ticks = sk.ticks || 1;
   const scorePts = Object.entries(sc).reduce((a, [k, v]) => a + (SCORE_PTS[k] ?? 0) * v, 0);
+  // Scoring EVENTS (not turnover/clatter/caught) — for shot conversion.
+  const scoreEvents = ['fall', 'rise', 'loop', 'curl', 'ground']
+    .reduce((a, k) => a + (sc[k] ?? 0), 0);
+  const tw = (last?.throws ?? {}) as Record<string, number>;
+  const totalThrows = Object.values(tw).reduce((a, v) => a + v, 0);
+  const shotConv = totalThrows > 0 ? scoreEvents / totalThrows : 0;
+  const chainMax = sk.passStreakMax || 0;
   const skinPct = n ? (100 * skin) / n : 100;
   const thrashK = (sk.thrash || 0) / ticks * 1000;
   return {
     sub: {
-      prog:  clamp01((sk.gateClears || 0) / CAP.gate),
-      pass:  clamp01((sk.passes || 0) / CAP.pass),
-      intc:  clamp01((sk.intercepts || 0) / CAP.intc),
-      score: clamp01(scorePts / CAP.score),
-      poss:  clamp01(held / CAP.poss),
-      calm:  1 - clamp01(thrashK / CAP.thrashK),
-      field: 1 - clamp01(skinPct / CAP.skinPct),
+      prog:     clamp01((sk.gateClears || 0) / CAP.gate),
+      pass:     clamp01((sk.passes || 0) / CAP.pass),
+      intc:     clamp01((sk.intercepts || 0) / CAP.intc),
+      score:    clamp01(scorePts / CAP.score),
+      poss:     clamp01(held / CAP.poss),
+      calm:     1 - clamp01(thrashK / CAP.thrashK),
+      field:    1 - clamp01(skinPct / CAP.skinPct),
+      shotConv: clamp01(shotConv / CAP.shotConv),
+      chain:    clamp01(chainMax / CAP.chain),
     },
     raw: {
       gateClears: sk.gateClears || 0, passes: sk.passes || 0,
       intercepts: sk.intercepts || 0, scorePts,
       heldFrac: held, thrashK: +thrashK.toFixed(0), skinPct: +skinPct.toFixed(0),
+      shotConv: +shotConv.toFixed(2), chainMax,
     },
   };
 }
