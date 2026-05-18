@@ -645,17 +645,27 @@ mod tests {
         set_planner_class(0);
     }
 
+    // On-demand exploration tool, NOT a CI gate (the full 6-class zoo at
+    // a real budget is ~155 s — like the old TS headless it must not tax
+    // every CI run). Run it deliberately:
+    //   cargo test -p rig-core ranks_the_algorithm_zoo -- --ignored --nocapture
+    // The fast `deterministic_same_seed` test above stays always-on as
+    // the harness regression guard.
     #[test]
+    #[ignore = "exploration tool; run with --ignored --nocapture"]
     fn ranks_the_algorithm_zoo() {
-        // The instrument in action: rank MPC / RRT / CEM. Native, so a
-        // real budget is cheap. We assert the eval is well-formed and
-        // print the ranking (visible with `cargo test -- --nocapture`);
+        // The instrument in action: rank the full planner zoo (0..=5).
+        // Native, so a real budget is cheap. We assert the eval is
+        // well-formed and print the ranking (with `--nocapture`);
         // we do NOT hard-assert an ordering (that's the explorable part).
         let budget = 2000;
         let out = [
             eval_skill("MPC", 0, 1234, budget),
             eval_skill("RRT", 1, 1234, budget),
             eval_skill("CEM", 2, 1234, budget),
+            eval_skill("MPPI", 3, 1234, budget),
+            eval_skill("SA", 4, 1234, budget),
+            eval_skill("Beam", 5, 1234, budget),
         ];
         for r in &out {
             println!(
