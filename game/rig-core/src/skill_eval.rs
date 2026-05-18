@@ -364,8 +364,16 @@ fn gate_ord(g: ai::Gate) -> i32 {
 }
 
 /// One full AI-vs-AI match. Returns (sub-signals[name→0..1], raw[name→val]).
-fn one_match(
-    planner_class: i32,
+///
+/// The planner knob (thread-local) MUST already be installed by the caller:
+/// `one_match` (the ranker path) installs it via `set_planner_class` BEFORE
+/// calling this; the GA path (`one_match_profile`) installs an evolved
+/// `Rc<Profile>` via `set_planner_profile`. Everything below — the sim loop,
+/// every seam, and ALL scoring math — is shared verbatim so the two paths
+/// are guaranteed consistent and the documented ranker composites are
+/// untouched (the only difference between the paths is WHICH planner profile
+/// the thread-local holds when `aisys.tick` → `plan_grapple` reads it).
+fn run_scored_match(
     h_style: &str,
     h_cyl: &str,
     a_style: &str,
@@ -373,7 +381,6 @@ fn one_match(
     seed: u32,
     max_ticks: u64,
 ) -> (HashMap<&'static str, f64>, HashMap<&'static str, f64>) {
-    set_planner_class(planner_class);
     let mut sim = SimWorld::new(seed);
     let rs = roster();
     let team_of: HashMap<String, ai::TeamSide> =
@@ -610,6 +617,136 @@ fn one_match(
     raw.insert("chainMax", streak_max);
     raw.insert("ticks", ticks);
     (sub, raw)
+}
+
+/// The ORIGINAL ranker entry: install the class on the thread-local knob via
+/// the `set_planner_class` back-compat shim, then run the shared scored
+/// match. STRUCTURALLY + BEHAVIORALLY UNCHANGED from before the Stage-3
+/// refactor — `set_planner_class(class)` then the exact same match/scoring
+/// body (now in `run_scored_match`). This keeps `eval_skill` and the
+/// documented ranker composites bit-identical.
+fn one_match(
+    planner_class: i32,
+    h_style: &str,
+    h_cyl: &str,
+    a_style: &str,
+    a_cyl: &str,
+    seed: u32,
+    max_ticks: u64,
+) -> (HashMap<&'static str, f64>, HashMap<&'static str, f64>) {
+    set_planner_class(planner_class);
+    run_scored_match(h_style, h_cyl, a_style, a_cyl, seed, max_ticks)
+}
+
+/// The GA path's match: install an EVOLVED `Profile` (not an engine class)
+/// on the calling rayon thread's thread-local knob, then run the SAME shared
+/// scored match. Because `PLANNER_PROFILE` is thread-local, installing here
+/// affects only this thread — parallel-safe exactly like `set_planner_class`
+/// (the whole point of Stage 2). `aisys.tick` → `plan_grapple` →
+/// `planner_profile()` reads back THIS profile, so the GA's evolved weights
+/// (`branch_cost`/`coord_compute_cost` fold) actually drive the match.
+fn one_match_profile(
+    profile: &crate::planner_cost::Profile,
+    h_style: &str,
+    h_cyl: &str,
+    a_style: &str,
+    a_cyl: &str,
+    seed: u32,
+    max_ticks: u64,
+) -> (HashMap<&'static str, f64>, HashMap<&'static str, f64>) {
+    use crate::ai::plan_bridge::set_planner_profile;
+    use crate::planner_cost::Profile;
+    use std::rc::Rc;
+    // `Profile` owns a `Vec<Box<dyn CostTerm>>` (no `Clone`), and the GA
+    // only ever evolves the WEIGHT VECTOR (engine stays 9 = Coordination
+    // dispatch). So reconstruct a fresh term-bearing `Profile` for this
+    // thread from the genome's engine, then overwrite its `weights` with
+    // the evolved fixed-order vector. `from_class` builds the SAME
+    // fixed-order term list whose names line up 1:1 with `weights`, so the
+    // `branch_cost`/`coord_compute_cost` fold uses the evolved weights
+    // exactly. Built once per match (3 per eval), never per tick.
+    let mut p = Profile::from_class(profile.engine);
+    p.label = profile.label.clone();
+    debug_assert_eq!(
+        p.weights.len(),
+        profile.weights.len(),
+        "GA genome must match the engine's term-vector length"
+    );
+    for (slot, g) in p.weights.iter_mut().zip(profile.weights.iter()) {
+        debug_assert_eq!(slot.0, g.0, "GA genome term-order must match engine");
+        slot.1 = g.1;
+    }
+    set_planner_profile(Some(Rc::new(p)));
+    run_scored_match(h_style, h_cyl, a_style, a_cyl, seed, max_ticks)
+}
+
+/// Shared matchup reduction: average each sub-signal / raw in FIXED
+/// match-index order and assemble the `Composite` EXACTLY as `eval_skill`
+/// does (same `avg`, same WT fold, same rounding). Used by `eval_profile`;
+/// `eval_skill` keeps its own inline copy verbatim so its path is provably
+/// untouched (this helper is byte-equivalent — verified by
+/// `eval_profile_matches_eval_skill_for_class_profile`).
+fn assemble_composite(
+    label: &str,
+    results: Vec<(HashMap<&str, f64>, HashMap<&str, f64>)>,
+) -> Composite {
+    let mut subs: Vec<HashMap<&str, f64>> = Vec::with_capacity(results.len());
+    let mut raws: Vec<HashMap<&str, f64>> = Vec::with_capacity(results.len());
+    for (s, r) in results {
+        subs.push(s);
+        raws.push(r);
+    }
+    let avg = |k: &str, arr: &[HashMap<&str, f64>]| -> f64 {
+        arr.iter().map(|m| *m.get(k).unwrap_or(&0.0)).sum::<f64>() / arr.len() as f64
+    };
+    let mut parts = Vec::new();
+    let mut composite = 0.0;
+    for (k, w) in WT.iter() {
+        let v = avg(k, &subs);
+        parts.push((k.to_string(), (v * 1000.0).round() / 1000.0));
+        composite += w * v;
+    }
+    let raw_keys = [
+        "gateClears", "passes", "intercepts", "scorePts", "heldFrac", "thrashK", "skinPct",
+        "shotConv", "chainMax", "ticks",
+    ];
+    let raw = raw_keys
+        .iter()
+        .map(|k| (k.to_string(), (avg(k, &raws) * 10.0).round() / 10.0))
+        .collect();
+    Composite {
+        label: label.to_string(),
+        composite: (1000.0 * composite).round() / 10.0,
+        parts,
+        raw,
+    }
+}
+
+/// STAGE-3 GA fitness: evaluate an EVOLVED `Profile`'s weights (NOT an
+/// engine class) over the same three matchups, parallel + fixed-order
+/// collect, scored identically to `eval_skill`. The GA's fitness is
+/// `eval_profile(profile, seed, max_ticks).composite`. This is the
+/// corrected blueprint wiring: it injects the profile via
+/// `set_planner_profile` (per-rayon-thread, thread-local ⇒ parallel-safe)
+/// so the GA actually optimizes the coordination/branch WEIGHTS rather than
+/// re-scoring stock Coordination (engine stays 9 for dispatch).
+pub fn eval_profile(
+    profile: &crate::planner_cost::Profile,
+    seed: u32,
+    max_ticks: u64,
+) -> Composite {
+    use rayon::prelude::*;
+    // Same parallel structure as `eval_skill`: independent matchups, but
+    // collected into a Vec indexed by matchup position so every downstream
+    // float reduction happens in fixed match-index order (determinism).
+    let results: Vec<(HashMap<&str, f64>, HashMap<&str, f64>)> = (0..MATCHUPS.len())
+        .into_par_iter()
+        .map(|i| {
+            let (hs, hc, as_, ac) = MATCHUPS[i];
+            one_match_profile(profile, hs, hc, as_, ac, seed, max_ticks)
+        })
+        .collect();
+    assemble_composite(&profile.label, results)
 }
 
 /// Full skill eval for one planner class, averaged over the matchups.

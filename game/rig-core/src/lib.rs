@@ -50,6 +50,14 @@ mod ai_wasm;
 // module itself is excluded from the wasm32 target.
 #[cfg(not(target_arch = "wasm32"))]
 mod skill_eval;
+// Stage 3: the offline GA over planner profile-space (deterministic,
+// seeded ChaCha8). ADDITIVE & NATIVE-ONLY — it does not change production
+// behavior (production still uses the default Coordination profile); the
+// GA is an offline search tool over the cost-term WEIGHTS. Gated out of
+// the wasm cdylib EXACTLY like skill_eval (it uses rand/rayon and the
+// native eval_profile).
+#[cfg(not(target_arch = "wasm32"))]
+mod ga;
 // Increment 3 (swarm): the deterministic world + the wasm-bindgen facade.
 mod sim_world;
 mod wasm;
