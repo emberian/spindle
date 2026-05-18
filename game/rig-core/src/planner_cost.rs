@@ -448,6 +448,21 @@ impl Profile {
         }
     }
 
+    /// The planner class id this profile dispatches as (its `engine`).
+    /// `from_class(n)` always yields a profile whose `class_number()` is the
+    /// dispatch arm: 0..=9 are the named engines, ≥10 falls back to MPC but
+    /// `engine` retains the requested id (dispatch treats unknown as MPC).
+    pub fn class_number(&self) -> i32 {
+        self.engine
+    }
+
+    /// The production-default profile: Coordination (class 9). A free
+    /// function mirror of `from_class(9)` for the bridge's lazy thread-local
+    /// init — semantically identical, kept as one source of truth.
+    pub fn coordination_default() -> Profile {
+        Profile::from_class(9)
+    }
+
     /// The shared branch_cost identity (classes 1..=8 selection; class 9 base
     /// before the coord extra; class 0/7's helpers reuse the same pieces).
     /// Strict left-fold over the fixed-order term list:

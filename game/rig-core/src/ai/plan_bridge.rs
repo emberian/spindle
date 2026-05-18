@@ -11,7 +11,9 @@
 use super::types::{PlayerSim, SimState, TeamSide};
 use crate::math::Vec3;
 use crate::planner;
-use std::cell::Cell;
+use crate::planner_cost::Profile;
+use std::cell::RefCell;
+use std::rc::Rc;
 
 /// Re-export of the planner's `Plan` as the AI-facing `GrapplePlan`
 /// (TS `GrapplePlan`: anchor_pos, reel ∈ {-1,0}, projected_dist, is_spar).
@@ -34,22 +36,81 @@ pub use crate::planner::Plan as GrapplePlan;
 ///
 /// Stored THREAD-LOCAL (not a process-global atomic) so the native
 /// parallel skill-eval can run independent matches with different
-/// classes on rayon threads without clobbering each other mid-match.
-/// Production wasm is single-threaded, so the thread-local default
-/// (9 = Coordination) is observationally identical to the old global.
+/// classes/profiles on rayon threads without clobbering each other
+/// mid-match. Production wasm is single-threaded, so the thread-local
+/// default (Coordination, engine 9) is observationally identical to the
+/// old global.
+///
+/// STAGE 2: the knob is generalized from `i32` to `Rc<Profile>`. We hold
+/// `Option<Rc<Profile>>`:
+///  - `None` ⇒ "use the production default" — resolved lazily, ON FIRST
+///    READ, to a single per-thread cached `Rc<Profile::from_class(9)>`.
+///  - `Some(p)` ⇒ an explicitly installed profile (eval / future GA).
+///
+/// Why `RefCell`, not `Cell` (blueprint bug fix): `Cell::get` requires
+/// `Copy`, and `Option<Rc<Profile>>` is NOT `Copy` (`Rc` owns a refcount;
+/// `Profile` owns a `Vec<Box<dyn CostTerm>>`). `RefCell` borrows soundly
+/// with no `Copy` bound. (`Cell::take`/`replace` would also work; `RefCell`
+/// is the cleanest read-mostly form here.)
+///
+/// Why `Rc`, not `Arc`: the cell is `thread_local!` — only ever touched by
+/// its owning thread, so no cross-thread sharing exists and the atomic
+/// refcount of `Arc` would be pure overhead. `Rc` is wasm32-safe and
+/// single-thread-sound here. Both compile for the production wasm cdylib;
+/// `Rc` is chosen for being strictly cheaper with identical semantics.
+///
+/// NO PER-TICK CHURN: `planner_profile()` is called once per `plan_grapple`
+/// = per player per 240 Hz tick. The default `Profile::from_class(9)` (which
+/// allocates a `Vec<Box<dyn CostTerm>>`) is built AT MOST ONCE PER THREAD:
+/// the first read with a `None` cell constructs it, stores the `Rc` back
+/// into the cell, and every subsequent read is just an `Rc::clone` (a
+/// refcount bump — no `Vec`/`Box` allocation, no `from_class` call). See
+/// `planner_profile()` for the lazy-init.
 thread_local! {
-    static PLANNER_CLASS: Cell<i32> = const { Cell::new(9) };
+    static PLANNER_PROFILE: RefCell<Option<Rc<Profile>>> =
+        const { RefCell::new(None) };
 }
 
-/// Set the active planner class (eval / exploration only). Set before a
-/// run; constant during it. Thread-local: affects only the calling thread.
+/// Install an explicit planner profile on the calling thread (eval /
+/// exploration / future GA). `None` restores the lazily-cached production
+/// default (Coordination). Set before a run; constant during it.
+/// Thread-local: affects only the calling thread.
+pub fn set_planner_profile(profile: Option<Rc<Profile>>) {
+    PLANNER_PROFILE.with(|c| *c.borrow_mut() = profile);
+}
+
+/// The active planner profile on the calling thread. If none is installed
+/// (the production case), returns the per-thread lazily-cached Coordination
+/// default (`Profile::from_class(9)`), built at most once per thread and
+/// thereafter returned by a cheap `Rc::clone` — NO per-tick allocation.
+pub fn planner_profile() -> Rc<Profile> {
+    PLANNER_PROFILE.with(|c| {
+        // Fast path: already populated (explicit OR the cached default).
+        if let Some(p) = c.borrow().as_ref() {
+            return Rc::clone(p);
+        }
+        // Slow path: taken AT MOST ONCE per thread — build the default,
+        // cache it back so all future reads are an Rc::clone only.
+        let def = Rc::new(Profile::coordination_default());
+        *c.borrow_mut() = Some(Rc::clone(&def));
+        def
+    })
+}
+
+/// BACK-COMPAT SHIM. The pre-Stage-2 `i32` knob, preserved verbatim in
+/// behavior so existing callers (notably `skill_eval.rs`) are STRUCTURALLY
+/// UNTOUCHED — they keep flipping the class and the ranker composites stay
+/// provably unchanged. Forwards to `set_planner_profile` with the matching
+/// profile.
 pub fn set_planner_class(class: i32) {
-    PLANNER_CLASS.with(|c| c.set(class));
+    set_planner_profile(Some(Rc::new(Profile::from_class(class))));
 }
 
-/// Current planner class (production default 9 = Coordination).
+/// Current planner class = the active profile's class number (production
+/// default 9 = Coordination). `class_number()` is always the dispatch arm,
+/// so this is total; kept for back-compat with i32 callers/tests.
 pub fn planner_class() -> i32 {
-    PLANNER_CLASS.with(|c| c.get())
+    planner_profile().class_number()
 }
 
 /// TS `sticky?: { pos; reel: -1|0 }` for the anti-dither hysteresis.
@@ -107,9 +168,13 @@ pub fn plan_grapple(
         pos: s.pos,
         reel: s.reel,
     });
-    // Planner class from the knob (production default 9 = Coordination; the
-    // skill-eval harness flips it to rank the algorithm zoo).
-    planner::plan_grapple(&pl, target, &st, avoid_defenders, sk, planner_class())
+    // STAGE 2: dispatch by the ACTIVE PROFILE's engine (the generalized
+    // knob), not a bare i32. Production default = Coordination (engine 9);
+    // the skill-eval harness flips the profile (via the i32 shim) to rank
+    // the algorithm zoo. `from_class(9).engine == 9` ⇒ identical dispatch
+    // arm ⇒ bit-identical Plan.
+    let engine = planner_profile().engine;
+    planner::plan_grapple(&pl, target, &st, avoid_defenders, sk, engine)
 }
 
 /// TS `sparPositions()` — the static spar lattice (axis spine + off-axis
@@ -195,5 +260,97 @@ mod tests {
     #[test]
     fn spar_lattice_nonempty() {
         assert!(!spar_positions().is_empty());
+    }
+
+    // ── STAGE 2: thread-local Profile knob ──────────────────────────────
+
+    /// Default (no profile installed) ⇒ Coordination, engine 9. This is
+    /// the production gate: the lazily-cached default is `from_class(9)`.
+    #[test]
+    fn default_profile_is_coordination_engine_9() {
+        // Fresh thread ⇒ untouched thread-local (None ⇒ lazy default).
+        std::thread::spawn(|| {
+            let p = planner_profile();
+            assert_eq!(p.engine, 9, "default engine must be Coordination");
+            assert_eq!(p.class_number(), 9);
+            assert_eq!(planner_class(), 9, "i32 back-compat default");
+        })
+        .join()
+        .unwrap();
+    }
+
+    /// The `set_planner_class` back-compat shim still works: it installs
+    /// the matching profile and `planner_class()` round-trips. This is the
+    /// path `skill_eval.rs` uses unchanged.
+    #[test]
+    fn set_planner_class_back_compat() {
+        std::thread::spawn(|| {
+            set_planner_class(3);
+            assert_eq!(planner_class(), 3);
+            assert_eq!(planner_profile().engine, 3);
+            set_planner_class(9);
+            assert_eq!(planner_class(), 9);
+            // ≥10 ⇒ MPC-fallback dispatch, engine retains requested id.
+            set_planner_class(42);
+            assert_eq!(planner_profile().engine, 42);
+            assert_eq!(planner_profile().label, "MPC");
+        })
+        .join()
+        .unwrap();
+    }
+
+    /// `set_planner_profile` / `planner_profile` round-trip on the calling
+    /// thread, and `None` restores the lazily-cached Coordination default.
+    #[test]
+    fn set_planner_profile_round_trip() {
+        std::thread::spawn(|| {
+            set_planner_profile(Some(Rc::new(Profile::from_class(5))));
+            assert_eq!(planner_profile().engine, 5);
+            assert_eq!(planner_class(), 5);
+            // None ⇒ back to the production default.
+            set_planner_profile(None);
+            assert_eq!(planner_profile().engine, 9);
+            assert_eq!(planner_class(), 9);
+        })
+        .join()
+        .unwrap();
+    }
+
+    /// Thread-local isolation: a profile installed on one thread does NOT
+    /// leak into another (mirrors the determinism-test intent — parallel
+    /// eval threads must not clobber each other).
+    #[test]
+    fn profile_is_thread_local_isolated() {
+        let t1 = std::thread::spawn(|| {
+            set_planner_class(1); // RRT on this thread only
+            assert_eq!(planner_class(), 1);
+        });
+        let t2 = std::thread::spawn(|| {
+            // Untouched thread ⇒ still the production default.
+            assert_eq!(planner_class(), 9);
+            set_planner_class(6);
+            assert_eq!(planner_class(), 6);
+        });
+        t1.join().unwrap();
+        t2.join().unwrap();
+        // Main thread untouched by either child ⇒ still default.
+        assert_eq!(planner_class(), 9);
+    }
+
+    /// No per-tick churn: repeated `planner_profile()` reads on the default
+    /// path return the SAME cached allocation (same `Rc` data pointer) —
+    /// proof the `Vec<Box<dyn CostTerm>>` is built at most once per thread,
+    /// never rebuilt per call.
+    #[test]
+    fn default_profile_not_rebuilt_per_call() {
+        std::thread::spawn(|| {
+            let a = planner_profile();
+            let b = planner_profile();
+            let c = planner_profile();
+            assert!(Rc::ptr_eq(&a, &b), "default must be cached, not rebuilt");
+            assert!(Rc::ptr_eq(&b, &c), "default must be cached, not rebuilt");
+        })
+        .join()
+        .unwrap();
     }
 }
