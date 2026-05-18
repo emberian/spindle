@@ -1,16 +1,17 @@
 // Rig-line renderer — graphic-novel grapple line.
 //
-// The line originates from the rigger's ANIMATED grapple hand (published by
-// Rigger.ts via RigGrapple), so it stays welded to the posed reach-arm instead
-// of a fixed body offset. Taut = a clean, bold, straight energized line in team
-// colour with an ink edge; slack = a soft catenary sag along the radial-outward
-// ("centrifugal down") direction, dimmer. A vivid faceted glint marks the
-// anchor. P1's line is the brightest.
+// THE core mechanic is the grapple: a rigger fires a line to a spar/teammate
+// and HAULS along it. That has to be unmistakable on screen. A 1 px
+// THREE.Line (hardware-capped width) was invisible at the lore-scale
+// spectate camera — "I don't see RIGGING". So the line is now a real
+// world-space TUBE with thickness, a bold ink edge, a bright bitten anchor
+// node and a node at the rigger's hand, so you can read: who fired, to
+// where, taut (hauling — thick/bright/straight) vs slack (lazy/dim/sagging),
+// and the reel snapping it in.
 //
-// Ink-edged look: a thin black underlay line drawn behind a slightly thinner
-// team-colour line → reads as an inked stroke at any distance (matches the
-// figures' inverted-hull ink outline). No new deps, no per-frame alloc in the
-// hot path.
+// The line originates from the rigger's ANIMATED grapple hand (published by
+// Rigger.ts) so it stays welded to the posed reach-arm. Render-only; ~8
+// short tubes rebuilt per frame is trivial off the 240 Hz sim path.
 
 import * as THREE from 'three';
 import type { PlayerSim } from '../sim/types';
@@ -19,15 +20,14 @@ import { INK } from './RiggerToon';
 import { grappleHand } from './RigGrapple';
 
 const SAG_SEGMENTS = 24;
-const GLINT_RADIUS = 0.55;
 
-// Fallback hand offset (figure-local) if Rigger hasn't published a hand yet
-// (e.g. first frame ordering): roughly chest-rig / reach-arm height, +Z front.
+// World-space line radii (m) — tuned to read clearly at the wide lore camera.
+const TAUT_RADIUS = 0.42;   // hauling: a taut, energized cable
+const SLACK_RADIUS = 0.26;  // lazy rope
+const P1_RADIUS_BOOST = 0.12;
+
+// Fallback hand offset (figure-local) if Rigger hasn't published a hand yet.
 const HAND_FALLBACK_LOCAL = new THREE.Vector3(0.42, 1.55, 0.55);
-
-const TAUT_OPACITY = 0.95;
-const SLACK_OPACITY = 0.45;
-const P1_BOOST = 0.05;
 
 // ── Scratch (no hot-path alloc) ──────────────────────────────────────────────
 const _from = new THREE.Vector3();
@@ -36,8 +36,8 @@ const _mid = new THREE.Vector3();
 const _radial = new THREE.Vector3();
 const _quat = new THREE.Quaternion();
 const _off = new THREE.Vector3();
-const _dir = new THREE.Vector3();
-const _perp = new THREE.Vector3();
+const _pts: THREE.Vector3[] = [];
+for (let i = 0; i <= SAG_SEGMENTS; i++) _pts.push(new THREE.Vector3());
 
 function blendHex(a: number, b: number, t: number): number {
   const ar = (a >> 16) & 0xff, ag = (a >> 8) & 0xff, ab = a & 0xff;
@@ -50,36 +50,28 @@ function blendHex(a: number, b: number, t: number): number {
 /** World-space line origin: the animated grapple hand, else a posed fallback. */
 function lineOrigin(ps: PlayerSim, out: THREE.Vector3): void {
   const h = grappleHand(ps.id);
-  if (h) {
-    out.copy(h);
-    return;
-  }
+  if (h) { out.copy(h); return; }
   _off.copy(HAND_FALLBACK_LOCAL);
   _quat.set(ps.q.x, ps.q.y, ps.q.z, ps.q.w).normalize();
   _off.applyQuaternion(_quat);
   out.set(ps.p.x + _off.x, ps.p.y + _off.y, ps.p.z + _off.z);
 }
 
-/** Cosmetic catenary from a→b; sag = peak radial-outward droop at midpoint. */
-function fillCatenary(
-  a: THREE.Vector3, b: THREE.Vector3, sag: number,
-  segments: number, out: Float32Array,
-): void {
+/** Fill _pts[0..SAG_SEGMENTS] with a cosmetic catenary a→b (radial-out sag). */
+function fillCatenary(a: THREE.Vector3, b: THREE.Vector3, sag: number): void {
   _mid.addVectors(a, b).multiplyScalar(0.5);
   _radial.set(0, _mid.y, _mid.z);
   const rl = _radial.length();
   if (rl > 1e-6) _radial.multiplyScalar(1 / rl);
   else _radial.set(0, 1, 0);
-
-  for (let i = 0; i <= segments; i++) {
-    const t = i / segments;
-    const px = a.x + (b.x - a.x) * t;
-    const py = a.y + (b.y - a.y) * t;
-    const pz = a.z + (b.z - a.z) * t;
+  for (let i = 0; i <= SAG_SEGMENTS; i++) {
+    const t = i / SAG_SEGMENTS;
     const drop = sag * 4 * t * (1 - t);
-    out[i * 3 + 0] = px + _radial.x * drop;
-    out[i * 3 + 1] = py + _radial.y * drop;
-    out[i * 3 + 2] = pz + _radial.z * drop;
+    _pts[i].set(
+      a.x + (b.x - a.x) * t + _radial.x * drop,
+      a.y + (b.y - a.y) * t + _radial.y * drop,
+      a.z + (b.z - a.z) * t + _radial.z * drop,
+    );
   }
 }
 
@@ -88,67 +80,79 @@ function fillCatenary(
 class LineInstance {
   readonly group = new THREE.Group();
 
-  private posArr: Float32Array;
-  private inkArr: Float32Array;
+  private rope: THREE.Mesh;       // bright team-colour tube
+  private ink: THREE.Mesh;        // slightly fatter dark tube = bold ink edge
+  private anchor: THREE.Mesh;     // the bite point (bright, faceted)
+  private anchorCore: THREE.Mesh; // hot white core
+  private hand: THREE.Mesh;       // node where the line leaves the rigger
+  private curGeo: THREE.TubeGeometry | null = null;
+  private inkGeo: THREE.TubeGeometry | null = null;
 
-  private geo: THREE.BufferGeometry;
-  private lineMat: THREE.LineBasicMaterial;
-
-  // Ink underlay: same path, slightly radial-offset, black, drawn first.
-  private inkGeo: THREE.BufferGeometry;
-  private inkMat: THREE.LineBasicMaterial;
-  private inkLine: THREE.Line;
-
-  private glint: THREE.Mesh;
-  private glintCore: THREE.Mesh;
-
-  // Dynamics state.
-  private active = false;     // had a line last frame? (for fire-snap detect)
-  private fire = 0;           // 0→1 snap-out progress on a fresh fire
-  private prevChord = 0;      // last frame chord length (reel-in detection)
-  private ta15 = false;       // prev taut (for snap-to-taut shimmer kick)
-  private snapKick = 0;       // brief shimmer burst when a line goes taut
+  private active = false;
+  private fire = 0;
+  private prevChord = 0;
+  private wasTaut = false;
+  private snapKick = 0;
 
   constructor() {
-    const count = (SAG_SEGMENTS + 1) * 3;
-    this.posArr = new Float32Array(count);
-    this.inkArr = new Float32Array(count);
+    this.ink = new THREE.Mesh(
+      new THREE.BufferGeometry(),
+      new THREE.MeshBasicMaterial({
+        color: INK, transparent: true, opacity: 0, depthWrite: false,
+      }),
+    );
+    this.ink.frustumCulled = false;
+    this.ink.renderOrder = 0;
 
-    this.geo = new THREE.BufferGeometry();
-    this.geo.setAttribute('position', new THREE.BufferAttribute(this.posArr, 3));
-    this.lineMat = new THREE.LineBasicMaterial({
-      color: PAL.cyan, transparent: true, opacity: 0, depthWrite: false,
-    });
-    const lineMesh = new THREE.Line(this.geo, this.lineMat);
-    lineMesh.frustumCulled = false;
-    lineMesh.renderOrder = 1;
+    this.rope = new THREE.Mesh(
+      new THREE.BufferGeometry(),
+      new THREE.MeshBasicMaterial({
+        color: PAL.cyan, transparent: true, opacity: 0, depthWrite: false,
+      }),
+    );
+    this.rope.frustumCulled = false;
+    this.rope.renderOrder = 1;
 
-    this.inkGeo = new THREE.BufferGeometry();
-    this.inkGeo.setAttribute('position', new THREE.BufferAttribute(this.inkArr, 3));
-    this.inkMat = new THREE.LineBasicMaterial({
-      color: INK, transparent: true, opacity: 0, depthWrite: false,
-    });
-    this.inkLine = new THREE.Line(this.inkGeo, this.inkMat);
-    this.inkLine.frustumCulled = false;
-    this.inkLine.renderOrder = 0;
-
-    this.glint = new THREE.Mesh(
-      new THREE.OctahedronGeometry(GLINT_RADIUS, 0),
+    this.anchor = new THREE.Mesh(
+      new THREE.OctahedronGeometry(0.9, 0),
       new THREE.MeshBasicMaterial({
         color: PAL.paper, transparent: true, opacity: 0,
         blending: THREE.AdditiveBlending, depthWrite: false,
       }),
     );
-    this.glintCore = new THREE.Mesh(
-      new THREE.OctahedronGeometry(GLINT_RADIUS * 0.4, 0),
+    this.anchor.renderOrder = 2;
+    this.anchorCore = new THREE.Mesh(
+      new THREE.OctahedronGeometry(0.42, 0),
       new THREE.MeshBasicMaterial({
         color: PAL.paper, transparent: true, opacity: 0,
         blending: THREE.AdditiveBlending, depthWrite: false,
       }),
     );
+    this.anchorCore.renderOrder = 3;
 
-    this.group.add(this.inkLine, lineMesh, this.glint, this.glintCore);
+    this.hand = new THREE.Mesh(
+      new THREE.SphereGeometry(0.45, 8, 6),
+      new THREE.MeshBasicMaterial({
+        color: PAL.paper, transparent: true, opacity: 0,
+        blending: THREE.AdditiveBlending, depthWrite: false,
+      }),
+    );
+    this.hand.renderOrder = 2;
+
+    this.group.add(this.ink, this.rope, this.anchor, this.anchorCore, this.hand);
     this.group.visible = false;
+  }
+
+  private rebuild(radius: number): void {
+    const curve = new THREE.CatmullRomCurve3(_pts, false, 'catmullrom', 0);
+    const g = new THREE.TubeGeometry(curve, SAG_SEGMENTS, radius, 6, false);
+    const gi = new THREE.TubeGeometry(curve, SAG_SEGMENTS, radius * 1.7, 6, false);
+    this.rope.geometry = g;
+    this.ink.geometry = gi;
+    this.curGeo?.dispose();
+    this.inkGeo?.dispose();
+    this.curGeo = g;
+    this.inkGeo = gi;
   }
 
   apply(ps: PlayerSim, isP1: boolean, now: number, dt: number): void {
@@ -163,112 +167,65 @@ class LineInstance {
 
     lineOrigin(ps, _from);
     _to.set(ls.anchorPos.x, ls.anchorPos.y, ls.anchorPos.z);
-
     const chord = _from.distanceTo(_to);
     const taut = ls.taut;
 
-    // ── Fire-snap: a brand-new line shoots out from the hand to the anchor
-    // in a fast ease-out (~90 ms) instead of just appearing welded.
-    if (!this.active) {
-      this.fire = 0;
-      this.prevChord = chord;
-    }
+    if (!this.active) { this.fire = 0; this.prevChord = chord; }
     this.active = true;
     this.fire = Math.min(1, this.fire + dt / 0.09);
-    const fireEase = 1 - Math.pow(1 - this.fire, 3); // fast out, eases in
+    const fireEase = 1 - Math.pow(1 - this.fire, 3);
 
-    // ── Snap-to-taut shimmer kick: the instant slack→taut, the line cracks
-    // tight; give it a brief high-freq tension shimmer that decays.
-    if (taut && !this.ta15) this.snapKick = 1;
-    this.ta15 = taut;
+    if (taut && !this.wasTaut) this.snapKick = 1;
+    this.wasTaut = taut;
     this.snapKick = Math.max(0, this.snapKick - dt * 4.5);
 
-    // Reeling-in reads as the chord shrinking frame-to-frame: tighten the
-    // line visibly (sag collapses faster, slight extra brightness).
     const reelingIn = chord < this.prevChord - 0.02;
     this.prevChord = chord;
 
-    // Sag: taut = laser straight; slack = lazy catenary; reeling pulls it in.
     let sag = taut ? 0 : Math.min(chord * 0.12, 6);
     if (reelingIn) sag *= 0.55;
 
-    // The animated endpoint races out along the chord during the fire-snap.
+    // The endpoint races out along the chord during the fire-snap.
     _to.lerpVectors(_from, _to, fireEase);
+    fillCatenary(_from, _to, sag);
 
-    fillCatenary(_from, _to, sag, SAG_SEGMENTS, this.posArr);
-
-    // ── Tension shimmer: a taut line is *energized* — overlay a tiny, fast
-    // perpendicular ripple (sub-cm, scaled by chord) so it sings rather than
-    // sitting dead-straight. Strongest right after it cracks taut, then a
-    // faint idle hum. None when slack (a slack line is lazy, not humming).
-    if (taut && this.fire >= 1) {
-      _dir.subVectors(_to, _from);
-      const dl = _dir.length();
-      if (dl > 1e-4) {
-        _dir.multiplyScalar(1 / dl);
-        _perp.set(0, _dir.z, -_dir.y); // a stable perpendicular (in y,z)
-        if (_perp.lengthSq() < 1e-6) _perp.set(0, 1, 0);
-        else _perp.normalize();
-        const hum = 0.012 + this.snapKick * 0.06;
-        const amp = hum * Math.min(dl, 30) * 0.06;
-        const tt = now * 0.001;
-        for (let i = 1; i < SAG_SEGMENTS; i++) {
-          const u = i / SAG_SEGMENTS;
-          // standing-wave-ish: nodes at the ends, fast travelling ripple
-          const env = Math.sin(u * Math.PI);
-          const w = Math.sin(u * 26 - tt * 34) * env * amp;
-          this.posArr[i * 3 + 0] += _perp.x * w;
-          this.posArr[i * 3 + 1] += _perp.y * w;
-          this.posArr[i * 3 + 2] += _perp.z * w;
-        }
-      }
-    }
-
-    this.geo.attributes.position.needsUpdate = true;
-    this.geo.setDrawRange(0, SAG_SEGMENTS + 1);
-
-    // Ink underlay: same curve, nudged slightly radial-outward so the black
-    // edge sits just behind/under the colour stroke = inked-line read.
-    _radial.set(0, (_from.y + _to.y) * 0.5, (_from.z + _to.z) * 0.5);
-    const rl = _radial.length();
-    if (rl > 1e-6) _radial.multiplyScalar(0.06 / rl);
-    else _radial.set(0, 0.06, 0);
-    for (let i = 0; i < this.posArr.length; i += 3) {
-      this.inkArr[i + 0] = this.posArr[i + 0] + _radial.x;
-      this.inkArr[i + 1] = this.posArr[i + 1] + _radial.y;
-      this.inkArr[i + 2] = this.posArr[i + 2] + _radial.z;
-    }
-    this.inkGeo.attributes.position.needsUpdate = true;
-    this.inkGeo.setDrawRange(0, SAG_SEGMENTS + 1);
+    const baseR = taut ? TAUT_RADIUS : SLACK_RADIUS;
+    const radius = baseR
+      + (isP1 ? P1_RADIUS_BOOST : 0)
+      + this.snapKick * 0.14
+      + (reelingIn ? 0.06 : 0);
+    this.rebuild(radius);
 
     const teamCol = ps.team === 'home' ? PAL.cyan : PAL.orange;
-    // Taut = energized: push the colour toward bright paper (hot wire) and
-    // pulse it subtly with the snap-kick so a freshly-tensioned line cracks
-    // visibly. Slack = lazy & dim. (No additive on the line — opacity only,
-    // so it never contributes to a screen-white mass.)
-    const tautHot = blendHex(teamCol, PAL.paper, 0.30 + this.snapKick * 0.25);
-    const lineHex = taut ? tautHot : blendHex(teamCol, PAL.dim, 0.5);
-    const op = (taut ? TAUT_OPACITY : SLACK_OPACITY)
-      + (isP1 ? P1_BOOST : 0)
-      + (taut ? this.snapKick * 0.04 : 0);
+    // Taut = hauling: hot toward paper-white and pulses on the snap. Slack =
+    // lazy & dim. Opacity is high either way so the rope is always legible.
+    const ropeHex = taut
+      ? blendHex(teamCol, PAL.paper, 0.35 + this.snapKick * 0.3)
+      : blendHex(teamCol, PAL.dim, 0.35);
+    (this.rope.material as THREE.MeshBasicMaterial).color.setHex(ropeHex);
+    (this.rope.material as THREE.MeshBasicMaterial).opacity =
+      (taut ? 0.98 : 0.72) + (isP1 ? 0.02 : 0);
+    (this.ink.material as THREE.MeshBasicMaterial).opacity = taut ? 0.9 : 0.6;
 
-    this.lineMat.color.setHex(lineHex);
-    this.lineMat.opacity = Math.min(1, op);
-    this.inkMat.opacity = (taut ? 0.85 : 0.55) + (isP1 ? P1_BOOST : 0);
-
-    // Anchor glint — bright/faceted when taut, soft when slack.
-    const glintOp = taut ? (isP1 ? 1.0 : 0.85) : (isP1 ? 0.55 : 0.4);
-    const gm = this.glint.material as THREE.MeshBasicMaterial;
-    const cm = this.glintCore.material as THREE.MeshBasicMaterial;
-    gm.color.setHex(taut ? blendHex(teamCol, PAL.paper, 0.5) : teamCol);
-    gm.opacity = glintOp;
-    cm.color.setHex(PAL.paper);
-    cm.opacity = taut ? glintOp * 0.9 : 0;
-
+    // Anchor bite-point — big & hot when taut (you're hauling on it), softer
+    // when slack. This is the "where the claw bit" read.
+    const an = this.anchor.material as THREE.MeshBasicMaterial;
+    const ac = this.anchorCore.material as THREE.MeshBasicMaterial;
+    an.color.setHex(taut ? blendHex(teamCol, PAL.paper, 0.55) : teamCol);
+    an.opacity = taut ? (isP1 ? 1.0 : 0.9) : 0.5;
+    ac.opacity = taut ? 0.95 : 0.25;
     const t = now * 0.001;
-    this.glint.position.copy(_to);
-    this.glint.rotation.set(t * 0.6, t * 0.8, 0);
-    this.glintCore.position.copy(_to);
+    this.anchor.position.copy(_to);
+    this.anchor.rotation.set(t * 0.6, t * 0.8, 0);
+    const aScale = 1 + this.snapKick * 0.6;
+    this.anchor.scale.setScalar(aScale);
+    this.anchorCore.position.copy(_to);
+
+    // Hand node: the line visibly LEAVES the rigger.
+    const hm = this.hand.material as THREE.MeshBasicMaterial;
+    hm.color.setHex(blendHex(teamCol, PAL.paper, 0.4));
+    hm.opacity = taut ? 0.85 : 0.55;
+    this.hand.position.copy(_from);
   }
 
   hide(): void {
