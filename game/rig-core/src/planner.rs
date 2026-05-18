@@ -500,13 +500,18 @@ fn plan_cem(
     let mut best_ai: usize = 0;
     let mut best_reel: i32 = -1;
 
+    // Reused across CEM_ITERS to avoid a per-iteration Vec alloc; contents
+    // are fully overwritten each pass so behavior is bit-identical.
+    let mut samples: Vec<(usize, i32, f64)> = Vec::with_capacity(CEM_POP as usize);
+    let mut next_w: Vec<f64> = vec![0.0; a_n];
+
     for _ in 0..CEM_ITERS {
         let mut wsum = 0.0;
         for i in 0..a_n {
             wsum += w[i];
         }
         // (ai, reel, c)
-        let mut samples: Vec<(usize, i32, f64)> = Vec::with_capacity(CEM_POP as usize);
+        samples.clear();
         for _ in 0..CEM_POP {
             // Sample an anchor index from the categorical weights (TS).
             let mut u = rng.next() * wsum;
@@ -535,11 +540,13 @@ fn plan_cem(
             std::cmp::Ordering::Equal => a.0.cmp(&b.0),
             o => o,
         });
-        let mut next_w = vec![CEM_SMOOTH; a_n];
+        for nw in next_w.iter_mut() {
+            *nw = CEM_SMOOTH;
+        }
         for e in 0..CEM_ELITE.min(samples.len()) {
             next_w[samples[e].0] += 1.0;
         }
-        w = next_w;
+        std::mem::swap(&mut w, &mut next_w);
     }
 
     let mut chosen_pos = anchors[best_ai].pos;
