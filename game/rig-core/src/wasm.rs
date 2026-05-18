@@ -448,14 +448,28 @@ impl RigSim {
         let ids_json = json_str_arr(&self.player_ids);
         let tier_json = json_str(tier_str);
 
+        // Render-only: per-player bound grapple target id (player↔player
+        // lines), parallel to `playerIds`. `null` ⇒ static-anchor / no line.
+        // Sourced from the render-only `line_anchor_player` snapshot field;
+        // it is NOT part of `hash_snapshot` so determinism is untouched.
+        let anchors_json = {
+            let inner: Vec<String> = snap
+                .players
+                .iter()
+                .map(|p| json_opt_str(&p.line_anchor_player))
+                .collect();
+            format!("[{}]", inner.join(","))
+        };
+
         format!(
-            "{{\"tick\":{},\"bellHeldBy\":{},\"bellThrownBy\":{},\"bellTouched\":{},\"passChain\":{},\"playerIds\":{},\"loopTier\":{}}}",
+            "{{\"tick\":{},\"bellHeldBy\":{},\"bellThrownBy\":{},\"bellTouched\":{},\"passChain\":{},\"playerIds\":{},\"lineAnchors\":{},\"loopTier\":{}}}",
             snap.tick,
             held_json,
             thrown_json,
             touched,
             chain_json,
             ids_json,
+            anchors_json,
             tier_json,
         )
     }

@@ -171,6 +171,16 @@ pub struct PlayerSnapshot {
     pub line_anchor: Option<Vec3>,
     pub line_rest_len: Option<f64>,
     pub line_taut: Option<bool>,
+    // ── Render-only fields (NOT folded into `hash_snapshot`; excluded from
+    //    the determinism-hashed surface — verified: `hash_snapshot` folds
+    //    only tick, bell.p/v/w and per-player p/v). ────────────────────────
+    /// The bound target player id for a player↔player line (= `Line.anchor_player`).
+    /// `None` for a static-world-anchor line (spar/skin/ring) or no line.
+    pub line_anchor_player: Option<String>,
+    /// Effective LIVE anchor position for rendering: the bound player's
+    /// current body position when player-bound, else the static `anchor_pos`.
+    /// `None` when there is no line. Render-only.
+    pub line_anchor_eff: Option<Vec3>,
 }
 
 /// Full snapshot — serialisable, hashable, replay-compatible.
@@ -751,6 +761,27 @@ impl SimWorld {
                 line_anchor: w.body.line.as_ref().map(|l| l.anchor_pos),
                 line_rest_len: w.body.line.as_ref().map(|l| l.rest_len),
                 line_taut: w.body.line.as_ref().map(|l| l.taut),
+                // Render-only: bound target id (player↔player) and effective
+                // LIVE anchor pos (the bound player's CURRENT body.p when
+                // player-bound — physics tracks the moving target via
+                // `anchor_player`, so `anchor_pos` is a stale fire-time point
+                // for those; resolve it live here for render parity).
+                line_anchor_player: w
+                    .body
+                    .line
+                    .as_ref()
+                    .and_then(|l| l.anchor_player.clone()),
+                line_anchor_eff: w.body.line.as_ref().map(|l| {
+                    match l.anchor_player.as_ref() {
+                        Some(aid) => self
+                            .players
+                            .iter()
+                            .find(|t| &t.id == aid)
+                            .map(|t| t.body.p)
+                            .unwrap_or(l.anchor_pos),
+                        None => l.anchor_pos,
+                    }
+                }),
             }).collect(),
             rng_cursor: self.rng.cursor(),
         }
@@ -995,6 +1026,81 @@ mod tests {
             drift.is_finite(),
             "momentum must stay finite (constraint stable), drift = {}",
             drift
+        );
+    }
+
+    /// Render-only contract: a player-bound line's snapshot must expose the
+    /// bound TARGET id and an *effective* anchor that tracks the LIVE target
+    /// position — never the stale fire-time `anchor_pos` (≈ origin for the
+    /// phantom-line bug). These fields must NOT perturb `hash_snapshot`.
+    #[test]
+    fn player_bound_line_snapshot_exposes_target_and_live_anchor() {
+        let mut w = SimWorld::new(7);
+        w.add_player("R", TeamSide::Home, RiggerRole::Spinner, Vec3::new(0.0, 5.0, 0.0));
+        w.add_player("T", TeamSide::Away, RiggerRole::Reach, Vec3::new(13.0, 5.0, 0.0));
+
+        let base = PlayerInput {
+            id: "R".to_string(),
+            aim: Vec3::new(1.0, 0.0, 0.0),
+            fire_line_at: Some(Vec3::new(13.0, 5.0, 0.0)), // fire AT player T
+            reel: 0,
+            release: false,
+            pushoff: false,
+            throw_charge: 0.0,
+            throw_released: false,
+            throw_spin: 0.0,
+            thrumbler: Vec3::new(0.0, 0.0, 0.0),
+            catch_intent: false,
+        };
+        let t_in = PlayerInput { id: "T".to_string(), fire_line_at: None, ..base.clone() };
+        w.step(&InputFrame { tick: 0, players: vec![base.clone(), t_in.clone()] }, SIM_H);
+
+        // Determinism hash BEFORE asserting render fields — it must be
+        // byte-identical to a fresh run regardless of the new fields.
+        let snap = w.snapshot();
+        let hash_a = hash_snapshot(&snap);
+
+        let r = snap.players.iter().find(|p| p.id == "R").unwrap();
+        let t = snap.players.iter().find(|p| p.id == "T").unwrap();
+
+        // 1. The firer's line is player-bound: target id is exposed.
+        assert_eq!(
+            r.line_anchor_player.as_deref(),
+            Some("T"),
+            "player-bound line must expose the bound target id"
+        );
+
+        // 2. The effective render anchor is T's LIVE body position — NOT the
+        //    stale fire-time point and NOT the origin.
+        let eff = r.line_anchor_eff.expect("player-bound line has an effective anchor");
+        assert!(
+            (eff.x - t.p.x).abs() < 1e-9
+                && (eff.y - t.p.y).abs() < 1e-9
+                && (eff.z - t.p.z).abs() < 1e-9,
+            "effective anchor must equal the LIVE target pos {:?}, got {:?}",
+            (t.p.x, t.p.y, t.p.z),
+            (eff.x, eff.y, eff.z)
+        );
+        assert!(
+            eff.x.abs() + eff.y.abs() + eff.z.abs() > 1e-3,
+            "effective anchor must NOT be the stale ≈origin point ({:?})",
+            (eff.x, eff.y, eff.z)
+        );
+
+        // 3. T has no line: render fields are None (no phantom on the target).
+        assert!(t.line_anchor_player.is_none());
+        assert!(t.line_anchor_eff.is_none());
+
+        // 4. Determinism untouched: re-running the identical sequence yields
+        //    the byte-identical hash (the new fields are NOT folded in).
+        let mut w2 = SimWorld::new(7);
+        w2.add_player("R", TeamSide::Home, RiggerRole::Spinner, Vec3::new(0.0, 5.0, 0.0));
+        w2.add_player("T", TeamSide::Away, RiggerRole::Reach, Vec3::new(13.0, 5.0, 0.0));
+        w2.step(&InputFrame { tick: 0, players: vec![base, t_in] }, SIM_H);
+        assert_eq!(
+            hash_a,
+            hash_snapshot(&w2.snapshot()),
+            "render-only line fields must not perturb the determinism hash"
         );
     }
 

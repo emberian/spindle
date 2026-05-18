@@ -56,6 +56,10 @@ export interface SimMeta {
   bellThrownBy: string | null;
   bellTouched: boolean;
   passChain: string[];
+  /** Render-only: per-player bound grapple target id (parallel to
+   *  `playerIds`); `null` ⇒ static-anchor line or no line. Excluded from
+   *  the determinism hash. */
+  lineAnchors: (string | null)[];
   loopTier: 'loop' | 'curl' | 'none';
 }
 
@@ -137,8 +141,11 @@ export class WasmSim {
         line:
           f[o + 9] > 0
             ? {
-                anchorType: 'spar',
-                anchorRef: null,
+                // Render-only anchor classification from the meta seam:
+                // a non-null bound id ⇒ player↔player line (draw to the
+                // LIVE target rigger); null ⇒ static anchor (unchanged).
+                anchorType: m.lineAnchors[i] != null ? 'player' : 'spar',
+                anchorRef: m.lineAnchors[i] ?? null,
                 anchorPos: { x: 0, y: 0, z: 0 },
                 restLen: f[o + 9],
                 taut: f[o + 8] > 0.5,
