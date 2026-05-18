@@ -16,9 +16,10 @@ use super::director::run_director;
 use super::rigger_ai::compute_player_input;
 use super::rng::AiRng;
 use super::types::{InputFrame, MatchState, SimState, TeamSide};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// Director cache: one per team side (index.ts DirectorCache).
+#[derive(Clone)]
 struct DirectorCache {
     state: DirectorState,
     last_updated_tick: f64,
@@ -47,15 +48,29 @@ struct CommitKey {
     player_id: String,
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct AiSystem {
     director_caches: HashMap<(u8, usize), DirectorCache>,
     commit_cache: HashMap<CommitKey, PlayerCommitCache>,
+    /// Rigger ids whose Action is supplied externally (the gym `Env`
+    /// caller drives them). EMPTY by default ⇒ the baseline AI controls
+    /// everyone exactly as before (production / skill_eval path unchanged).
+    /// When non-empty, `tick` SKIPS these ids — it never emits an input
+    /// for them and never advances their commit/director caches off their
+    /// state, so the external policy fully owns them.
+    controlled: HashSet<String>,
 }
 
 impl AiSystem {
     pub fn new() -> Self {
         AiSystem::default()
+    }
+
+    /// Install the externally-controlled rigger id set (the gym
+    /// agent-control selector). Deterministic: membership is a pure id
+    /// lookup, no iteration over the set in the tick hot path.
+    pub fn set_controlled<I: IntoIterator<Item = String>>(&mut self, ids: I) {
+        self.controlled = ids.into_iter().collect();
     }
 
     /// Produce an InputFrame for all AI-controlled players (id != "P1")
@@ -78,7 +93,14 @@ impl AiSystem {
                 .players
                 .iter()
                 .enumerate()
-                .filter(|(_, p)| p.team == cfg.side && p.id != "P1")
+                // Agent-control selector: a rigger in `controlled` is
+                // driven by the external Env caller, so the baseline AI
+                // skips it entirely (no input emitted, caches untouched).
+                .filter(|(_, p)| {
+                    p.team == cfg.side
+                        && p.id != "P1"
+                        && !self.controlled.contains(&p.id)
+                })
                 .map(|(i, _)| i)
                 .collect();
             if team_players.is_empty() {

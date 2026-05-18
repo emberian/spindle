@@ -25,6 +25,7 @@ pub enum LoopTier {
 }
 
 /// Per-bell state machine for Loop / Curl detection.
+#[derive(Clone)]
 pub struct LoopTracker {
     active: bool,
     touched: bool,

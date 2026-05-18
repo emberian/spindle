@@ -700,6 +700,9 @@ fn wmax_coverage_target(
     let skin_r = REG_R;
     let omega = state.omega;
     let sgn = attack_sign(team);
+    // EFE controller params (thread-local; production default is the
+    // verbatim former constants ⇒ behavior-preserving).
+    let ep = super::efe_params::efe_params();
 
     let band =
         efe::BellBand::predict(state.bell.p, state.bell.v, omega, skin_r);
@@ -714,9 +717,9 @@ fn wmax_coverage_target(
     // anchors around the bell and ahead toward the attack gate.
     let defending = assignment.job == Job::Zone;
     let anchor_x = if defending {
-        defend_ring_x(team) + sgn * 30.0
+        defend_ring_x(team) + sgn * ep.cov_defense_anchor_ahead
     } else {
-        state.bell.p.x + sgn * 40.0
+        state.bell.p.x + sgn * ep.cov_offense_anchor_ahead
     };
 
     // Style gives each agent a STABLE distinct slice of the fan so the team
@@ -745,13 +748,13 @@ fn wmax_coverage_target(
                 // PRAGMATIC: responsiveness to the predicted bell band.
                 // Offense wants to be a favorable future interceptor;
                 // defense wants to be able to deny it. Same quantity.
-                let resp = band.expected_response_gap(cand, 22.0);
+                let resp = band.expected_response_gap(cand, ep.cov_close_v);
                 // Soften by forward intent so offense still flows up-field.
                 let fwd = forward_progress(team, cand.x);
                 let fwd_pull = if defending {
                     0.0
                 } else {
-                    -(fwd / (crate::tuning::GATE_X.abs())) * 6.0
+                    -(fwd / (crate::tuning::GATE_X.abs())) * ep.cov_fwd_pull_gain
                 };
                 let pragmatic = resp + fwd_pull;
 
@@ -759,12 +762,12 @@ fn wmax_coverage_target(
                 // teammates; don't stack at one depth.
                 let crowd = vm.crowding_at(cand, &others);
                 let redun = vm.axis_redundancy(fwd, &others_fp);
-                let epistemic = crowd * 10.0 + redun * 6.0;
+                let epistemic = crowd * ep.cov_crowd_w + redun * ep.cov_redun_w;
 
                 // Weakest-sufficient bias: prefer the central depth/radius
                 // (broader success-set, less committal) by a small bonus
                 // so among near-equal EFE the BROAD region wins.
-                let breadth_bonus = if di == 1 { -1.5 } else { 0.0 };
+                let breadth_bonus = if di == 1 { ep.cov_breadth_bonus } else { 0.0 };
 
                 let total = pragmatic + epistemic + breadth_bonus;
                 if total < best_efe {
@@ -1029,6 +1032,9 @@ fn decide_throw(
     let omega = state.omega;
     let skin_r = REG_R;
     let team = player.team;
+    // EFE throw-controller params (thread-local; default = former
+    // hardcoded constants ⇒ behavior-preserving).
+    let ep = super::efe_params::efe_params();
     let sgn = attack_sign(team);
     let ring_x = attack_ring_x(team);
     let dist_to_ring = (ring_x - player.p.x).abs();
@@ -1055,7 +1061,7 @@ fn decide_throw(
         .iter()
         .enumerate()
         .map(|(i, tm)| {
-            let st = efe::roll_forward(tm.p, tm.v, omega, 0.9, skin_r);
+            let st = efe::roll_forward(tm.p, tm.v, omega, ep.throw_tm_horizon, skin_r);
             (i, st.p)
         })
         .collect();
@@ -1064,10 +1070,10 @@ fn decide_throw(
     // Roll the bell with the canon model from the release; return a scalar
     // in roughly [0,1+] where >= GOOD_ENOUGH means "this is a good throw".
     // Higher = better. No RNG.
-    let good_enough = 0.55_f64;
+    let good_enough = ep.throw_good_enough;
     let eval_launch = |v0: Vec3| -> f64 {
         // Roll far enough to see it cross the ring plane or settle.
-        let st = efe::roll_forward(player.p, v0, omega, 3.0, skin_r);
+        let st = efe::roll_forward(player.p, v0, omega, ep.throw_eval_horizon, skin_r);
         let end_fp = forward_progress(team, st.p.x);
         let end_rho = st.p.y.hypot(st.p.z);
 
@@ -1093,7 +1099,7 @@ fn decide_throw(
         }
         // Reachable if a teammate is within a generous catch envelope of the
         // bell's settle point (wide on purpose — weakest-sufficient).
-        let reach = (1.0 - (nearest_tm / 38.0)).clamp(0.0, 1.0);
+        let reach = (1.0 - (nearest_tm / ep.throw_reach_radius)).clamp(0.0, 1.0);
         let gain_norm = (gain / 120.0).clamp(-0.5, 1.0);
 
         // Don't reward flinging it into the skin or behind us.
@@ -1170,7 +1176,7 @@ fn decide_throw(
     ];
     // Perturbation magnitude scaled to the difficulty's own throw variance
     // band so "robust" means robust to THIS rigger's real error.
-    let err_mag = (3.0 + scaling.throw_variance * 60.0).max(2.0);
+    let err_mag = (3.0 + scaling.throw_variance * ep.throw_err_mag_scale).max(2.0);
 
     let mut best_v0: Option<Vec3> = None;
     let mut best_band: f64 = -1.0;
@@ -1229,8 +1235,8 @@ fn decide_throw(
     // common case is "yes" (that is the point — they should throw often).
     // Stall pressure only ever LOOSENS this further. ────────────────────
     let stall = cache.value.as_ref().unwrap().hold_ticks;
-    let pressured = nearest_opponent_dist(player, &opponents) < 14.0;
-    let force = stall > 540.0 || m.cast.throws_left as f64 <= 1.0;
+    let pressured = nearest_opponent_dist(player, &opponents) < ep.throw_pressure_dist;
+    let force = stall > ep.throw_stall_force_ticks || m.cast.throws_left as f64 <= 1.0;
 
     let chosen = match best_v0 {
         Some(v) => v,

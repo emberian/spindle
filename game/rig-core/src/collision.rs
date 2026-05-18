@@ -125,6 +125,38 @@ pub fn strip_velocity(carrier_vel: Vec3, defender_vel: Vec3) -> Vec3 {
     )
 }
 
+/// CONTEST CONSEQUENCE: a sustained, committed strip should genuinely flip
+/// spatial control — not just nudge the bell where both players re-grab it.
+/// On top of the base knock we shove the loose bell into the CONTESTER's
+/// space (carrier→defender direction) at a magnitude scaling with how long
+/// the press was sustained PAST threshold. A marginal strip (just at the
+/// hysteresis edge) stays soft and contestable; a hard-fought one decisively
+/// cedes the volume to the contester — so crowding a carrier is a real risk
+/// (you must commit and track) and a real reward (a won contest is a true
+/// turnover, not a coin-flip scramble).
+///
+/// `away_dir` = unit carrier→defender direction (the side the contester owns).
+/// `over_press` = press ticks held PAST the strip threshold (≥ 0).
+/// Pure & deterministic: a fixed function of its inputs only (tick count, no
+/// wall-clock; no RNG).
+pub fn strip_velocity_dir(
+    carrier_vel: Vec3,
+    defender_vel: Vec3,
+    away_dir: Vec3,
+    over_press: u32,
+) -> Vec3 {
+    let base = strip_velocity(carrier_vel, defender_vel);
+    // Commitment ramp: 0 extra at threshold, saturating to a firm shove by
+    // ~0.3 s of extra sustained press (tick count only — determinism-safe).
+    let commit = (over_press as f64 / 70.0).min(1.0);
+    let shove = 3.0 + 4.0 * commit; // 3 → 7 m/s into the contester's space
+    Vec3::new(
+        base.x + away_dir.x * shove,
+        base.y + away_dir.y * shove,
+        base.z + away_dir.z * shove,
+    )
+}
+
 /// Apply a bobble: kill most of the relative velocity (damp to 25%), then
 /// knock the bell off its true spin axis with a fixed off-axis impulse.
 pub fn apply_bobble(bell: &mut BellBody, player_vel: Vec3) {

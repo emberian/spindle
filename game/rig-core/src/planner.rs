@@ -121,6 +121,39 @@ fn spar_ring_r() -> f64 {
     R * 0.62
 }
 
+// ── Affordance-volume scaffolding (#35) ──────────────────────────────────────
+// The canon core (axis spine + the R·0.62 clip ring) is a thin, sparse world:
+// nothing lives between R·0.62≈28 and the R=45 skin, and only 3 azimuthal
+// spokes give almost no spinward/antispinward distinction. An O'Neill
+// cylinder's calm interior plausibly carries structural scaffolding — so we
+// ADD two static tiers that turn the chamber into a real volume to play:
+//
+//  • OUTER mid-shell scaffold at R·0.86 (≈38.7 m): a denser ring lattice
+//    (more rings axially, 6 spokes) bridging the gap to the recently-opened
+//    skin shell. Six spokes give genuine spinward vs antispinward anchors —
+//    the swing's Coriolis/centrifugal character now differs by azimuth.
+//  • INNER band at R·0.31 (≈14 m): an intermediate radius tier between the
+//    spine and the 0.62 ring, so the radius ladder is graded (spine → 14 →
+//    28 → 39 → 45) instead of one lonely middle ring. Enables short relay
+//    hops at small radius (low-Coriolis) regimes.
+//
+// Reachability: every new anchor is within TETHER_MAX (70 m) of the spine and
+// of the 0.62 ring (max radial step here is 45−28 = 17 m, axial spacing
+// L/rings ≤ 32 m, so the diagonal stays well under 70 m given the powered
+// hook). Density is deliberately moderate — a richer lane network, NOT a
+// free-traverse mesh. Determinism: all compile-time constants ⇒ the lattice
+// is byte-identical on every call (still memoized once via OnceLock).
+const SCAF_OUTER_RINGS: usize = 20;
+const SCAF_OUTER_AROUND: usize = 6;
+fn scaf_outer_r() -> f64 {
+    R * 0.86
+}
+const SCAF_INNER_RINGS: usize = 12;
+const SCAF_INNER_AROUND: usize = 4;
+fn scaf_inner_r() -> f64 {
+    R * 0.31
+}
+
 /// The spar lattice depends only on compile-time constants (`L`, `R`,
 /// SPAR_* ), so it is identical on every call. Build it exactly once and
 /// hand out a shared slice on the hot path; the f64 values produced are
@@ -140,7 +173,27 @@ fn build_spar_positions() -> Vec<Vec3> {
             out.push(Vec3::new(x, ang.cos() * ring_r, ang.sin() * ring_r));
         }
     }
+    // #35 scaffolding tiers, appended AFTER the canon core so the existing
+    // prefix order (and every per-class anchor scan that depends on it) is
+    // byte-for-byte unchanged. `push_ring_tier` is the same parametric
+    // ring-lattice formula as the core, just with its own (rings, around, r).
+    push_ring_tier(&mut out, SCAF_INNER_RINGS, SCAF_INNER_AROUND, scaf_inner_r());
+    push_ring_tier(&mut out, SCAF_OUTER_RINGS, SCAF_OUTER_AROUND, scaf_outer_r());
     out
+}
+
+/// Parametric off-axis ring lattice: `rings` evenly-spaced axial stations,
+/// each with `around` azimuthal spokes at radius `r`. Identical formula to
+/// the canon R·0.62 lattice (so the structure is canon-consistent), reused
+/// for the scaffolding tiers. Pure compile-time-driven ⇒ deterministic.
+fn push_ring_tier(out: &mut Vec<Vec3>, rings: usize, around: usize, r: f64) {
+    for i in 0..rings {
+        let x = -L / 2.0 + ((i as f64 + 0.5) / rings as f64) * L;
+        for a in 0..around {
+            let ang = (a as f64 / around as f64) * std::f64::consts::PI * 2.0;
+            out.push(Vec3::new(x, ang.cos() * r, ang.sin() * r));
+        }
+    }
 }
 
 fn spar_positions_cached() -> &'static [Vec3] {
@@ -1559,6 +1612,113 @@ const COORD_W_PASS: f64 = 8.0;
 // for any remaining in-file use.
 use crate::planner_cost::{point_seg_dist, seg_seg_dist};
 
+// ── Player↔player grappling (the coordination primitive) ─────────────────────
+// `build_anchors` (shared by classes 0..=8, bit-identity-frozen) yields only
+// spars + same-team bodies. Class 9 is the multi-agent arm: it ALSO wants
+// opponent bodies as anchors (tether/contest a carrier) and an explicit
+// REASON to pick a body over a coincident spar — a slingshot relay. These
+// two pieces live ONLY here so every other class stays byte-for-byte
+// unchanged. Determinism: fixed Vec-order scan, no RNG, no wall-clock.
+#[derive(Clone, Copy, PartialEq)]
+enum AnchorKind {
+    Spar,
+    Teammate,
+    Opponent,
+}
+
+#[derive(Clone, Copy)]
+struct CoordAnchor {
+    pos: Vec3,
+    kind: AnchorKind,
+}
+
+/// Coordination candidate set: the frozen `build_anchors` spar+teammate set
+/// PLUS opponent bodies inside grapple reach. Opponents are kept SEPARATE
+/// from spars/teammates and ordered AFTER them in a deterministic Vec scan
+/// (state.players order) so selection ties stay seeded/ordered exactly as
+/// before for the spar+teammate prefix.
+fn build_coord_anchors(
+    pos: Vec3,
+    to_dir: Vec3,
+    spars: &[Vec3],
+    player: &PlayerSim,
+    state: &SimState,
+) -> Vec<CoordAnchor> {
+    let base = build_anchors(pos, to_dir, spars, player, state);
+    let mut out: Vec<CoordAnchor> = Vec::with_capacity(base.len() + state.players.len());
+    for a in &base {
+        out.push(CoordAnchor {
+            pos: a.pos,
+            kind: if a.is_spar {
+                AnchorKind::Spar
+            } else {
+                AnchorKind::Teammate
+            },
+        });
+    }
+    // Opponent bodies within tether reach are legitimate anchors: a line
+    // fired at one binds momentum-conservingly (sim_world BIND_RADIUS) — the
+    // contest/tether primitive. Reachable bound: TETHER_MAX (70 m).
+    for pl in &state.players {
+        if pl.team == player.team {
+            continue;
+        }
+        let d = pos.sub(pl.p);
+        let dd = d.len();
+        if dd < 3.0 || dd > crate::grapple::TETHER_MAX {
+            continue;
+        }
+        // Keep the same "don't fire behind you" gate build_anchors uses.
+        if pl.p.sub(pos).norm().dot(to_dir) < -0.7 {
+            continue;
+        }
+        out.push(CoordAnchor {
+            pos: pl.p,
+            kind: AnchorKind::Opponent,
+        });
+    }
+    out
+}
+
+// Slingshot-relay constants. A body anchor that sits BETWEEN the rigger and
+// its target turns a reel-in + swing into real cross-volume locomotion off a
+// moving body — the coordination texture we want. The bonus is bounded so it
+// biases selection toward a teammate relay WHEN it genuinely advances the
+// traverse, without ever swamping the primary min_dist objective (tens of m).
+const RELAY_W_TEAM: f64 = 14.0; // slingshot off a teammate (fast traverse / set-up)
+const RELAY_W_OPP: f64 = 9.0; // tether/contest an opponent on the lane
+const RELAY_MIN_GAIN: f64 = 6.0; // anchor must shorten the to-target gap by ≥ this
+
+/// Negative cost (a bonus) for using a moving BODY as a relay anchor. Pure
+/// geometry: how well the anchor lies on the player→target line and whether
+/// reaching it actually closes distance to target. Spars get 0 (unchanged).
+fn relay_bonus(kind: AnchorKind, pos: Vec3, anchor: Vec3, target: Vec3) -> f64 {
+    let w = match kind {
+        AnchorKind::Spar => return 0.0,
+        AnchorKind::Teammate => RELAY_W_TEAM,
+        AnchorKind::Opponent => RELAY_W_OPP,
+    };
+    let to_t = target.sub(pos);
+    let to_t_len = to_t.len();
+    let to_a = anchor.sub(pos);
+    let to_a_len = to_a.len();
+    if to_t_len < 1e-6 || to_a_len < 1e-6 {
+        return 0.0;
+    }
+    // Distance still left to target AFTER notionally arriving at the anchor.
+    let remain = target.sub(anchor).len();
+    let gain = to_t_len - remain;
+    if gain < RELAY_MIN_GAIN {
+        return 0.0; // not a forward relay — no bias (don't grapple sideways/back)
+    }
+    // Alignment of the anchor with the desired heading (0..1, forward only).
+    let align = (to_a.dot(to_t) / (to_a_len * to_t_len)).clamp(0.0, 1.0);
+    // Saturating gain fraction so a near anchor that still advances counts,
+    // but the term is bounded by `w` (never dominates min_dist).
+    let gain_frac = (gain / to_t_len).clamp(0.0, 1.0);
+    -w * align * gain_frac
+}
+
 fn plan_coordination(
     player: &PlayerSim,
     target: Vec3,
@@ -1573,11 +1733,21 @@ fn plan_coordination(
     let omega = state.omega;
     let to_dir = to_target_dir(pos, target);
 
-    let mut anchors = build_anchors(pos, to_dir, spars, player, state);
+    let mut anchors = build_coord_anchors(pos, to_dir, spars, player, state);
     if anchors.is_empty() {
         return None;
     }
-    sort_anchors(&mut anchors, target);
+    // Sort by nearer-to-target, x tie-break (same comparator as sort_anchors)
+    // — applied over the spar+teammate+opponent set so the relay candidates
+    // are visited in the same deterministic order machinery.
+    anchors.sort_by(|a, b| {
+        let da = a.pos.sub(target).len();
+        let db = b.pos.sub(target).len();
+        match da.partial_cmp(&db).unwrap() {
+            std::cmp::Ordering::Equal => a.pos.x.partial_cmp(&b.pos.x).unwrap(),
+            o => o,
+        }
+    });
 
     // Same-team teammates (id != self), in deterministic Vec order, with both
     // current position and velocity (for the lane extrapolation).
@@ -1635,14 +1805,19 @@ fn plan_coordination(
     let mut best_c = f64::INFINITY;
     let mut best_pos = anchors[0].pos;
     let mut best_reel = -1i32;
-    let mut best_is_spar = anchors[0].is_spar;
+    let mut best_is_spar = anchors[0].kind == AnchorKind::Spar;
     let mut best_pd = f64::INFINITY;
     for a in &anchors {
+        // Slingshot-relay bias: a moving BODY that genuinely advances the
+        // traverse toward target is rewarded so the controller actually
+        // picks teammate (and opponent contest) anchors, not just spars.
+        // Bounded; spars get 0 → spar-only play is unchanged behaviour.
+        let relay = relay_bonus(a.kind, pos, a.pos, target);
         for &reel in &[-1i32, 0i32] {
             let r = rollout_primitive(
                 pos, vel, a.pos, omega, reel, target, RRT_PRIM_STEPS, PLAN_H,
             );
-            let c = coord_cost(r.p, r.min_dist, r.term);
+            let c = coord_cost(r.p, r.min_dist, r.term) + relay;
             let better = if c < best_c - 1e-12 {
                 true
             } else if (c - best_c).abs() <= 1e-12 {
@@ -1658,7 +1833,7 @@ fn plan_coordination(
                 best_c = c;
                 best_pos = a.pos;
                 best_reel = reel;
-                best_is_spar = a.is_spar;
+                best_is_spar = a.kind == AnchorKind::Spar;
                 best_pd = r.min_dist;
             }
         }
@@ -2269,30 +2444,52 @@ mod tests {
         assert!(s.min_dist.is_finite() && s.term.is_finite() && s.term >= 0.0);
     }
 
-    // ── spar_positions: TS contract (GP.ts:46-64) ────────────────────────────
-    /// Count = axis spine (ceil(L/40)+1) + exactly 16*3 off-axis lattice.
+    // ── spar_positions: canon core + #35 scaffolding ─────────────────────────
+    /// Count = axis spine (ceil(L/40)+1) + canon 16*3 R·0.62 ring lattice
+    /// + the two enrichment tiers (inner 12*4 @ R·0.31, outer 20*6 @ R·0.86).
+    /// The canon-core PREFIX is unchanged (axis spine then the R·0.62 ring) so
+    /// every per-class anchor scan that depends on prefix order is unaffected.
     #[test]
     fn spar_positions_count_and_structure() {
         let spars = spar_positions();
         let axis_n = (L / 40.0).ceil() as usize + 1;
-        assert_eq!(spars.len(), axis_n + 16 * 3);
+        let core_off = 16 * 3;
+        let inner_n = 12 * 4;
+        let outer_n = 20 * 6;
+        assert_eq!(spars.len(), axis_n + core_off + inner_n + outer_n);
 
         // Axis spine: first `axis_n` are on the x-axis (y=z=0), spaced 40 m
-        // starting at -L/2.
+        // starting at -L/2 — byte-identical canon core prefix.
         for (i, s) in spars.iter().take(axis_n).enumerate() {
             assert_eq!(s.y, 0.0);
             assert_eq!(s.z, 0.0);
             assert_eq!(s.x, -L / 2.0 + i as f64 * 40.0);
         }
-        // Off-axis lattice: exactly 16*3 points at radius R*0.62 in (y,z).
+        // Canon off-axis ring: exactly 16*3 points at radius R*0.62, directly
+        // after the spine (unchanged).
         let ring_r = R * 0.62;
-        let mut off_axis = 0usize;
-        for s in spars.iter().skip(axis_n) {
+        for s in spars.iter().skip(axis_n).take(core_off) {
             let r = (s.y * s.y + s.z * s.z).sqrt();
-            assert!((r - ring_r).abs() < 1e-9, "off-axis radius {} != {}", r, ring_r);
-            off_axis += 1;
+            assert!((r - ring_r).abs() < 1e-9, "core ring radius {} != {}", r, ring_r);
         }
-        assert_eq!(off_axis, 16 * 3);
+        // #35 INNER tier: next 12*4 at R*0.31.
+        let inner_r = R * 0.31;
+        for s in spars.iter().skip(axis_n + core_off).take(inner_n) {
+            let r = (s.y * s.y + s.z * s.z).sqrt();
+            assert!((r - inner_r).abs() < 1e-9, "inner tier radius {} != {}", r, inner_r);
+        }
+        // #35 OUTER tier: final 20*6 at R*0.86 — fits inside the R=45 skin,
+        // and within TETHER_MAX of the spine/0.62 ring (reachability).
+        let outer_r = R * 0.86;
+        assert!(outer_r < R, "outer scaffold must sit inside the skin");
+        assert!(
+            outer_r - 0.0 < crate::grapple::TETHER_MAX,
+            "outer scaffold reachable from the axis spine within TETHER_MAX"
+        );
+        for s in spars.iter().skip(axis_n + core_off + inner_n) {
+            let r = (s.y * s.y + s.z * s.z).sqrt();
+            assert!((r - outer_r).abs() < 1e-9, "outer tier radius {} != {}", r, outer_r);
+        }
     }
 
     fn demo_state(tick: i64) -> (PlayerSim, SimState, Vec3) {
@@ -2794,6 +2991,114 @@ mod tests {
         for p in [coord, base] {
             assert!(p.anchor_pos.x.is_finite() && p.projected_dist.is_finite());
             assert!(p.reel == -1 || p.reel == 0);
+        }
+    }
+
+    /// JOB 1 GATE: a teammate body is generated as a coordination anchor AND
+    /// can be the CHOSEN plan in a plausible setup — a teammate parked on the
+    /// player→target line, with the spar lattice off to the side, so the
+    /// slingshot-relay bias makes the controller fire AT the teammate (a
+    /// real player↔player grapple), not at a spar.
+    #[test]
+    fn teammate_anchor_generated_and_chosen() {
+        let player = PlayerSim {
+            id: "A".to_string(),
+            team: 0,
+            p: v(0.0, 30.0, 0.0),
+            v: v(0.0, 0.0, 0.0),
+        };
+        // Teammate squarely between the rigger and the target → a forward
+        // relay (closes the to-target gap well past RELAY_MIN_GAIN) and
+        // aligned with the heading.
+        let mate = PlayerSim {
+            id: "B".to_string(),
+            team: 0,
+            p: v(55.0, 30.0, 0.0), // within TETHER_MAX, on the line to target
+            v: v(0.0, 0.0, 0.0),
+        };
+        let target = v(240.0, 30.0, 0.0);
+        let state = SimState {
+            omega: OMEGA,
+            tick: 7,
+            players: vec![player.clone(), mate.clone()],
+        };
+
+        // (a) generation: build_coord_anchors must include the teammate body.
+        let to_dir = to_target_dir(player.p, target);
+        let anchors =
+            build_coord_anchors(player.p, to_dir, spar_positions_cached(), &player, &state);
+        assert!(
+            anchors
+                .iter()
+                .any(|a| a.kind == AnchorKind::Teammate
+                    && a.pos.sub(mate.p).len() < 1e-9),
+            "teammate body must be a generated coordination anchor"
+        );
+
+        // (b) selection: the chosen class-9 plan fires AT the teammate body
+        // (not a spar) — the relay bias makes player↔player grappling happen.
+        let plan = plan_grapple(&player, target, &state, true, None, 9)
+            .expect("coordination should yield a plan");
+        assert!(!plan.is_spar, "expected a body anchor, got a spar");
+        assert!(
+            plan.anchor_pos.sub(mate.p).len() < 1e-6,
+            "expected the plan to fire at the teammate body, got {:?}",
+            plan.anchor_pos
+        );
+        // Deterministic.
+        let plan2 = plan_grapple(&player, target, &state, true, None, 9).unwrap();
+        assert_eq!(plan, plan2, "teammate-anchor selection must be deterministic");
+    }
+
+    /// JOB 1 GATE: an opponent body within tether reach is a coordination
+    /// anchor candidate (the tether/contest primitive) — generation only;
+    /// selection vs. spars is situational, so we only assert availability.
+    #[test]
+    fn opponent_anchor_is_a_coord_candidate() {
+        let player = PlayerSim {
+            id: "A".to_string(),
+            team: 0,
+            p: v(0.0, 25.0, 0.0),
+            v: v(0.0, 0.0, 0.0),
+        };
+        let foe = PlayerSim {
+            id: "Z".to_string(),
+            team: 1,
+            p: v(40.0, 25.0, 0.0), // within TETHER_MAX, ahead of the player
+            v: v(0.0, 0.0, 0.0),
+        };
+        let target = v(200.0, 25.0, 0.0);
+        let state = SimState {
+            omega: OMEGA,
+            tick: 3,
+            players: vec![player.clone(), foe.clone()],
+        };
+        let to_dir = to_target_dir(player.p, target);
+        let anchors =
+            build_coord_anchors(player.p, to_dir, spar_positions_cached(), &player, &state);
+        assert!(
+            anchors
+                .iter()
+                .any(|a| a.kind == AnchorKind::Opponent
+                    && a.pos.sub(foe.p).len() < 1e-9),
+            "an in-reach opponent must be a coordination anchor candidate"
+        );
+    }
+
+    /// JOB 2 GATE: every #35 scaffolding anchor is reachable — within
+    /// TETHER_MAX of the axis spine (radius ≤ R < 70) and inside the skin.
+    #[test]
+    fn scaffolding_anchors_are_reachable() {
+        let spars = spar_positions();
+        let axis_n = (L / 40.0).ceil() as usize + 1;
+        for s in spars.iter().skip(axis_n) {
+            let r = (s.y * s.y + s.z * s.z).sqrt();
+            assert!(r < R, "scaffold anchor outside the skin: r={r}");
+            // Reachable from the co-axial spine point with the powered hook.
+            assert!(
+                r < crate::grapple::TETHER_MAX,
+                "scaffold anchor beyond TETHER_MAX from the spine: r={r}"
+            );
         }
     }
 }

@@ -6,8 +6,7 @@
 
 use crate::bell::{chime, step_bell, BellBody};
 use crate::collision::{
-    apply_bobble, contest_clatter, skin_bounce, strip_velocity as w_strip_velocity, try_catch_ex,
-    CatchResult, STRIP_RANGE,
+    apply_bobble, contest_clatter, skin_bounce, try_catch_ex, CatchResult, STRIP_RANGE,
 };
 use crate::loop_detector::{LoopTier, LoopTracker};
 use crate::math::{Quat, Vec3};
@@ -186,6 +185,7 @@ pub struct Snapshot {
 
 // ── Internal player record ────────────────────────────────────────────────────
 
+#[derive(Clone)]
 struct WorldPlayer {
     id: String,
     team: TeamSide,
@@ -196,6 +196,7 @@ struct WorldPlayer {
 // ── SimWorld ──────────────────────────────────────────────────────────────────
 
 /// The deterministic physics world.
+#[derive(Clone)]
 pub struct SimWorld {
     pub tick: u64,
     pub bell: BellBody,
@@ -513,7 +514,26 @@ impl SimWorld {
                 if let Some(j) = stripper {
                     self.strip_press += 1;
                     if self.strip_press >= STRIP_PRESS {
-                        let dv = w_strip_velocity(hv, self.players[j].body.v);
+                        // CONTEST CONSEQUENCE: the loose ball is shoved into
+                        // the CONTESTER's space, harder the longer the press
+                        // was sustained past threshold — a committed, tracked
+                        // strip decisively flips spatial control; a marginal
+                        // one is soft and re-contestable. Carrier→defender
+                        // unit dir; deterministic (positions only, no RNG).
+                        let dp = self.players[j].body.p.sub(hp);
+                        let dl = dp.len();
+                        let away = if dl > 1e-6 {
+                            dp.scale(1.0 / dl)
+                        } else {
+                            Vec3::new(0.0, 1.0, 0.0)
+                        };
+                        let over = self.strip_press - STRIP_PRESS;
+                        let dv = crate::collision::strip_velocity_dir(
+                            hv,
+                            self.players[j].body.v,
+                            away,
+                            over,
+                        );
                         let carrier_id = holder_id.clone();
                         // Loose ball tagged thrown_by = carrier: whoever
                         // recovers it next is scored relative to the

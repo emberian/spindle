@@ -31,6 +31,10 @@ pub mod decision_types;
 // Chamber-alive rebuild: active-inference + w-maxing controller substrate
 // (generative model, EFE pragmatic+epistemic terms, volume coverage).
 pub mod efe;
+// Coordination-learner substrate: the EFE + w-maxing controller's tunable
+// parameter surface (evolved by `crate::coord_learner`; production keeps
+// the behavior-preserving default). WASM-safe (no rayon/rand here).
+pub mod efe_params;
 // Port increment 4b: the decision integrator + orchestrator.
 pub mod director;
 pub mod rigger_ai;

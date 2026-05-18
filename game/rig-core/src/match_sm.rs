@@ -178,6 +178,7 @@ fn make_initial_state(faith_end: RingEnd, first_possession: TeamSide) -> MatchSt
 
 // ─── Main state machine (mirror of TS class MatchStateMachine) ───────────────
 
+#[derive(Clone)]
 pub struct MatchStateMachine {
     state: MatchState,
 }

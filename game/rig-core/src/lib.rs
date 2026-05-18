@@ -58,9 +58,29 @@ mod skill_eval;
 // native eval_profile).
 #[cfg(not(target_arch = "wasm32"))]
 mod ga;
+// THE COORDINATION LEARNER: a deterministic seeded self-play / evolutionary
+// loop that optimizes the EFE + w-maxing controller (ai::efe +
+// ai::rigger_ai) for team coordination. Fitness = the game's OWN intrinsic
+// outcome for the controlled team (net score, possession, gate advance,
+// contests, bell-in-play) — NOT a meta-instrument. w-maxing is kept as the
+// generalization criterion (the controller it tunes is w-maxing; the
+// learner also tie-breaks toward the weakest-sufficient genome). NATIVE-
+// ONLY, gated out of the wasm cdylib EXACTLY like skill_eval / ga (it uses
+// rand/rayon and the native episode driver).
+#[cfg(not(target_arch = "wasm32"))]
+mod coord_learner;
 // Increment 3 (swarm): the deterministic world + the wasm-bindgen facade.
 mod sim_world;
 mod wasm;
+// The RL environment / gym facade: exposes the deterministic
+// SimWorld+MatchStateMachine+AiSystem as a clean `Env` (reset/step/
+// snapshot/restore) so external learners can drive a subset of riggers.
+// NATIVE-ONLY (gated EXACTLY like skill_eval/ga): it reuses the
+// skill_eval `conv::` seam bridges (which live behind the same
+// not(wasm32) cfg) and has no place in the browser cdylib. Determinism
+// is preserved by construction — see gym.rs for the argument.
+#[cfg(not(target_arch = "wasm32"))]
+mod gym;
 
 use wasm_bindgen::prelude::*;
 

@@ -141,7 +141,11 @@ pub struct Composite {
 }
 
 // ── Seam adapters (the 7 conversions from the seam map) ──────────────────────
-mod conv {
+// `pub(crate)` so the native-only `gym` Env reuses these EXACT bridges
+// (no reinvention — same sim_world↔scoring↔ai::types conversions the
+// ranker path uses, so a gym match and a skill_eval match see identical
+// seam semantics).
+pub(crate) mod conv {
     use super::*;
 
     pub fn team_ai_to_scoring(t: ai::TeamSide) -> scoring::TeamSide {

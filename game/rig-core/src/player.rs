@@ -42,6 +42,7 @@ impl Ramp {
 }
 
 /// Full kinematic state for a rigger in the rotating frame.
+#[derive(Clone)]
 pub struct PlayerBody {
     pub p: Vec3,
     pub v: Vec3,

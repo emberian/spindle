@@ -80,6 +80,7 @@ impl Substream {
     }
 }
 
+#[derive(Clone)]
 pub struct Rng {
     seed: u32,
     streams: HashMap<String, Substream>,
