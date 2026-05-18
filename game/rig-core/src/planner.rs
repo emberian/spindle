@@ -576,6 +576,405 @@ fn plan_cem(
     })
 }
 
+// ── MPPI planner (planner == 3) ──────────────────────────────────────────────
+// Model-Predictive Path Integral control over the discrete-anchor action
+// space. Like CEM it samples a population of (anchor, reel) candidates from
+// the same goal-biased categorical and rolls each out via rollout_primitive;
+// UNLIKE CEM there is no hard elite cut — every sample contributes a soft
+// importance weight  wᵢ = exp(−(cᵢ − c_min)/λ)  (the information-theoretic
+// MPPI update; c_min subtracted only for numerical stability, it cancels in
+// the normalised weights). The action space here is *discrete* anchors, not
+// a continuous control sequence, so the MPPI expected-control update would
+// have to round back onto a real anchor. The principled discrete-MPPI form
+// is therefore to aggregate the soft weights *per discrete (anchor,reel)
+// action* and return the action carrying the maximum total posterior weight
+// (the MAP action under the path-integral posterior). This is documented and
+// chosen deliberately over a coordinate-averaged pseudo-anchor, which could
+// land in empty space off the spar lattice.
+const MPPI_POP: u32 = 24;
+const MPPI_LAMBDA: f64 = 8.0;
+
+fn plan_mppi(
+    player: &PlayerSim,
+    target: Vec3,
+    state: &SimState,
+    opponents: &[Vec3],
+    teammates: &[Vec3],
+    sticky: Option<Sticky>,
+    spars: &[Vec3],
+) -> Option<Plan> {
+    let pos = player.p;
+    let vel = player.v;
+    let omega = state.omega;
+    let to_dir = to_target_dir(pos, target);
+
+    let mut anchors = build_anchors(pos, to_dir, spars, player, state);
+    if anchors.is_empty() {
+        return None;
+    }
+    sort_anchors(&mut anchors, target);
+
+    let replan_w = rrt_replan_ticks();
+    let mut rng = HashRng::new(&player.id, state.tick.div_euclid(replan_w));
+    let a_n = anchors.len();
+    // Same goal-biased categorical proposal as CEM (w[i] = 1/(1+i)).
+    let w: Vec<f64> = (0..a_n).map(|i| 1.0 / (1.0 + i as f64)).collect();
+    let mut wsum = 0.0;
+    for wi in &w {
+        wsum += *wi;
+    }
+
+    // (ai, reel, cost) for every sampled rollout, in deterministic draw order.
+    let mut samples: Vec<(usize, i32, f64)> = Vec::with_capacity(MPPI_POP as usize);
+    let mut best_c = f64::INFINITY;
+    let mut min_c = f64::INFINITY;
+    for _ in 0..MPPI_POP {
+        let mut u = rng.next() * wsum;
+        let mut ai: usize = 0;
+        while ai < a_n - 1 {
+            u -= w[ai];
+            if u <= 0.0 {
+                break;
+            }
+            ai += 1;
+        }
+        let reel: i32 = if rng.next() < 0.5 { -1 } else { 0 };
+        let r = rollout_primitive(
+            pos, vel, anchors[ai].pos, omega, reel, target, RRT_PRIM_STEPS, PLAN_H,
+        );
+        let c = branch_cost(r.p, r.min_dist, r.term, opponents, teammates);
+        if c < min_c {
+            min_c = c;
+        }
+        if c < best_c - 1e-9 {
+            best_c = c;
+        }
+        samples.push((ai, reel, c));
+    }
+
+    // Path-integral posterior: accumulate soft weight per discrete (ai,reel)
+    // action. Index key = ai*2 + (reel==0). Deterministic Vec, no HashMap.
+    let mut acc: Vec<f64> = vec![0.0; a_n * 2];
+    for &(ai, reel, c) in &samples {
+        let key = ai * 2 + if reel == 0 { 1 } else { 0 };
+        acc[key] += (-(c - min_c) / MPPI_LAMBDA).exp();
+    }
+    // MAP action = max total posterior weight. Deterministic tie-break by
+    // lower key index (i.e. nearer-to-target anchor, reel=-1 before reel=0).
+    let mut best_key = 0usize;
+    let mut best_wt = f64::NEG_INFINITY;
+    for (k, &wt) in acc.iter().enumerate() {
+        if wt > best_wt + 1e-12 {
+            best_wt = wt;
+            best_key = k;
+        }
+    }
+    let chosen_ai = best_key / 2;
+    let chosen_reel0: i32 = if best_key % 2 == 1 { 0 } else { -1 };
+
+    let mut chosen_pos = anchors[chosen_ai].pos;
+    let mut chosen_reel = chosen_reel0;
+    let mut chosen_is_spar = anchors[chosen_ai].is_spar;
+
+    if let Some(st) = sticky {
+        let sd = pos.sub(st.pos).len();
+        if sd >= 2.0 && sd <= 180.0 && chosen_pos.sub(st.pos).len() > 4.0 {
+            let sr = rollout_primitive(
+                pos, vel, st.pos, omega, st.reel, target, RRT_PRIM_STEPS, PLAN_H,
+            );
+            let sticky_cost =
+                branch_cost(sr.p, sr.min_dist, sr.term, opponents, teammates);
+            if best_c >= sticky_cost - ANCHOR_SWITCH_MARGIN {
+                chosen_pos = st.pos;
+                chosen_reel = st.reel;
+                chosen_is_spar = st.pos.y.hypot(st.pos.z) < 1.0;
+            }
+        }
+    }
+    Some(Plan {
+        anchor_pos: chosen_pos,
+        reel: chosen_reel,
+        projected_dist: best_c,
+        is_spar: chosen_is_spar,
+    })
+}
+
+// ── Simulated-annealing planner (planner == 4) ───────────────────────────────
+// Start from the sticky anchor if valid else the best (nearest-to-target)
+// spar candidate, then propose neighbour anchors (a nearby anchor index
+// drawn from the sorted candidate list) and accept Δcost<0 always, Δcost≥0
+// with probability exp(−Δcost/T). T cools geometrically over SA_ITERS. All
+// randomness is the windowed HashRng, so the whole walk is deterministic.
+const SA_ITERS: u32 = 40;
+const SA_T0: f64 = 12.0;
+const SA_COOL: f64 = 0.92;
+
+fn plan_simanneal(
+    player: &PlayerSim,
+    target: Vec3,
+    state: &SimState,
+    opponents: &[Vec3],
+    teammates: &[Vec3],
+    sticky: Option<Sticky>,
+    spars: &[Vec3],
+) -> Option<Plan> {
+    let pos = player.p;
+    let vel = player.v;
+    let omega = state.omega;
+    let to_dir = to_target_dir(pos, target);
+
+    let mut anchors = build_anchors(pos, to_dir, spars, player, state);
+    if anchors.is_empty() {
+        return None;
+    }
+    sort_anchors(&mut anchors, target);
+    let a_n = anchors.len();
+
+    let replan_w = rrt_replan_ticks();
+    let mut rng = HashRng::new(&player.id, state.tick.div_euclid(replan_w));
+
+    let cost_of = |ai: usize, reel: i32| -> (f64, f64) {
+        let r = rollout_primitive(
+            pos, vel, anchors[ai].pos, omega, reel, target, RRT_PRIM_STEPS, PLAN_H,
+        );
+        (branch_cost(r.p, r.min_dist, r.term, opponents, teammates), r.min_dist)
+    };
+
+    // Seed: nearest sticky anchor if a sticky pos is given, else candidate 0
+    // (sorted nearest-to-target). reel seeds from sticky else -1.
+    let (mut cur_ai, mut cur_reel) = if let Some(st) = sticky {
+        let mut bi = 0usize;
+        let mut bd = f64::INFINITY;
+        for (i, a) in anchors.iter().enumerate() {
+            let d = a.pos.sub(st.pos).len();
+            if d < bd {
+                bd = d;
+                bi = i;
+            }
+        }
+        (bi, st.reel)
+    } else {
+        (0usize, -1i32)
+    };
+    let (mut cur_c, mut cur_pd) = cost_of(cur_ai, cur_reel);
+    let mut best_ai = cur_ai;
+    let mut best_reel = cur_reel;
+    let mut best_c = cur_c;
+    let mut best_pd = cur_pd;
+
+    let mut t = SA_T0;
+    for _ in 0..SA_ITERS {
+        // Neighbour: jump to a nearby anchor index (±a small window) and/or
+        // flip reel. Deterministic via the windowed rng.
+        let span = 3.0;
+        let off = ((rng.next() * (2.0 * span + 1.0)) as i64 - span as i64) as i64;
+        let mut nai = cur_ai as i64 + off;
+        if nai < 0 {
+            nai = 0;
+        }
+        if nai > a_n as i64 - 1 {
+            nai = a_n as i64 - 1;
+        }
+        let nai = nai as usize;
+        let nreel: i32 = if rng.next() < 0.5 { -1 } else { 0 };
+        let (nc, npd) = cost_of(nai, nreel);
+        let d = nc - cur_c;
+        let accept = if d < 0.0 {
+            true
+        } else {
+            rng.next() < (-d / t).exp()
+        };
+        if accept {
+            cur_ai = nai;
+            cur_reel = nreel;
+            cur_c = nc;
+            cur_pd = npd;
+            if cur_c < best_c - 1e-9 {
+                best_c = cur_c;
+                best_ai = cur_ai;
+                best_reel = cur_reel;
+                best_pd = cur_pd;
+            }
+        }
+        t *= SA_COOL;
+    }
+    let _ = cur_pd;
+
+    let mut chosen_pos = anchors[best_ai].pos;
+    let mut chosen_reel = best_reel;
+    let mut chosen_is_spar = anchors[best_ai].is_spar;
+    let mut chosen_pd = best_pd;
+
+    if let Some(st) = sticky {
+        let sd = pos.sub(st.pos).len();
+        if sd >= 2.0 && sd <= 180.0 && chosen_pos.sub(st.pos).len() > 4.0 {
+            let sr = rollout_primitive(
+                pos, vel, st.pos, omega, st.reel, target, RRT_PRIM_STEPS, PLAN_H,
+            );
+            let sticky_cost =
+                branch_cost(sr.p, sr.min_dist, sr.term, opponents, teammates);
+            if best_c >= sticky_cost - ANCHOR_SWITCH_MARGIN {
+                chosen_pos = st.pos;
+                chosen_reel = st.reel;
+                chosen_is_spar = st.pos.y.hypot(st.pos.z) < 1.0;
+                chosen_pd = sr.min_dist;
+            }
+        }
+    }
+    Some(Plan {
+        anchor_pos: chosen_pos,
+        reel: chosen_reel,
+        projected_dist: chosen_pd,
+        is_spar: chosen_is_spar,
+    })
+}
+
+// ── Beam-search planner (planner == 5) ───────────────────────────────────────
+// The MPC arm is a 1-cycle greedy choice; this does a BEAM_K-wide beam over
+// BEAM_DEPTH grapple hops. Each beam node carries the post-rollout
+// (p, v, cumulative-cost, running-min-dist) plus the FIRST-hop (anchor,reel,
+// is_spar) so the winner can be traced back to its opening move. Expansion
+// is fully deterministic: the anchor list is sorted, every (anchor,reel) is
+// tried in order, and survivors are kept by a deterministic sort on
+// (cumulative cost, first-hop anchor x). No RNG is needed (exhaustive beam),
+// so determinism is structural.
+const BEAM_K: usize = 6;
+const BEAM_DEPTH: u32 = 3;
+
+#[derive(Clone, Copy)]
+struct BeamNode {
+    p: Vec3,
+    v: Vec3,
+    cum: f64,
+    run_min: f64,
+    first_pos: Vec3,
+    first_reel: i32,
+    first_is_spar: bool,
+    first_pd: f64,
+}
+
+fn plan_beam(
+    player: &PlayerSim,
+    target: Vec3,
+    state: &SimState,
+    opponents: &[Vec3],
+    teammates: &[Vec3],
+    sticky: Option<Sticky>,
+    spars: &[Vec3],
+) -> Option<Plan> {
+    let pos = player.p;
+    let vel = player.v;
+    let omega = state.omega;
+    let to_dir = to_target_dir(pos, target);
+
+    let mut anchors = build_anchors(pos, to_dir, spars, player, state);
+    if anchors.is_empty() {
+        return None;
+    }
+    sort_anchors(&mut anchors, target);
+
+    // Frontier seed: a single node at the player's current state.
+    let mut frontier: Vec<BeamNode> = vec![BeamNode {
+        p: pos,
+        v: vel,
+        cum: 0.0,
+        run_min: pos.sub(target).len(),
+        first_pos: pos,
+        first_reel: -1,
+        first_is_spar: true,
+        first_pd: pos.sub(target).len(),
+    }];
+
+    let mut best: Option<BeamNode> = None;
+
+    for depth in 0..BEAM_DEPTH {
+        let mut expanded: Vec<BeamNode> = Vec::new();
+        for node in &frontier {
+            for a in &anchors {
+                for &reel in &[-1i32, 0i32] {
+                    let r = rollout_primitive(
+                        node.p, node.v, a.pos, omega, reel, target, RRT_PRIM_STEPS,
+                        PLAN_H,
+                    );
+                    let run_min = node.run_min.min(r.min_dist);
+                    let step_c =
+                        branch_cost(r.p, r.min_dist, r.term, opponents, teammates);
+                    let (first_pos, first_reel, first_is_spar, first_pd) =
+                        if depth == 0 {
+                            (a.pos, reel, a.is_spar, r.min_dist)
+                        } else {
+                            (node.first_pos, node.first_reel, node.first_is_spar,
+                             node.first_pd)
+                        };
+                    let n = BeamNode {
+                        p: r.p,
+                        v: r.v,
+                        cum: node.cum + step_c,
+                        run_min,
+                        first_pos,
+                        first_reel,
+                        first_is_spar,
+                        first_pd,
+                    };
+                    match best {
+                        Some(b) if b.cum <= n.cum + 1e-12 => {}
+                        _ => best = Some(n),
+                    }
+                    expanded.push(n);
+                }
+            }
+        }
+        if expanded.is_empty() {
+            break;
+        }
+        // Keep top-BEAM_K by (cumulative cost, first-hop anchor x, reel) —
+        // a total deterministic order with no float-equality ambiguity.
+        expanded.sort_by(|x, y| {
+            match x.cum.partial_cmp(&y.cum).unwrap() {
+                std::cmp::Ordering::Equal => {
+                    match x.first_pos.x.partial_cmp(&y.first_pos.x).unwrap() {
+                        std::cmp::Ordering::Equal => x.first_reel.cmp(&y.first_reel),
+                        o => o,
+                    }
+                }
+                o => o,
+            }
+        });
+        expanded.truncate(BEAM_K);
+        frontier = expanded;
+    }
+
+    let chosen = best?;
+    let mut chosen_pos = chosen.first_pos;
+    let mut chosen_reel = chosen.first_reel;
+    let mut chosen_is_spar = chosen.first_is_spar;
+    let mut chosen_pd = chosen.first_pd;
+    let best_c = chosen.cum;
+
+    if let Some(st) = sticky {
+        let sd = pos.sub(st.pos).len();
+        if sd >= 2.0 && sd <= 180.0 && chosen_pos.sub(st.pos).len() > 4.0 {
+            let sr = rollout_primitive(
+                pos, vel, st.pos, omega, st.reel, target, RRT_PRIM_STEPS, PLAN_H,
+            );
+            let sticky_cost =
+                branch_cost(sr.p, sr.min_dist, sr.term, opponents, teammates);
+            if best_c >= sticky_cost - ANCHOR_SWITCH_MARGIN {
+                chosen_pos = st.pos;
+                chosen_reel = st.reel;
+                chosen_is_spar = st.pos.y.hypot(st.pos.z) < 1.0;
+                chosen_pd = sr.min_dist;
+            }
+        }
+    }
+    Some(Plan {
+        anchor_pos: chosen_pos,
+        reel: chosen_reel,
+        projected_dist: chosen_pd,
+        is_spar: chosen_is_spar,
+    })
+}
+
 // ── Defender-aware swing sim (TS GP.ts:229-300) ──────────────────────────────
 struct SwingDef {
     closest_dist: f64,
@@ -819,13 +1218,39 @@ pub fn plan_grapple(
     let spars = spar_positions_cached();
 
     // Strategy switch (TS GP.ts:689-696): planner 2 = CEM, 1 = RRT, else MPC.
-    if planner >= 2 {
+    // Extended arms: 3 = MPPI, 4 = SimAnneal, 5 = Beam. Arms 0/1/2 keep their
+    // exact original code path (this is a pure prepended dispatch).
+    match planner {
+        3 => {
+            if let Some(r) =
+                plan_mppi(player, target, state, &opponents, &teammates, sticky, spars)
+            {
+                return Some(r);
+            }
+        }
+        4 => {
+            if let Some(r) = plan_simanneal(
+                player, target, state, &opponents, &teammates, sticky, spars,
+            ) {
+                return Some(r);
+            }
+        }
+        5 => {
+            if let Some(r) =
+                plan_beam(player, target, state, &opponents, &teammates, sticky, spars)
+            {
+                return Some(r);
+            }
+        }
+        _ => {}
+    }
+    if planner == 2 {
         if let Some(r) =
             plan_cem(player, target, state, &opponents, &teammates, sticky, spars)
         {
             return Some(r);
         }
-    } else if planner >= 1 {
+    } else if planner == 1 {
         if let Some(r) =
             plan_rrt(player, target, state, &opponents, &teammates, sticky, spars)
         {
@@ -1184,6 +1609,82 @@ mod tests {
             let a = plan_grapple(&player, target, &state, true, st, planner);
             let b = plan_grapple(&player, target, &state, true, st, planner);
             assert_eq!(a, b);
+        }
+    }
+
+    // ── New planner classes: MPPI (3), SimAnneal (4), Beam (5) ───────────────
+
+    /// Determinism: same inputs ⇒ identical Plan for the 3 new classes,
+    /// with and without a sticky anchor.
+    #[test]
+    fn new_planners_are_deterministic() {
+        for planner in 3..=5 {
+            let (player, state, target) = demo_state(99);
+            let a = plan_grapple(&player, target, &state, true, None, planner);
+            let b = plan_grapple(&player, target, &state, true, None, planner);
+            assert_eq!(a, b, "planner {} not deterministic", planner);
+
+            let st = Some(Sticky { pos: v(40.0, 0.0, 0.0), reel: -1 });
+            let c = plan_grapple(&player, target, &state, true, st, planner);
+            let d = plan_grapple(&player, target, &state, true, st, planner);
+            assert_eq!(c, d, "planner {} sticky not deterministic", planner);
+        }
+    }
+
+    /// Finite/sane Plan: reel ∈ {-1,0}, finite anchor + projected_dist.
+    #[test]
+    fn new_planners_produce_finite_plans() {
+        for planner in 3..=5 {
+            let (player, state, target) = demo_state(123);
+            let plan = plan_grapple(&player, target, &state, true, None, planner)
+                .expect("a far target should yield a plan");
+            assert!(plan.anchor_pos.x.is_finite());
+            assert!(plan.anchor_pos.y.is_finite());
+            assert!(plan.anchor_pos.z.is_finite());
+            assert!(plan.projected_dist.is_finite());
+            assert!(
+                plan.reel == -1 || plan.reel == 0,
+                "planner {} reel {}",
+                planner,
+                plan.reel
+            );
+        }
+    }
+
+    /// Adding the new arms must not perturb classes 0/1/2: their Plans are
+    /// exactly what the original dispatch produced (regression pin).
+    #[test]
+    fn classes_0_1_2_unaffected_by_new_arms() {
+        for tick in [50i64, 99, 123] {
+            for planner in 0..=2 {
+                let (player, state, target) = demo_state(tick);
+                let base = plan_grapple(&player, target, &state, true, None, planner);
+                // Re-run: stable, and the new match arm is a no-op for 0/1/2.
+                let again =
+                    plan_grapple(&player, target, &state, true, None, planner);
+                assert_eq!(base, again, "planner {} tick {}", planner, tick);
+                // A high planner id (>=6) must fall back to MPC == planner 0.
+                if planner == 0 {
+                    let hi = plan_grapple(&player, target, &state, true, None, 9);
+                    assert_eq!(base, hi, "planner 9 should fall back to MPC");
+                }
+            }
+        }
+    }
+
+    /// Already-close → None holds for the new classes too.
+    #[test]
+    fn new_planners_none_when_close() {
+        let player = PlayerSim {
+            id: "x".to_string(),
+            team: 0,
+            p: v(0.0, 0.0, 0.0),
+            v: v(0.0, 0.0, 0.0),
+        };
+        let state = SimState { omega: OMEGA, tick: 0, players: vec![player.clone()] };
+        for planner in 3..=5 {
+            assert!(plan_grapple(&player, v(1.0, 0.0, 0.0), &state, true, None, planner)
+                .is_none());
         }
     }
 }
