@@ -178,3 +178,12 @@ pub struct InputFrame {
     pub tick: f64,
     pub players: Vec<PlayerInput>,
 }
+
+/// Stable per-commitment style draw (RiggerAI.ts:484 / Anchor.ts:29).
+/// When present, role policies use these instead of fresh rng() draws so
+/// a committed intent stays positionally consistent across ticks.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RoleStyle {
+    pub angle: f64,
+    pub radius: f64,
+}

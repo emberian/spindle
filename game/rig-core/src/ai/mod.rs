@@ -19,6 +19,12 @@ pub mod gate_solve;
 pub mod lead_predict;
 pub mod score_ev;
 pub mod throw_score;
+// Port increment 4: ai↔planner bridge (orchestrator-authored coherence
+// glue) — the stable GrapplePlanner.planGrapple surface on ai::types
+// that the swarmed role ports call.
+pub mod plan_bridge;
+// Port increment 4: per-role tactical policies (swarm-authored).
+pub mod roles;
 
 pub use orientation::*;
 pub use profile::{style_to_profile, Difficulty, TeamProfile};
