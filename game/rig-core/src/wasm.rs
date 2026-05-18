@@ -26,16 +26,18 @@
 //! [17]    loop_untouched      (1.0 = untouched, 0.0 = touched)
 //!
 //! Then for each player i (0-based, in add_player order):
-//!   [18 + i*10 + 0]  p.x
-//!   [18 + i*10 + 1]  p.y
-//!   [18 + i*10 + 2]  p.z
-//!   [18 + i*10 + 3]  v.x
-//!   [18 + i*10 + 4]  v.y
-//!   [18 + i*10 + 5]  v.z
-//!   [18 + i*10 + 6]  grounded (1.0 = grounded, 0.0 = free)
-//!   [18 + i*10 + 7]  dv_budget
-//!   [18 + i*10 + 8]  line_taut (1.0 = taut, 0.0 = slack or no line)
-//!   [18 + i*10 + 9]  line_rest_len (0.0 if no line)
+//!   [18 + i*11 + 0]  p.x
+//!   [18 + i*11 + 1]  p.y
+//!   [18 + i*11 + 2]  p.z
+//!   [18 + i*11 + 3]  v.x
+//!   [18 + i*11 + 4]  v.y
+//!   [18 + i*11 + 5]  v.z
+//!   [18 + i*11 + 6]  grounded (1.0 = grounded, 0.0 = free)
+//!   [18 + i*11 + 7]  dv_budget
+//!   [18 + i*11 + 8]  line_taut (1.0 = taut, 0.0 = slack or no line)
+//!   [18 + i*11 + 9]  line_rest_len (0.0 if no line)
+//!   [18 + i*11 + 10] line_attached (1.0 = claw landed/line live,
+//!                     0.0 = claw in flight OR no line) — GRAPPLE LATENCY
 //! ```
 //!
 //! `snapshot_meta()` returns a JSON string with non-numeric fields:
@@ -414,6 +416,10 @@ impl RigSim {
             out.push(p.dv_budget);
             out.push(if p.line_taut.unwrap_or(false) { 1.0 } else { 0.0 });
             out.push(p.line_rest_len.unwrap_or(0.0));
+            // GRAPPLE LATENCY: 1.0 ⇒ claw landed (line live); 0.0 ⇒ claw in
+            // flight OR no line. Render uses this to draw a traveling claw
+            // vs. a live rope; not part of the determinism hash.
+            out.push(if p.line_attached.unwrap_or(false) { 1.0 } else { 0.0 });
         }
 
         out
@@ -569,16 +575,17 @@ mod tests {
         sim.add_player("A", 0, 0, 1.0, 2.0, 3.0);
         sim.add_player("B", 1, 4, 4.0, 5.0, 6.0);
         let flat = sim.snapshot_flat();
-        // 18 header + 2 players * 10 = 38
-        assert_eq!(flat.len(), 38);
+        // GRAPPLE LATENCY: stride is now 11 (added line_attached at +10), so
+        // 18 header + 2 players * 11 = 40. Player 1 starts at 18 + 11 = 29.
+        assert_eq!(flat.len(), 40);
         // player 0 position
         assert_eq!(flat[18], 1.0); // p.x
         assert_eq!(flat[19], 2.0); // p.y
         assert_eq!(flat[20], 3.0); // p.z
         // player 1 position
-        assert_eq!(flat[28], 4.0);
-        assert_eq!(flat[29], 5.0);
-        assert_eq!(flat[30], 6.0);
+        assert_eq!(flat[29], 4.0);
+        assert_eq!(flat[30], 5.0);
+        assert_eq!(flat[31], 6.0);
     }
 
     #[test]

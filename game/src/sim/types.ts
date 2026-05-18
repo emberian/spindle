@@ -28,6 +28,10 @@ export interface GrappleState {
   anchorPos: Vec3;
   restLen: number;
   taut: boolean;
+  // GRAPPLE LATENCY: false while the claw is in flight toward anchorPos (no
+  // constraint force yet), true once it has landed and the line is live.
+  // Render/AI hint; NOT part of the determinism hash.
+  attached: boolean;
 }
 
 export interface PlayerSim {

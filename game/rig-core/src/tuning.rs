@@ -43,6 +43,25 @@ pub const LINE_SLACK_K: f64 = 120.0;
 pub const REEL_PULL_SPEED: f64 = 26.0; // m/s toward the anchor while reeling in
 pub const REEL_PULL_ACCEL: f64 = 120.0; // m/s² winch acceleration toward anchor
 
+/// GRAPPLE LATENCY (the catch fix). The rig claw is NOT instantaneous: when
+/// a line is fired the claw travels from the player toward the fire target at
+/// `CLAW_SPEED` m/s and only ATTACHES (line becomes active/anchored) after
+/// `ceil(distance / CLAW_SPEED / h)` ticks. While the claw is in flight the
+/// line is committed to that target and re-aiming is ignored until it lands
+/// or an explicit release cancels it. After a release (or a missed/expired
+/// claw) the player cannot fire again for `REFIRE_COOLDOWN_TICKS`.
+///
+/// `CLAW_SPEED` = 80 m/s ⇒ at h = 1/240 s the flight is `ceil(distance·3)`
+/// ticks: a 20 m shot lands in 60 ticks ≈ 0.25 s, 30 m ≈ 0.375 s, 40 m ≈
+/// 0.5 s — slow enough to read on screen, fast enough to still be a viable
+/// committed dive. Tick-counted (integer ceil against the sim tick), NO
+/// wall clock, NO rng ⇒ fully deterministic.
+pub const CLAW_SPEED: f64 = 80.0; // m/s — claw travel speed from player to target
+/// Re-fire lockout after a release / missed claw. 48 ticks at 240 Hz = 0.2 s
+/// — long enough that the AI must RIDE its committed line instead of
+/// spamming a fresh prediction every tick, short enough not to feel sticky.
+pub const REFIRE_COOLDOWN_TICKS: u64 = 48;
+
 /// Soft-grounding penetration push-out spring (rho ≥ R).
 /// ω_n = sqrt(GROUND_K / 78) ≈ 8.0 rad/s ⇒ ω_n·h ≈ 0.033 ≪ 2.
 pub const GROUND_K: f64 = 5000.0;

@@ -83,22 +83,37 @@ export class SimWorld {
     return this.players.find((w) => w.id === id);
   }
 
-  private applyInput(inp: PlayerInput): void {
+  private applyInput(inp: PlayerInput, h: number): void {
     const w = this.find(inp.id);
     if (!w) return;
     const pl = w.body;
 
-    // Grapple
+    // Grapple — GRAPPLE LATENCY (the catch fix), mirrors rig-core
+    // sim_world.rs apply_input. A fire is IGNORED if a line is already
+    // present (claw in flight OR attached — committed to target, no silent
+    // per-tick re-anchor) OR the re-fire cooldown has not elapsed
+    // (tick < refireReadyTick). Otherwise the claw launches: the line
+    // exists immediately (blocks re-aim) but attaches only after
+    // ceil(dist / CLAW_SPEED / h) ticks. Integer ticks, no wall clock.
     if (inp.fireLineAt) {
-      const len = vlen(vsub(pl.p, inp.fireLineAt));
-      pl.line = {
-        anchorPos: { ...inp.fireLineAt },
-        anchorBody: null,
-        restLen: Math.min(TETHER_MAX, Math.max(3, len)),
-        taut: false,
-      } as Line;
+      const blocked = pl.line !== null || this.tick < pl.refireReadyTick;
+      if (!blocked) {
+        const len = vlen(vsub(pl.p, inp.fireLineAt));
+        const flightTicks = Math.max(1, Math.ceil(len / FEEL.CLAW_SPEED / h));
+        pl.line = {
+          anchorPos: { ...inp.fireLineAt },
+          anchorBody: null,
+          restLen: Math.min(TETHER_MAX, Math.max(3, len)),
+          taut: false,
+          attached: false,
+          attachTick: this.tick + flightTicks,
+        } as Line;
+      }
     } else if (inp.release && pl.line) {
+      // Explicit release cancels the line (in flight or attached) and
+      // starts the re-fire cooldown.
       pl.line = null;
+      pl.refireReadyTick = this.tick + FEEL.REFIRE_COOLDOWN_TICKS;
     }
     if (inp.pushoff) pushOff(pl, inp.aim, 7);
     if (inp.thrumbler) thrumbler(pl, inp.thrumbler);
@@ -122,7 +137,18 @@ export class SimWorld {
   step(frame: InputFrame, h: number): SimEvent[] {
     this.events = [];
     const inMap = new Map(frame.players.map((p) => [p.id, p]));
-    for (const pi of frame.players) this.applyInput(pi);
+    for (const pi of frame.players) this.applyInput(pi, h);
+
+    // GRAPPLE LATENCY: flip in-flight claws to attached once the sim tick
+    // reaches their landing tick — BEFORE stepping players so a claw landing
+    // this tick exerts its first constraint force this same tick. Integer
+    // compare, deterministic (mirrors rig-core sim_world.rs).
+    for (const w of this.players) {
+      const ln = w.body.line;
+      if (ln && !ln.attached && this.tick >= ln.attachTick) {
+        ln.attached = true;
+      }
+    }
 
     // Players
     for (const w of this.players) {
@@ -287,6 +313,7 @@ export class SimWorld {
               anchorPos: { ...w.body.line.anchorPos },
               restLen: w.body.line.restLen,
               taut: w.body.line.taut,
+              attached: w.body.line.attached,
             }
           : null,
         dvBudget: w.body.dvBudget,

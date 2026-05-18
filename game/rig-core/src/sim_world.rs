@@ -171,6 +171,12 @@ pub struct PlayerSnapshot {
     pub line_anchor: Option<Vec3>,
     pub line_rest_len: Option<f64>,
     pub line_taut: Option<bool>,
+    /// GRAPPLE LATENCY: `Some(false)` ⇒ the claw is still in flight toward
+    /// `line_anchor` (line committed to target, no constraint force yet);
+    /// `Some(true)` ⇒ the claw has landed and the line is live; `None` ⇒ no
+    /// line. Render/AI use this to distinguish a traveling claw from a live
+    /// line. NOT folded into `hash_snapshot` (render/AI hint only).
+    pub line_attached: Option<bool>,
     // ── Render-only fields (NOT folded into `hash_snapshot`; excluded from
     //    the determinism-hashed surface — verified: `hash_snapshot` folds
     //    only tick, bell.p/v/w and per-player p/v). ────────────────────────
@@ -307,14 +313,24 @@ impl SimWorld {
         self.players.iter().find(|w| w.id == id).map(|w| w.team)
     }
 
-    fn apply_input(&mut self, inp: &PlayerInput) {
+    fn apply_input(&mut self, inp: &PlayerInput, h: f64) {
         let idx = match self.find_idx(&inp.id) {
             Some(i) => i,
             None => return,
         };
 
-        // Grapple line
+        // Grapple line — GRAPPLE LATENCY (the catch fix). A fire is IGNORED
+        // if a line is already present (claw in flight OR attached —
+        // committed to its target, no silent per-tick re-anchor) OR the
+        // re-fire cooldown has not elapsed (`self.tick < refire_ready_tick`)
+        // after a release / missed claw. Otherwise the claw launches: the
+        // line EXISTS immediately (blocks re-aim) but is `attached = false`
+        // until it travels `len` at CLAW_SPEED — landing after
+        // `ceil(len / CLAW_SPEED / h)` ticks. Tick-counted, no rng.
         if let Some(anchor) = inp.fire_line_at {
+            let blocked = self.players[idx].body.line.is_some()
+                || self.tick < self.players[idx].body.refire_ready_tick;
+            if !blocked {
             let len = (self.players[idx].body.p.sub(anchor)).len();
             // BLOCKER 1: if the fire point lands on/near another player's
             // body (teammate OR opponent) within BIND_RADIUS, bind the
@@ -338,14 +354,27 @@ impl SimWorld {
                     anchor_player = Some(w.id.clone());
                 }
             }
+            // Claw flight time ∝ distance: ceil(len / CLAW_SPEED / h) ticks.
+            // f64 math then ceil → exact integer tick count; deterministic,
+            // no rng, no wall clock. Min 1 tick so a line never attaches the
+            // same tick it is fired (latency always observable).
+            let flight_ticks =
+                (len / crate::tuning::CLAW_SPEED / h).ceil().max(1.0) as u64;
             self.players[idx].body.line = Some(crate::grapple::Line {
                 anchor_pos: anchor,
                 rest_len: TETHER_MAX.min(3.0_f64.max(len)),
                 taut: false,
+                attached: false,
+                attach_tick: self.tick + flight_ticks,
                 anchor_player,
             });
+            }
         } else if inp.release && self.players[idx].body.line.is_some() {
+            // Explicit release cancels the line (in flight or attached) and
+            // starts the re-fire cooldown.
             self.players[idx].body.line = None;
+            self.players[idx].body.refire_ready_tick =
+                self.tick + crate::tuning::REFIRE_COOLDOWN_TICKS;
         }
 
         if inp.pushoff {
@@ -393,7 +422,19 @@ impl SimWorld {
         // is borrowed disjointly from `self`, so we can iterate it
         // directly — no per-tick clone of every PlayerInput.
         for inp in &frame.players {
-            self.apply_input(inp);
+            self.apply_input(inp, h);
+        }
+
+        // GRAPPLE LATENCY: flip in-flight claws to attached once the sim
+        // tick reaches their landing tick. Done BEFORE stepping players so a
+        // claw landing this tick exerts its first constraint force this same
+        // tick. Tick-counted (integer compare) ⇒ deterministic, run==run.
+        for w in &mut self.players {
+            if let Some(line) = w.body.line.as_mut() {
+                if !line.attached && self.tick >= line.attach_tick {
+                    line.attached = true;
+                }
+            }
         }
 
         // Step players. Reel values are read straight off `frame`
@@ -761,6 +802,7 @@ impl SimWorld {
                 line_anchor: w.body.line.as_ref().map(|l| l.anchor_pos),
                 line_rest_len: w.body.line.as_ref().map(|l| l.rest_len),
                 line_taut: w.body.line.as_ref().map(|l| l.taut),
+                line_attached: w.body.line.as_ref().map(|l| l.attached),
                 // Render-only: bound target id (player↔player) and effective
                 // LIVE anchor pos (the bound player's CURRENT body.p when
                 // player-bound — physics tracks the moving target via

@@ -45,6 +45,18 @@ pub struct Line {
     pub anchor_pos: Vec3, // world-space anchor used for a static attachment
     pub rest_len: f64,
     pub taut: bool,
+    /// GRAPPLE LATENCY: false while the claw is in flight toward the fire
+    /// target, true once it has landed and the line is live (anchored). The
+    /// constraint solver does NOTHING until the line is attached — no spring,
+    /// no reel, no recoil — so an in-flight claw exerts zero force. While
+    /// `!attached` the line is COMMITTED to its target: re-aiming is ignored
+    /// (sim_world::apply_input) until it lands or an explicit release cancels.
+    pub attached: bool,
+    /// Sim tick (the value of `SimWorld.tick` during the step) at which the
+    /// claw lands and the line becomes attached. Tick-counted: each step
+    /// flips `attached = true` once `sim.tick >= attach_tick`. Deterministic
+    /// integer count, no wall clock.
+    pub attach_tick: u64,
     /// Identity of the player this line is bound to, if it was fired at a
     /// player body (teammate OR opponent) within bind range. `None` ⇒ a
     /// static world anchor (spar / skin / ring) at `anchor_pos` exactly as
@@ -72,6 +84,16 @@ pub fn resolve_line(
     reel: i32,
     h: f64,
 ) {
+    // GRAPPLE LATENCY: a claw still in flight exerts NO force. The line
+    // exists (it is committed to its target and blocks re-aim) but the
+    // constraint is inert until `attached` is flipped true by the caller
+    // (sim_world::step) once `sim.tick >= attach_tick`. Byte-identical to
+    // the legacy path the instant a line attaches.
+    if !line.attached {
+        line.taut = false;
+        return;
+    }
+
     // Anchor position and velocity — borrow once here before splitting.
     let (a_p, a_v, a_inv_mass): (Vec3, Vec3, f64) = match &anchor {
         Some(b) => (b.p, b.v, b.inv_mass),
@@ -173,6 +195,8 @@ mod tests {
             rest_len: 20.0,
             taut: false,
             anchor_player: None,
+            attached: true,
+            attach_tick: 0,
         };
         let v0 = p.v;
         resolve_line(&mut p, &mut line, None, 0, H);
@@ -195,6 +219,8 @@ mod tests {
             rest_len: 10.0,
             taut: false,
             anchor_player: None,
+            attached: true,
+            attach_tick: 0,
         };
         resolve_line(&mut p, &mut line, None, 0, H);
         // Radial spring force is inward (−x) ⇒ outward speed must drop.
@@ -222,6 +248,8 @@ mod tests {
             rest_len: 10.0,
             taut: false,
             anchor_player: None,
+            attached: true,
+            attach_tick: 0,
         };
         resolve_line(&mut p, &mut line, None, 0, H);
         // Pre-tension pulls gently inward (−x); never pushes outward (+x).
@@ -248,6 +276,8 @@ mod tests {
             rest_len: 12.0,
             taut: false,
             anchor_player: None,
+            attached: true,
+            attach_tick: 0,
         };
 
         let m_a = 80.0_f64;
@@ -291,6 +321,8 @@ mod tests {
             rest_len: 11.0,
             taut: false,
             anchor_player: Some("teammate".into()),
+            attached: true,
+            attach_tick: 0,
         };
 
         let m_a = 80.0_f64;
@@ -349,6 +381,8 @@ mod tests {
             rest_len: 20.0,
             taut: false,
             anchor_player: None,
+            attached: true,
+            attach_tick: 0,
         };
 
         // One reel-in step: rest_len shrinks by exactly REEL_RATE·h.

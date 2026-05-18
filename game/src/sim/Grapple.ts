@@ -29,6 +29,12 @@ export interface Line {
   anchorBody: Body | null; // used when the anchor is another player
   restLen: number;
   taut: boolean;
+  // GRAPPLE LATENCY (mirrors rig-core grapple.rs Line): `attached` is false
+  // while the claw is in flight (line committed to target, NO constraint
+  // force) and true once it lands. `attachTick` is the sim tick at/after
+  // which SimWorld flips `attached` true. Integer tick count, no wall clock.
+  attached: boolean;
+  attachTick: number;
 }
 
 export const TETHER_MIN = 3;
@@ -44,6 +50,13 @@ function anchorV(line: Line): Vec3 {
 
 // One constraint solve for one line. `reel` ∈ {-1,0,1} (in/none/out).
 export function resolveLine(player: Body, line: Line, reel: -1 | 0 | 1, h: number): void {
+  // GRAPPLE LATENCY: an in-flight claw exerts NO force — the constraint is
+  // inert until SimWorld flips `attached` true (sim.tick >= attachTick).
+  // Byte-identical to the legacy path the instant a line attaches.
+  if (!line.attached) {
+    line.taut = false;
+    return;
+  }
   const aP = anchorP(line);
   const aV = anchorV(line);
   const aInvMass = line.anchorBody ? line.anchorBody.invMass : 0;

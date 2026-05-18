@@ -11,6 +11,8 @@ describe('rig-line constraint', () => {
       anchorBody: null,
       restLen: 20,
       taut: false,
+      attached: true,
+      attachTick: 0,
     };
     const v0 = { ...p.v };
     resolveLine(p, line, 0, h);
@@ -26,6 +28,8 @@ describe('rig-line constraint', () => {
       anchorBody: null,
       restLen: 10,
       taut: false,
+      attached: true,
+      attachTick: 0,
     };
     resolveLine(p, line, 0, h);
     expect(p.v.x).toBeLessThan(6); // radial spring force pulls inward
@@ -41,6 +45,8 @@ describe('rig-line constraint', () => {
       anchorBody: null,
       restLen: 10,
       taut: false,
+      attached: true,
+      attachTick: 0,
     };
     resolveLine(p, line, 0, h);
     expect(p.v.x).toBeLessThanOrEqual(-2); // never pushed outward
@@ -55,6 +61,8 @@ describe('rig-line constraint', () => {
       anchorBody: a,
       restLen: 12,
       taut: false,
+      attached: true,
+      attachTick: 0,
     };
     const mA = 80,
       mP = 75;
@@ -73,6 +81,8 @@ describe('rig-line constraint', () => {
       anchorBody: null,
       restLen: 20,
       taut: false,
+      attached: true,
+      attachTick: 0,
     };
     const pBefore = { ...p.p };
     resolveLine(p, line, -1, h);

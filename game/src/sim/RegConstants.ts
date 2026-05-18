@@ -43,4 +43,14 @@ export const FEEL = {
 
   HOLD_K: 800, // held-bell follow spring (ω_n·h ≈ 0.118)
   HOLD_C: 56, // held-bell follow damping (near-critical, unit mass)
+
+  // GRAPPLE LATENCY (the catch fix) — verbatim mirror of tuning.rs.
+  // The claw is NOT instantaneous: a fired line travels from the player to
+  // the target at CLAW_SPEED m/s and only ATTACHES after
+  // ceil(distance / CLAW_SPEED / h) ticks. CLAW_SPEED = 80 ⇒ at h = 1/240
+  // a 20 m shot lands in 60 ticks ≈ 0.25 s, 40 m ≈ 0.5 s. After a release
+  // / missed claw the player cannot re-fire for REFIRE_COOLDOWN_TICKS
+  // (48 ticks = 0.2 s). Integer tick counts, no wall clock.
+  CLAW_SPEED: 80, // m/s — claw travel speed from player to target
+  REFIRE_COOLDOWN_TICKS: 48, // ticks — re-fire lockout after release/miss
 } as const;

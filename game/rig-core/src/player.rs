@@ -50,6 +50,13 @@ pub struct PlayerBody {
     /// a stick-spring, so this no longer goes to 0.)
     pub inv_mass: f64,
     pub line: Option<Line>,
+    /// GRAPPLE LATENCY: the sim tick at/after which this player may fire a
+    /// new line. Set when a line is released, or when an in-flight claw is
+    /// cancelled by an explicit release. A fire input is IGNORED while
+    /// `sim.tick < refire_ready_tick` (re-fire cooldown) or while a line is
+    /// already present (claw in flight OR attached — committed to target).
+    /// Tick-counted (integer), no wall clock ⇒ deterministic.
+    pub refire_ready_tick: u64,
     /// Clipped to a spar/ring/teammate.
     pub contact: bool,
     /// Touched the skin — out of the calm. LATCHED (never cleared here) so the
@@ -71,6 +78,7 @@ pub fn make_player(p: Vec3) -> PlayerBody {
         v: Vec3::new(0.0, 0.0, 0.0),
         inv_mass: 1.0 / PLAYER_MASS,
         line: None,
+        refire_ready_tick: 0,
         contact: false,
         grounded: false,
         dv_budget: THRUMBLER_CAP,
@@ -365,6 +373,8 @@ mod tests {
             anchor_pos: Vec3::new(0.0, 0.0, 0.0),
             rest_len: 20.0,
             taut: false,
+            attached: true,
+            attach_tick: 0,
             anchor_player: None,
         });
 

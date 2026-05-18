@@ -35,6 +35,10 @@ export interface PlayerBody {
   v: Vec3;
   invMass: number; // 1/PLAYER_MASS (contact freeze is now a stick-spring)
   line: Line | null;
+  // GRAPPLE LATENCY (mirrors rig-core player.rs): sim tick at/after which a
+  // new line may be fired. A fire is ignored while sim.tick < this OR a line
+  // is already present (claw in flight / attached). Integer, no wall clock.
+  refireReadyTick: number;
   contact: boolean; // clipped to a spar/ring/teammate
   grounded: boolean; // touched the skin — LATCHED (one-shot event)
   dvBudget: number;
@@ -51,6 +55,7 @@ export function makePlayer(p: Vec3): PlayerBody {
     v: { x: 0, y: 0, z: 0 },
     invMass: 1 / PLAYER_MASS,
     line: null,
+    refireReadyTick: 0,
     contact: false,
     grounded: false,
     dvBudget: THRUMBLER_CAP,

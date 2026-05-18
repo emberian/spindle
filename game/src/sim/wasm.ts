@@ -48,7 +48,8 @@ export function aiReset(): void {
 
 // snapshot_flat layout (see rig-core/src/wasm.rs header).
 const HDR = 18;
-const PSTRIDE = 10;
+// GRAPPLE LATENCY: stride is 11 (added line_attached at offset +10).
+const PSTRIDE = 11;
 
 export interface SimMeta {
   playerIds: string[];
@@ -149,6 +150,9 @@ export class WasmSim {
                 anchorPos: { x: 0, y: 0, z: 0 },
                 restLen: f[o + 9],
                 taut: f[o + 8] > 0.5,
+                // GRAPPLE LATENCY: 1.0 ⇒ claw landed/line live; 0.0 ⇒ claw
+                // still in flight toward anchorPos (no constraint force yet).
+                attached: f[o + 10] > 0.5,
               }
             : null,
         dvBudget: f[o + 7],
