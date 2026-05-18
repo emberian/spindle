@@ -25,6 +25,13 @@ pub mod throw_score;
 pub mod plan_bridge;
 // Port increment 4: per-role tactical policies (swarm-authored).
 pub mod roles;
+// Port increment 4b decision-layer substrate: the cross-file shared
+// types of Director/RiggerAI/AiSystem (serialization point).
+pub mod decision_types;
+// Port increment 4b: the decision integrator + orchestrator.
+pub mod director;
+pub mod rigger_ai;
+pub mod system;
 
 pub use orientation::*;
 pub use profile::{style_to_profile, Difficulty, TeamProfile};
