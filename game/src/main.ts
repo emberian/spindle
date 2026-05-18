@@ -7,6 +7,7 @@ import { GameRuntime } from './core/GameRuntime';
 import { FixedStepDriver, SIM_H } from './core/FixedStepDriver';
 import { renderState, type RenderView } from './render/RenderState';
 import { Calm } from './render/Calm';
+import { DistantHabitat } from './render/DistantHabitat';
 import { BellTrail, bellGlow } from './render/BellTrail';
 import { PostFX } from './render/PostFX';
 import { GameCamera } from './render/Camera';
@@ -55,6 +56,10 @@ app.appendChild(renderer.domElement);
 
 const scene = new THREE.Scene();
 const calm = new Calm(scene);
+// Distant O'Neill-cylinder vista OUTSIDE the play volume. Persistent like
+// `calm`. Quality flag defaults ON (it is the atmosphere); pass `false` as
+// the 2nd arg to disable and reclaim its (tiny) budget.
+const distantHabitat = new DistantHabitat(scene, true);
 const camera = new THREE.PerspectiveCamera(60, 1, 0.1, 4000);
 const post = new PostFX(renderer, scene, camera);
 const trail = new BellTrail(scene, camera);
@@ -329,6 +334,7 @@ async function runMatch(
       if (input.actedThisFrame) armed = true;
       const frozen = !armed && pre.bell.heldBy === 'P1' && match.state.winner === null;
       calm.update(dt);
+      distantHabitat.update(dt);
       if (!frozen) driver.advance(dt);
       const s = renderState(driver.prev as RenderView, driver.cur as RenderView, driver.alpha);
       const lg = s.loopTier === 'loop' ? 1 : s.loopTier === 'curl' ? 0.4 : 0;
@@ -622,6 +628,7 @@ async function runWatch(
   runtime = new GameRuntime(
     (dt) => {
       calm.update(dt);
+      distantHabitat.update(dt);
       driver.advance(dt);
       const s = renderState(driver.prev as RenderView, driver.cur as RenderView, driver.alpha);
       const lg = s.loopTier === 'loop' ? 1 : s.loopTier === 'curl' ? 0.4 : 0;
@@ -854,6 +861,7 @@ async function runReplay(
   runtime = new GameRuntime(
     (dt) => {
       calm.update(dt);
+      distantHabitat.update(dt);
       driver.advance(dt);
       const s = renderState(driver.prev as RenderView, driver.cur as RenderView, driver.alpha);
       const lg = s.loopTier === 'loop' ? 1 : s.loopTier === 'curl' ? 0.4 : 0;
