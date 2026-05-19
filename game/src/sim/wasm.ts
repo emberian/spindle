@@ -46,6 +46,38 @@ export function aiReset(): void {
   aiInst?.reset();
 }
 
+// ── RENDER-ONLY legibility seam ───────────────────────────────────────────────
+// One per-rigger record, PARALLEL to `snapshot_meta.playerIds` / the emitted
+// InputFrame players. It is a pure deterministic function of the committed AI
+// state, crosses its OWN JSON method (never the InputFrame), and is EXCLUDED
+// from `hash_snapshot` / `sim.step` — exactly the `lineAnchors` rigor, only it
+// lives in the AI layer. It exists ONLY to make the swarm's coordination
+// human-watchable in spectate; nothing in the sim or replay reads it.
+export type ControlledBy = 'baseline' | 'rl' | 'human';
+export interface AiDebugRec {
+  id: string;
+  /** Structural role: anchor/spinner/faithwing/freewing/reach. */
+  role: string;
+  /** Committed intent verb: carry/recover/receive/mark/support/zone, or
+   *  'learned' for an RL-driven rigger (no Director Job). */
+  job: string;
+  /** The committed world point the rigger is acting on, or null when it
+   *  is holding/throwing in place (the bell IS the rigger then). */
+  intentTargetPos: { x: number; y: number; z: number } | null;
+  isDiver: boolean;
+  isContester: boolean;
+  isPrimary: boolean;
+  isShadow: boolean;
+  isOutlet: boolean;
+  controlledBy: ControlledBy;
+}
+
+/** The baseline AI's render-only legibility records from the last `aiTick`. */
+export function aiDebug(): AiDebugRec[] {
+  if (!aiInst) return [];
+  return JSON.parse(aiInst.ai_debug_json()) as AiDebugRec[];
+}
+
 // ── Trained RL policy boundary (RigPolicy) ────────────────────────────────────
 // The browser's seam to the learned shared-parameter MLP. One `RigPolicy`
 // per policy-driven team (it owns the internal baseline `AiSystem` that
@@ -67,6 +99,13 @@ export class PolicyAi {
   ): string {
     return this.pol.tick(simJson, matchJson, controlledIdsJson, seed >>> 0);
   }
+  /** RENDER-ONLY: merged legibility records from the last `tick`, in the
+   *  same order as the emitted players (policy-driven first, then the
+   *  baseline half). Spectate-overlay channel only — never sim/replay. */
+  debug(): AiDebugRec[] {
+    return JSON.parse(this.pol.ai_debug_json()) as AiDebugRec[];
+  }
+
   reset(): void {
     this.pol.reset();
   }

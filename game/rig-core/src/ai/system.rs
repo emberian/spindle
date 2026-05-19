@@ -10,12 +10,17 @@
 //! triggers (the heart of visible competence — see rigger_ai).
 
 use super::decision_types::{
-    DirectorState, PlayerCommitCache, TeamConfig, DIRECTOR_TICK_INTERVAL,
+    AiDebugRec, DirectorState, Job, PlayerAssignment, PlayerCommitCache, TeamConfig,
+    DIRECTOR_TICK_INTERVAL,
 };
 use super::director::run_director;
-use super::rigger_ai::compute_player_input;
+use super::rigger_ai::{
+    bell_intercept, compute_player_input, is_contest_committer, is_dive_committer, job_str,
+    role_str, wants_catch,
+};
 use super::rng::AiRng;
 use super::types::{InputFrame, MatchState, SimState, TeamSide};
+use crate::math::Vec3;
 use std::collections::{HashMap, HashSet};
 
 /// Director cache: one per team side (index.ts DirectorCache).
@@ -59,6 +64,13 @@ pub struct AiSystem {
     /// for them and never advances their commit/director caches off their
     /// state, so the external policy fully owns them.
     controlled: HashSet<String>,
+    /// RENDER-ONLY legibility side channel — one record per AI-controlled
+    /// rigger this tick, parallel to the emitted frame. Filled by `tick`
+    /// from the SAME committed director/commit state the input came from
+    /// (pure deterministic re-reads, no rng), serialized over a SEPARATE
+    /// wasm method. NEVER folded into the InputFrame, `Snapshot`, or
+    /// `hash_snapshot` — it cannot perturb the sim or determinism.
+    last_debug: Vec<AiDebugRec>,
 }
 
 impl AiSystem {
@@ -85,6 +97,7 @@ impl AiSystem {
         let tick = sim_state.tick;
         let tick_u = tick as u32;
         let mut inputs = Vec::new();
+        self.last_debug.clear();
 
         for (ci, cfg) in configs.iter().enumerate() {
             // 'P1' is human-controlled only when present; filtering by
@@ -169,6 +182,70 @@ impl AiSystem {
                     DIRECTOR_TICK_INTERVAL,
                 );
                 inputs.push(input);
+
+                // ── RENDER-ONLY legibility record ────────────────────────
+                // Re-read the SAME committed director/commit state the
+                // input above came from to label what this rigger is doing
+                // and why. All predicates are pure deterministic reads (no
+                // rng, no cache mutation) so building this never perturbs
+                // the emitted frame, the sim, or the determinism hash.
+                let assignment: PlayerAssignment = director
+                    .assignments
+                    .get(&player.id)
+                    .cloned()
+                    .unwrap_or(PlayerAssignment {
+                        job: Job::Support,
+                        mark_id: None,
+                        depth_slot: 0.4,
+                        radius_slot: 0.45,
+                        pressure: 0.0,
+                    });
+                let is_primary =
+                    director.recover_id.as_deref() == Some(player.id.as_str());
+                let is_shadow = assignment.is_shadow();
+                let is_outlet = assignment.job == Job::Receive;
+                let is_diver =
+                    is_dive_committer(player, sim_state, director, &assignment);
+                let is_contester = !is_diver
+                    && is_contest_committer(player, sim_state, match_state, director);
+                let catching =
+                    wants_catch(player, sim_state, &assignment);
+                let have_bell =
+                    sim_state.bell.held_by.as_deref() == Some(player.id.as_str());
+                // Committed point this rigger is acting on, in priority
+                // order matching the executor in `compute_player_input`.
+                let intent_target: Option<Vec3> = if have_bell {
+                    // Throwing/holding in place — the bell IS the rigger;
+                    // no separate target line reads cleaner than a stub.
+                    None
+                } else if is_diver {
+                    Some(sim_state.bell.p)
+                } else if is_contester {
+                    Some(sim_state.bell.p)
+                } else if catching {
+                    Some(bell_intercept(player, sim_state))
+                } else {
+                    commit_cache
+                        .get(&CommitKey {
+                            side: side_tag(cfg.side),
+                            ci,
+                            player_id: player.id.clone(),
+                        })
+                        .and_then(|c| c.value.as_ref())
+                        .and_then(|v| v.nav_target)
+                };
+                self.last_debug.push(AiDebugRec {
+                    id: player.id.clone(),
+                    role: role_str(player.role).to_string(),
+                    job: job_str(assignment.job).to_string(),
+                    intent_target,
+                    is_diver,
+                    is_contester,
+                    is_primary,
+                    is_shadow,
+                    is_outlet,
+                    controlled_by: "baseline",
+                });
             }
         }
 
@@ -179,7 +256,72 @@ impl AiSystem {
     pub fn reset(&mut self) {
         self.director_caches.clear();
         self.commit_cache.clear();
+        self.last_debug.clear();
     }
+
+    /// RENDER-ONLY: the legibility records produced by the last `tick`,
+    /// in emit order (parallel to the InputFrame players). Read by the
+    /// wasm `ai_debug_json` seam for the spectate overlay only.
+    pub fn last_debug(&self) -> &[AiDebugRec] {
+        &self.last_debug
+    }
+}
+
+/// Serialize the legibility records to the render-only JSON the overlay
+/// consumes. Hand-rolled to match the `wasm`/`ai_wasm` JSON dialect
+/// exactly (one seam dialect). Pure; no rng. NOT a sim/determinism
+/// surface — it is the human-watchable channel only.
+pub fn ai_debug_to_json(recs: &[AiDebugRec]) -> String {
+    fn jstr(s: &str) -> String {
+        let mut out = String::with_capacity(s.len() + 2);
+        out.push('"');
+        for c in s.chars() {
+            match c {
+                '"' => out.push_str("\\\""),
+                '\\' => out.push_str("\\\\"),
+                c => out.push(c),
+            }
+        }
+        out.push('"');
+        out
+    }
+    fn jnum(x: f64) -> String {
+        if x.is_finite() {
+            format!("{:?}", x)
+        } else {
+            "0.0".to_string()
+        }
+    }
+    fn jvec(v: &Option<Vec3>) -> String {
+        match v {
+            Some(v) => format!(
+                "{{\"x\":{},\"y\":{},\"z\":{}}}",
+                jnum(v.x),
+                jnum(v.y),
+                jnum(v.z)
+            ),
+            None => "null".to_string(),
+        }
+    }
+    let parts: Vec<String> = recs
+        .iter()
+        .map(|r| {
+            format!(
+                "{{\"id\":{},\"role\":{},\"job\":{},\"intentTargetPos\":{},\"isDiver\":{},\"isContester\":{},\"isPrimary\":{},\"isShadow\":{},\"isOutlet\":{},\"controlledBy\":{}}}",
+                jstr(&r.id),
+                jstr(&r.role),
+                jstr(&r.job),
+                jvec(&r.intent_target),
+                if r.is_diver { "true" } else { "false" },
+                if r.is_contester { "true" } else { "false" },
+                if r.is_primary { "true" } else { "false" },
+                if r.is_shadow { "true" } else { "false" },
+                if r.is_outlet { "true" } else { "false" },
+                jstr(r.controlled_by),
+            )
+        })
+        .collect();
+    format!("[{}]", parts.join(","))
 }
 
 #[cfg(test)]

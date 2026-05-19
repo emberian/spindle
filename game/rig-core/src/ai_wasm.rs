@@ -539,6 +539,18 @@ impl RigAi {
     pub fn reset(&mut self) {
         self.sys.reset();
     }
+
+    /// RENDER-ONLY legibility seam. Returns a JSON array — PARALLEL to the
+    /// last `tick`'s emitted players (and to `snapshot_meta.playerIds`) —
+    /// of per-rigger `{id, role, job, intentTargetPos|null, isDiver,
+    /// isContester, isPrimary, isShadow, isOutlet, controlledBy}`. This is
+    /// the human-watchable spectate-overlay channel ONLY: it is a separate
+    /// method (never merged into the `InputFrame`), is a pure
+    /// deterministic function of the committed AI state, and NEVER enters
+    /// `sim.step` or `hash_snapshot` — exactly the `lineAnchors` rigor.
+    pub fn ai_debug_json(&self) -> String {
+        crate::ai::system::ai_debug_to_json(self.sys.last_debug())
+    }
 }
 
 impl Default for RigAi {
