@@ -17,7 +17,7 @@ const C_DIM    = 0x6b7079;
 
 // ── Skin texture: luminous land-stripe pattern scrolls along +V to sell spin ─
 function makeSkinTexture(): THREE.CanvasTexture {
-  const W = 128, H = 1024;
+  const W = 256, H = 1024;
   const c = document.createElement('canvas');
   c.width = W; c.height = H;
   const g = c.getContext('2d')!;
@@ -31,27 +31,63 @@ function makeSkinTexture(): THREE.CanvasTexture {
     const x0 = (i / 6) * W;
     const w  = W / 6;
     if (i % 3 === 0) {
-      // bright window strip — glazed cyan glow
+      // Bright window strip — glazed cyan glow (intensified for starlight)
       const grd = g.createLinearGradient(x0, 0, x0 + w, 0);
       grd.addColorStop(0,   'rgba(26,166,183,0.0)');
-      grd.addColorStop(0.3, 'rgba(26,166,183,0.22)');
-      grd.addColorStop(0.7, 'rgba(26,166,183,0.22)');
+      grd.addColorStop(0.15, 'rgba(26,166,183,0.12)');
+      grd.addColorStop(0.3, 'rgba(60,210,230,0.45)');
+      grd.addColorStop(0.5, 'rgba(80,230,255,0.55)');
+      grd.addColorStop(0.7, 'rgba(60,210,230,0.45)');
+      grd.addColorStop(0.85, 'rgba(26,166,183,0.12)');
       grd.addColorStop(1,   'rgba(26,166,183,0.0)');
       g.fillStyle = grd;
       g.fillRect(x0, 0, w, H);
+      // Inner bright core (the glazing itself)
+      g.fillStyle = 'rgba(200,240,255,0.08)';
+      g.fillRect(x0 + w * 0.35, 0, w * 0.3, H);
     } else {
-      // land panel — warm grey-green terrain
+      // Land panel — warm grey-green terrain
       g.fillStyle = i % 2 ? '#232a35' : '#1e2530';
+      g.fillRect(x0, 0, w, H);
+
+      // Warm glow at the "bottom" of each land panel (rim-ward inhabited land beyond)
+      const warmGrd = g.createLinearGradient(x0, 0, x0, H);
+      warmGrd.addColorStop(0, 'rgba(180,100,40,0.0)');
+      warmGrd.addColorStop(0.7, 'rgba(180,100,40,0.0)');
+      warmGrd.addColorStop(1.0, 'rgba(180,100,40,0.06)');
+      g.fillStyle = warmGrd;
       g.fillRect(x0, 0, w, H);
     }
   }
 
-  // Axial lane ticks (faint, marking the 640 m length)
-  g.strokeStyle = 'rgba(107,112,121,0.28)';
-  g.lineWidth = 0.8;
+  // Construction seams — bright panel-joint lines along the hoop (vertical in texture space)
+  g.strokeStyle = 'rgba(160,180,200,0.35)';
+  g.lineWidth = 1.2;
+  for (let i = 0; i < 6; i++) {
+    const x0 = Math.round((i / 6) * W);
+    g.beginPath(); g.moveTo(x0, 0); g.lineTo(x0, H); g.stroke();
+  }
+  // Secondary construction seams — finer panel subdivisions
+  g.strokeStyle = 'rgba(120,140,160,0.15)';
+  g.lineWidth = 0.6;
+  for (let i = 0; i < 12; i++) {
+    const x0 = Math.round((i / 12) * W);
+    g.beginPath(); g.moveTo(x0, 0); g.lineTo(x0, H); g.stroke();
+  }
+
+  // Axial lane ticks (faint, marking the 640 m length) — ring seams at regular intervals
+  g.strokeStyle = 'rgba(130,145,160,0.35)';
+  g.lineWidth = 1.0;
+  for (let y = 0; y < H; y += 128) {
+    g.beginPath(); g.moveTo(0, y); g.lineTo(W, y); g.stroke();
+  }
+  // Secondary ring seams (construction joints)
+  g.strokeStyle = 'rgba(107,112,121,0.22)';
+  g.lineWidth = 0.6;
   for (let y = 0; y < H; y += 64) {
     g.beginPath(); g.moveTo(0, y); g.lineTo(W, y); g.stroke();
   }
+
   // Fine grain — faint noise-like horizontal dashes for texture depth
   g.strokeStyle = 'rgba(180,190,200,0.06)';
   g.lineWidth = 0.5;
@@ -71,6 +107,122 @@ function makeSkinTexture(): THREE.CanvasTexture {
   return t;
 }
 
+
+// ── Industrial scaffolding ribs — structural bones of the cylinder ───────────
+// These are the construction rings from which the sport was born. Dark metallic
+// with faint emissive edge highlighting, spaced every ~90m along the axis.
+function makeScaffoldingRibs(): THREE.InstancedMesh {
+  // Torus ring: slightly smaller than skin to sit visibly inside the boundary
+  const geo = new THREE.TorusGeometry(REG.R * 0.97, 0.35, 8, 96);
+  const mat = new THREE.MeshStandardMaterial({
+    color: 0x1a1e28,
+    emissive: 0x3a5060,
+    emissiveIntensity: 0.4,
+    roughness: 0.35,
+    metalness: 0.9,
+  });
+  const RIB_COUNT = 7; // ~90m spacing across 640m
+  const mesh = new THREE.InstancedMesh(geo, mat, RIB_COUNT);
+  const mtx = new THREE.Matrix4();
+  for (let i = 0; i < RIB_COUNT; i++) {
+    const x = -GATE_X + ((i + 1) / (RIB_COUNT + 1)) * REG.L;
+    mtx.makeRotationY(Math.PI / 2);
+    mtx.setPosition(x, 0, 0);
+    mesh.setMatrixAt(i, mtx);
+  }
+  mesh.instanceMatrix.needsUpdate = true;
+  mesh.castShadow = false;
+  return mesh;
+}
+
+// ── Atmospheric depth haze — subtle volumetric inside play volume ─────────────
+// A very low-opacity warm shell at R~37m that creates axial depth without
+// breaking legibility. The far goal softens slightly relative to the near one.
+function makeDepthHaze(): THREE.Mesh {
+  const geo = new THREE.CylinderGeometry(37, 37, REG.L * 0.85, 24, 1, true);
+  const mat = new THREE.MeshBasicMaterial({
+    color: 0x8a5530,
+    transparent: true,
+    opacity: 0.018,
+    side: THREE.BackSide,
+    depthWrite: false,
+    blending: THREE.AdditiveBlending,
+  });
+  const m = new THREE.Mesh(geo, mat);
+  m.rotation.z = Math.PI / 2;
+  return m;
+}
+
+// ── Spar brackets — instanced flat discs at each spar root ───────────────────
+function makeSparBrackets(): THREE.InstancedMesh {
+  const geo = new THREE.CylinderGeometry(1.2, 1.2, 0.25, 12);
+  const mat = new THREE.MeshStandardMaterial({
+    color: 0x2a3540,
+    emissive: 0x1a3040,
+    emissiveIntensity: 0.3,
+    roughness: 0.4,
+    metalness: 0.85,
+  });
+  const RINGS = 16, AROUND = 3;
+  const mesh = new THREE.InstancedMesh(geo, mat, RINGS * AROUND);
+  const mtx = new THREE.Matrix4();
+  let idx = 0;
+  for (let i = 0; i < RINGS; i++) {
+    const x = -GATE_X + ((i + 0.5) / RINGS) * REG.L;
+    for (let a = 0; a < AROUND; a++) {
+      const ang = (a / AROUND) * Math.PI * 2;
+      const r   = REG.R * 0.62;
+      const cy  = Math.cos(ang), sy = Math.sin(ang);
+      // Orient the disc face outward (radially) — rotate to align normal with radial
+      mtx.makeBasis(
+        new THREE.Vector3(1, 0, 0),
+        new THREE.Vector3(0, cy, sy),
+        new THREE.Vector3(0, -sy, cy),
+      );
+      mtx.setPosition(x, cy * r, sy * r);
+      mesh.setMatrixAt(idx++, mtx);
+    }
+  }
+  mesh.instanceMatrix.needsUpdate = true;
+  mesh.castShadow = false;
+  return mesh;
+}
+
+// ── Ambient drift particles — "the air in the calm" ──────────────────────────
+// Sparse, tiny, slowly drifting motes inside the play volume (R < 40).
+// These are condensation / dust visible in the sunline. Extremely subtle.
+function makeAmbientDrift(): { points: THREE.Points, velocities: Float32Array } {
+  const COUNT = 300;
+  const pos = new Float32Array(COUNT * 3);
+  const velocities = new Float32Array(COUNT * 3);
+  for (let i = 0; i < COUNT; i++) {
+    const ang = Math.random() * Math.PI * 2;
+    const r   = Math.random() * 38; // R < 40, keep inside play volume
+    const x   = -GATE_X + Math.random() * REG.L;
+    pos[i*3]   = x;
+    pos[i*3+1] = Math.cos(ang) * r;
+    pos[i*3+2] = Math.sin(ang) * r;
+    // Very slow drift: 0.1 - 0.5 m/s in random direction
+    const speed = 0.1 + Math.random() * 0.4;
+    const dAng = Math.random() * Math.PI * 2;
+    const dEl  = (Math.random() - 0.5) * Math.PI * 0.5;
+    velocities[i*3]   = Math.cos(dEl) * Math.cos(dAng) * speed;
+    velocities[i*3+1] = Math.cos(dEl) * Math.sin(dAng) * speed;
+    velocities[i*3+2] = Math.sin(dEl) * speed;
+  }
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+  const mat = new THREE.PointsMaterial({
+    color: 0xc8dde8,
+    size: 0.25,
+    transparent: true,
+    opacity: 0.18,
+    depthWrite: false,
+    blending: THREE.AdditiveBlending,
+    sizeAttenuation: true,
+  });
+  return { points: new THREE.Points(geo, mat), velocities };
+}
 
 // ── Axis "sunline" — the bright weightless core light tube ───────────────────
 function makeAxisGlow(): THREE.Mesh {
@@ -351,6 +503,11 @@ export class Calm {
   private skinTex: THREE.CanvasTexture;
   private faithGoal: THREE.Group;
   private freeGoal: THREE.Group;
+  private sparMesh: THREE.InstancedMesh;
+  private sparPhases: Float32Array; // per-spar oscillation phase offset
+  private driftPoints: THREE.Points;
+  private driftVelocities: Float32Array;
+  private possession: 'home' | 'away' | null = null;
 
   /** World-space centres of the two goal rings [faith(+x), free(−x)]. */
   goalCenters(): [THREE.Vector3, THREE.Vector3] {
@@ -456,8 +613,31 @@ export class Calm {
       this.group.add(makeGateDivider(gx));
     }
 
+    // ── Industrial scaffolding ribs ─────────────────────────────────────────
+    this.group.add(makeScaffoldingRibs());
+
+    // ── Atmospheric depth haze ───────────────────────────────────────────────
+    this.group.add(makeDepthHaze());
+
     // ── Spars ────────────────────────────────────────────────────────────────
-    this.group.add(makeSpars());
+    this.sparMesh = makeSpars();
+    this.group.add(this.sparMesh);
+
+    // Per-spar phase offsets for pulsing emissive
+    const SPAR_COUNT = 16 * 3;
+    this.sparPhases = new Float32Array(SPAR_COUNT);
+    for (let i = 0; i < SPAR_COUNT; i++) {
+      this.sparPhases[i] = Math.random() * Math.PI * 2;
+    }
+
+    // ── Spar brackets ────────────────────────────────────────────────────────
+    this.group.add(makeSparBrackets());
+
+    // ── Ambient drift particles — "the air in the calm" ─────────────────────
+    const drift = makeAmbientDrift();
+    this.driftPoints = drift.points;
+    this.driftVelocities = drift.velocities;
+    this.group.add(this.driftPoints);
 
     // ── Goal assemblies ──────────────────────────────────────────────────────
     this.faithGoal = makeGoalAssembly( GATE_X, C_CYAN,   'FAITH');
@@ -502,6 +682,14 @@ export class Calm {
     scene.add(this.group);
   }
 
+  /**
+   * Signal which team has possession (their attacked goal pulses brighter).
+   * Pass null to reset to neutral breathing on both goals.
+   */
+  setPossession(team: 'home' | 'away' | null): void {
+    this.possession = team;
+  }
+
   /** Scroll the skin texture to sell spin; pulse goal halos gently. */
   update(dt: number): void {
     // Skin scroll: V offset increases at angular rate × a visual scale.
@@ -509,10 +697,64 @@ export class Calm {
     // texture units — very gentle, clearly directional.
     this.skinTex.offset.y = (this.skinTex.offset.y + dt * REG.omega * 0.12) % 1;
 
-    // Gentle breathing pulse on goal halos (additive materials via scale).
+    // ── Goal ring pulse (with possession awareness) ──────────────────────────
     const t = performance.now() * 0.001;
-    const pulse = 0.93 + 0.07 * Math.sin(t * 1.4);
-    this.faithGoal.scale.setScalar(pulse);
-    this.freeGoal.scale.setScalar(pulse);
+
+    // Base pulse (neutral / calm breathing)
+    const basePulse = 0.93 + 0.07 * Math.sin(t * 1.4);
+
+    // Possession: the ATTACKED goal (opponent's) breathes faster/brighter
+    // home attacks Free (away goal at -x), away attacks Faith (home goal at +x)
+    if (this.possession === 'home') {
+      // Home has ball — Free ring (attacked) pulses more
+      const attackPulse = 0.90 + 0.12 * Math.sin(t * 2.8);
+      this.faithGoal.scale.setScalar(basePulse);
+      this.freeGoal.scale.setScalar(attackPulse);
+    } else if (this.possession === 'away') {
+      // Away has ball — Faith ring (attacked) pulses more
+      const attackPulse = 0.90 + 0.12 * Math.sin(t * 2.8);
+      this.faithGoal.scale.setScalar(attackPulse);
+      this.freeGoal.scale.setScalar(basePulse);
+    } else {
+      this.faithGoal.scale.setScalar(basePulse);
+      this.freeGoal.scale.setScalar(basePulse);
+    }
+
+    // ── Spar emissive pulsing ────────────────────────────────────────────────
+    // Each spar oscillates its color intensity at a slightly different phase.
+    // We modulate the instance colors (requires color attribute).
+    const sparMat = this.sparMesh.material as THREE.MeshStandardMaterial;
+    // Global emissive modulation: cycle between 0.4 and 0.7 intensity
+    // Use a per-spar approach via instance color (cheaper than per-instance material)
+    // Since InstancedMesh doesn't support per-instance emissive easily, modulate
+    // the overall material emissive with a slow global oscillation + slight variation.
+    const sparPulse = 0.45 + 0.25 * Math.sin(t * 0.8);
+    sparMat.emissiveIntensity = sparPulse;
+
+    // ── Ambient drift particle animation ─────────────────────────────────────
+    const posAttr = this.driftPoints.geometry.getAttribute('position') as THREE.BufferAttribute;
+    const pos = posAttr.array as Float32Array;
+    const COUNT = pos.length / 3;
+    for (let i = 0; i < COUNT; i++) {
+      pos[i*3]   += this.driftVelocities[i*3]   * dt;
+      pos[i*3+1] += this.driftVelocities[i*3+1] * dt;
+      pos[i*3+2] += this.driftVelocities[i*3+2] * dt;
+
+      // Wrap on X axis (stay in field)
+      if (pos[i*3] > GATE_X) pos[i*3] -= REG.L;
+      if (pos[i*3] < -GATE_X) pos[i*3] += REG.L;
+
+      // Wrap radially: if drifted beyond R=40, reflect inward gently
+      const yz = Math.sqrt(pos[i*3+1] * pos[i*3+1] + pos[i*3+2] * pos[i*3+2]);
+      if (yz > 40) {
+        const scale = 38 / yz;
+        pos[i*3+1] *= scale;
+        pos[i*3+2] *= scale;
+        // Reverse radial velocity component
+        this.driftVelocities[i*3+1] *= -1;
+        this.driftVelocities[i*3+2] *= -1;
+      }
+    }
+    posAttr.needsUpdate = true;
   }
 }

@@ -13,11 +13,17 @@
 // Scale: human ~ 1.9 m tall, against the R = 45 m calm. Overall footprint is
 // kept close to the previous placeholder so figures sit correctly in-world and
 // the spectate camera framing is unchanged.
+//
+// ROLE SILHOUETTES: each role receives distinct body proportions + badge geometry
+// so it reads at cinematic spectate distance (viewScale 5). Anchor = massive,
+// Spinner = sleek default, Faithwing = armoured, Freewing = asymmetric artist,
+// Reach = minimal/light keeper.
 
 import * as THREE from 'three';
 import { InkedPart } from './RiggerToon';
+import type { RiggerRole } from '../sim/types';
 
-// ── Proportions (metres) ─────────────────────────────────────────────────────
+// ── Base proportions (metres) ────────────────────────────────────────────────
 // ~1.9 m athlete: legs + torso + head.
 const HIP_Y      = 0.95;  // hip pivot height above figure origin
 const TORSO_LEN  = 0.62;  // hip → shoulder
@@ -30,6 +36,125 @@ const FOREARM    = 0.34;
 const THIGH      = 0.46;
 const SHIN       = 0.46;
 const LIMB_R     = 0.075; // limb tube radius
+
+// ── Role-specific proportion multipliers ─────────────────────────────────────
+interface RoleProps {
+  shoulderW: number;    // shoulder half-width
+  paulScale: number;    // pauldron scale multiplier
+  limbR: number;        // limb tube radius
+  torsoR: number;       // torso capsule radius
+  torsoLen: number;     // torso capsule length
+  hipY: number;         // hip pivot height
+  upperArm: number;     // upper arm length
+  forearm: number;      // forearm length
+  thigh: number;        // thigh length
+  shin: number;         // shin length
+  backPackScale: [number, number, number]; // xyz scale of back-pack
+  chestRigScale: [number, number, number]; // xyz scale of chest rig plate
+  hasBackPack: boolean;
+  hasPaulL: boolean;
+  hasPaulR: boolean;
+}
+
+function roleProps(role: RiggerRole): RoleProps {
+  switch (role) {
+    case 'anchor':
+      // MASSIVE/planted: wide shoulders, thick limbs, heavy kit, slightly taller
+      return {
+        shoulderW: SHOULDER_W * 1.30,
+        paulScale: 1.40,
+        limbR: LIMB_R * 1.25,
+        torsoR: 0.17 * 1.20,
+        torsoLen: TORSO_LEN * 1.06,
+        hipY: HIP_Y * 1.03,
+        upperArm: UPPER_ARM * 1.05,
+        forearm: FOREARM * 1.05,
+        thigh: THIGH * 1.05,
+        shin: SHIN * 1.05,
+        backPackScale: [1.3, 1.2, 1.3],
+        chestRigScale: [1.15, 1.1, 1.1],
+        hasBackPack: true,
+        hasPaulL: true,
+        hasPaulR: true,
+      };
+    case 'spinner':
+      // Sleek, agile: default proportions, slightly longer limbs for elegance
+      return {
+        shoulderW: SHOULDER_W,
+        paulScale: 1.0,
+        limbR: LIMB_R,
+        torsoR: 0.17,
+        torsoLen: TORSO_LEN,
+        hipY: HIP_Y,
+        upperArm: UPPER_ARM * 1.05,
+        forearm: FOREARM * 1.05,
+        thigh: THIGH * 1.04,
+        shin: SHIN * 1.04,
+        backPackScale: [1.0, 1.0, 1.0],
+        chestRigScale: [1.0, 1.0, 1.0],
+        hasBackPack: true,
+        hasPaulL: true,
+        hasPaulR: true,
+      };
+    case 'faithwing':
+      // Broader than spinner, armoured: bigger chest rig plate, solid pauldrons
+      return {
+        shoulderW: SHOULDER_W * 1.12,
+        paulScale: 1.25,
+        limbR: LIMB_R * 1.10,
+        torsoR: 0.17 * 1.08,
+        torsoLen: TORSO_LEN * 1.02,
+        hipY: HIP_Y,
+        upperArm: UPPER_ARM,
+        forearm: FOREARM,
+        thigh: THIGH,
+        shin: SHIN,
+        backPackScale: [1.1, 1.1, 1.1],
+        chestRigScale: [1.25, 1.20, 1.30],
+        hasBackPack: true,
+        hasPaulL: true,
+        hasPaulR: true,
+      };
+    case 'freewing':
+      // Narrow/lighter, longer forearms (artist reach), asymmetric (one pauldron)
+      return {
+        shoulderW: SHOULDER_W * 0.95,
+        paulScale: 1.0,
+        limbR: LIMB_R * 0.95,
+        torsoR: 0.17 * 0.95,
+        torsoLen: TORSO_LEN,
+        hipY: HIP_Y,
+        upperArm: UPPER_ARM,
+        forearm: FOREARM * 1.18, // the artist has reach
+        thigh: THIGH,
+        shin: SHIN,
+        backPackScale: [0.85, 0.9, 0.85],
+        chestRigScale: [0.9, 0.95, 0.9],
+        hasBackPack: true,
+        hasPaulL: false,  // asymmetric: left pauldron removed
+        hasPaulR: true,
+      };
+    case 'reach':
+      // Smallest/lightest: short limbs, minimal kit, nimble on the ring
+      return {
+        shoulderW: SHOULDER_W * 0.90,
+        paulScale: 0.75,
+        limbR: LIMB_R * 0.88,
+        torsoR: 0.17 * 0.90,
+        torsoLen: TORSO_LEN * 0.92,
+        hipY: HIP_Y * 0.95,
+        upperArm: UPPER_ARM * 0.92,
+        forearm: FOREARM * 0.92,
+        thigh: THIGH * 0.92,
+        shin: SHIN * 0.92,
+        backPackScale: [0.55, 0.55, 0.55], // tiny or nearly absent
+        chestRigScale: [0.80, 0.85, 0.80],
+        hasBackPack: true,
+        hasPaulL: true,
+        hasPaulR: true,
+      };
+  }
+}
 
 // Reusable low-poly geometry (shared across all figures via constructor args).
 function capsule(r: number, len: number): THREE.CapsuleGeometry {
@@ -67,19 +192,19 @@ class Limb {
   /** Empty marker at the hand/foot tip — for line/IK coordination. */
   private readonly tip = new THREE.Group();
 
-  constructor(upperLen: number, lowerLen: number, color: number, endGeo?: THREE.BufferGeometry) {
-    const upper = new InkedPart(capsule(LIMB_R, upperLen), color);
-    upper.group.position.y = -upperLen * 0.5 - LIMB_R;
+  constructor(upperLen: number, lowerLen: number, limbR: number, color: number, endGeo?: THREE.BufferGeometry) {
+    const upper = new InkedPart(capsule(limbR, upperLen), color);
+    upper.group.position.y = -upperLen * 0.5 - limbR;
     this.root.add(upper.group);
 
-    this.joint.position.y = -(upperLen + LIMB_R * 2);
+    this.joint.position.y = -(upperLen + limbR * 2);
     this.root.add(this.joint);
 
-    const lower = new InkedPart(capsule(LIMB_R * 0.92, lowerLen), color);
-    lower.group.position.y = -lowerLen * 0.5 - LIMB_R;
+    const lower = new InkedPart(capsule(limbR * 0.92, lowerLen), color);
+    lower.group.position.y = -lowerLen * 0.5 - limbR;
     this.joint.add(lower.group);
 
-    this.tip.position.y = -(lowerLen + LIMB_R * 2);
+    this.tip.position.y = -(lowerLen + limbR * 2);
     this.joint.add(this.tip);
 
     if (endGeo) {
@@ -105,102 +230,43 @@ export class RiggerFigure {
   /** Root — caller sets position + orientation each frame. */
   readonly root = new THREE.Group();
 
-  private readonly torso: InkedPart;
-  private readonly chestRig: InkedPart;  // grapple harness/spool plate
-  private readonly head: InkedPart;
-  private readonly visor: THREE.Mesh;    // accent (team/role read)
+  private torso!: InkedPart;
+  private chestRig!: InkedPart;  // grapple harness/spool plate
+  private head!: InkedPart;
+  private visor!: THREE.Mesh;    // accent (team/role read)
 
-  private readonly armL: Limb;
-  private readonly armR: Limb;           // R = grapple/reach arm
-  private readonly legL: Limb;
-  private readonly legR: Limb;
+  private armL!: Limb;
+  private armR!: Limb;           // R = grapple/reach arm
+  private legL!: Limb;
+  private legR!: Limb;
 
   // Sub-pivots for secondary motion.
-  private readonly spine = new THREE.Group();   // hip→up; lean lives here
-  private readonly shoulders = new THREE.Group(); // counter-rotate / follow-through
+  private spine = new THREE.Group();   // hip→up; lean lives here
+  private shoulders = new THREE.Group(); // counter-rotate / follow-through
+  private hips = new THREE.Group();
 
   // Always-on team-glow aura (every rigger, readable when small).
-  private readonly aura: THREE.Sprite;
+  private aura!: THREE.Sprite;
 
   // Stylized rigger kit — bold silhouette read at lore distance.
-  private readonly backPack: InkedPart;
-  private readonly paulL: InkedPart;
-  private readonly paulR: InkedPart;
+  private backPack!: InkedPart;
+  private paulL!: InkedPart;
+  private paulR!: InkedPart;
+
+  // Role-specific badge geometry (may be null for roles without one).
+  private roleBadge: THREE.Group | null = null;
 
   // P1 highlight extras.
-  private readonly halo: THREE.Mesh;
-  private readonly beacon: THREE.Mesh;
+  private halo!: THREE.Mesh;
+  private beacon!: THREE.Mesh;
+
+  // Track current role so we only rebuild when it changes.
+  private currentRole: RiggerRole | null = null;
 
   constructor() {
-    // Spine pivot at the hips.
-    this.spine.position.y = HIP_Y;
-    this.root.add(this.spine);
-
-    // Torso (tapered: capsule).
-    this.torso = new InkedPart(capsule(0.17, TORSO_LEN), 0x808080);
-    this.torso.group.position.y = TORSO_LEN * 0.5 + 0.05;
-    this.spine.add(this.torso.group);
-
-    // Chest rig: a flat-ish box plate across the chest = the spool the lines
-    // fire from. Slightly proud of the torso, faces +Z.
-    this.chestRig = new InkedPart(new THREE.BoxGeometry(0.40, 0.30, 0.16), 0x808080, 0.04);
-    this.chestRig.group.position.set(0, TORSO_LEN * 0.62, 0.16);
-    this.spine.add(this.chestRig.group);
-
-    // Back rig-pack: the line spool/reel slung between the shoulders. A bold,
-    // asymmetric block on the back so the silhouette reads as an equipped
-    // rigger (not a stick figure) even a few pixels tall. Heavier ink line.
-    this.backPack = new InkedPart(new THREE.BoxGeometry(0.34, 0.40, 0.20), 0x808080, 0.09);
-    this.backPack.group.position.set(0, TORSO_LEN * 0.55, -0.18);
-    this.spine.add(this.backPack.group);
-
-    // Shoulder yoke pivot (top of spine) — arms + head hang off this so
-    // follow-through twist propagates naturally.
-    this.shoulders.position.y = TORSO_LEN + 0.06;
-    this.spine.add(this.shoulders);
-
-    // Head + visor accent.
-    this.head = new InkedPart(new THREE.IcosahedronGeometry(HEAD_R, 1), 0x808080);
-    this.head.group.position.y = HEAD_R + 0.10;
-    this.shoulders.add(this.head.group);
-
-    // Visor: a thin curved-ish band on the face (+Z). MeshBasicMaterial so the
-    // accent reads as a bright glyph even at distance / in shadow band.
-    this.visor = new THREE.Mesh(
-      new THREE.BoxGeometry(HEAD_R * 1.7, HEAD_R * 0.6, 0.03),
-      new THREE.MeshBasicMaterial({ color: 0xffffff }),
-    );
-    this.visor.position.set(0, HEAD_R + 0.10, HEAD_R * 0.92);
-    this.shoulders.add(this.visor);
-
-    // Arms — small "hand" cap on the end.
-    const hand = (): THREE.BufferGeometry => new THREE.IcosahedronGeometry(LIMB_R * 1.4, 0);
-    this.armL = new Limb(UPPER_ARM, FOREARM, 0x808080, hand());
-    this.armR = new Limb(UPPER_ARM, FOREARM, 0x808080, hand());
-    this.armL.root.position.set(-SHOULDER_W, -0.02, 0);
-    this.armR.root.position.set( SHOULDER_W, -0.02, 0);
-    this.shoulders.add(this.armL.root, this.armR.root);
-
-    // Pauldrons: blocky shoulder caps. They square off the silhouette into a
-    // stylized "broad-shouldered athlete in a rig" read at any distance.
-    this.paulL = new InkedPart(new THREE.BoxGeometry(0.20, 0.16, 0.22), 0x808080, 0.08);
-    this.paulR = new InkedPart(new THREE.BoxGeometry(0.20, 0.16, 0.22), 0x808080, 0.08);
-    this.paulL.group.position.set(-SHOULDER_W, 0.04, 0);
-    this.paulR.group.position.set( SHOULDER_W, 0.04, 0);
-    this.shoulders.add(this.paulL.group, this.paulR.group);
-
-    // Legs — small "boot" cap.
-    const boot = (): THREE.BufferGeometry => new THREE.BoxGeometry(0.13, 0.10, 0.22);
-    this.legL = new Limb(THIGH, SHIN, 0x808080, boot());
-    this.legR = new Limb(THIGH, SHIN, 0x808080, boot());
-    this.legL.root.position.set(-HIP_W, 0, 0);
-    this.legR.root.position.set( HIP_W, 0, 0);
-    // Legs hang off the root at hip height (not the leaning spine) so a lean
-    // pivots the torso while legs trail from the body's true centre.
-    const hips = new THREE.Group();
-    hips.position.y = HIP_Y;
-    hips.add(this.legL.root, this.legR.root);
-    this.root.add(hips);
+    // Build once with default spinner proportions; setRole() will rebuild
+    // if a different role is assigned.
+    this._build('spinner');
 
     // ── P1 highlight: small feet ring + ▼ beacon overhead ───────────────────
     // Always-on-top so it's never lost (depthTest:false + high renderOrder),
@@ -252,6 +318,213 @@ export class RiggerFigure {
     this.root.visible = false;
   }
 
+  // ── Role assignment ─────────────────────────────────────────────────────────
+
+  /** Assign (or reassign) the role. Rebuilds body geometry when the role changes. */
+  setRole(role: RiggerRole): void {
+    if (role === this.currentRole) return;
+    this._teardown();
+    this._build(role);
+  }
+
+  /** Remove all role-specific body parts from the hierarchy. */
+  private _teardown(): void {
+    // Remove the spine (which holds torso, chest rig, back-pack, shoulders,
+    // head, visor, arms, pauldrons) and the hips (legs).
+    this.root.remove(this.spine);
+    this.root.remove(this.hips);
+    if (this.roleBadge) {
+      this.root.remove(this.roleBadge);
+      this.roleBadge = null;
+    }
+    // Create fresh pivots.
+    this.spine = new THREE.Group();
+    this.shoulders = new THREE.Group();
+    this.hips = new THREE.Group();
+  }
+
+  /** Build the body from the given role's proportions. */
+  private _build(role: RiggerRole): void {
+    this.currentRole = role;
+    const rp = roleProps(role);
+
+    // Spine pivot at the hips.
+    this.spine.position.y = rp.hipY;
+    this.root.add(this.spine);
+
+    // Torso (tapered: capsule).
+    this.torso = new InkedPart(capsule(rp.torsoR, rp.torsoLen), 0x808080);
+    this.torso.group.position.y = rp.torsoLen * 0.5 + 0.05;
+    this.spine.add(this.torso.group);
+
+    // Chest rig: a flat-ish box plate across the chest = the spool the lines
+    // fire from. Slightly proud of the torso, faces +Z.
+    const cw = 0.40 * rp.chestRigScale[0];
+    const ch = 0.30 * rp.chestRigScale[1];
+    const cd = 0.16 * rp.chestRigScale[2];
+    this.chestRig = new InkedPart(new THREE.BoxGeometry(cw, ch, cd), 0x808080, 0.04);
+    this.chestRig.group.position.set(0, rp.torsoLen * 0.62, 0.16);
+    this.spine.add(this.chestRig.group);
+
+    // Back rig-pack: the line spool/reel slung between the shoulders.
+    if (rp.hasBackPack) {
+      const bw = 0.34 * rp.backPackScale[0];
+      const bh = 0.40 * rp.backPackScale[1];
+      const bd = 0.20 * rp.backPackScale[2];
+      this.backPack = new InkedPart(new THREE.BoxGeometry(bw, bh, bd), 0x808080, 0.09);
+      this.backPack.group.position.set(0, rp.torsoLen * 0.55, -0.18);
+      this.spine.add(this.backPack.group);
+    } else {
+      // Create a zero-size placeholder so setColors doesn't break
+      this.backPack = new InkedPart(new THREE.BoxGeometry(0.001, 0.001, 0.001), 0x808080, 0);
+      this.backPack.group.visible = false;
+      this.spine.add(this.backPack.group);
+    }
+
+    // Shoulder yoke pivot (top of spine) — arms + head hang off this so
+    // follow-through twist propagates naturally.
+    this.shoulders.position.y = rp.torsoLen + 0.06;
+    this.spine.add(this.shoulders);
+
+    // Head + visor accent.
+    this.head = new InkedPart(new THREE.IcosahedronGeometry(HEAD_R, 1), 0x808080);
+    this.head.group.position.y = HEAD_R + 0.10;
+    this.shoulders.add(this.head.group);
+
+    // Visor: style varies by role. Reach gets a wide wraparound "lunatic" visor.
+    const visorW = role === 'reach' ? HEAD_R * 2.2 : HEAD_R * 1.7;
+    const visorH = role === 'reach' ? HEAD_R * 0.75 : HEAD_R * 0.6;
+    const visorD = role === 'reach' ? 0.05 : 0.03;
+    this.visor = new THREE.Mesh(
+      new THREE.BoxGeometry(visorW, visorH, visorD),
+      new THREE.MeshBasicMaterial({ color: 0xffffff }),
+    );
+    this.visor.position.set(0, HEAD_R + 0.10, HEAD_R * 0.92);
+    // Reach visor wraps: slight curve via rotation of side panels simulated
+    // with a wider + deeper geometry — already handled by wider dims above.
+    this.shoulders.add(this.visor);
+
+    // Arms — small "hand" cap on the end.
+    const hand = (lr: number): THREE.BufferGeometry => new THREE.IcosahedronGeometry(lr * 1.4, 0);
+    this.armL = new Limb(rp.upperArm, rp.forearm, rp.limbR, 0x808080, hand(rp.limbR));
+    this.armR = new Limb(rp.upperArm, rp.forearm, rp.limbR, 0x808080, hand(rp.limbR));
+    this.armL.root.position.set(-rp.shoulderW, -0.02, 0);
+    this.armR.root.position.set( rp.shoulderW, -0.02, 0);
+    this.shoulders.add(this.armL.root, this.armR.root);
+
+    // Pauldrons: blocky shoulder caps.
+    const pw = 0.20 * rp.paulScale;
+    const ph = 0.16 * rp.paulScale;
+    const pd = 0.22 * rp.paulScale;
+    this.paulL = new InkedPart(new THREE.BoxGeometry(pw, ph, pd), 0x808080, 0.08);
+    this.paulR = new InkedPart(new THREE.BoxGeometry(pw, ph, pd), 0x808080, 0.08);
+    this.paulL.group.position.set(-rp.shoulderW, 0.04, 0);
+    this.paulR.group.position.set( rp.shoulderW, 0.04, 0);
+    this.paulL.group.visible = rp.hasPaulL;
+    this.paulR.group.visible = rp.hasPaulR;
+    this.shoulders.add(this.paulL.group, this.paulR.group);
+
+    // Legs — small "boot" cap.
+    const boot = (): THREE.BufferGeometry => new THREE.BoxGeometry(
+      0.13 * (rp.limbR / LIMB_R),
+      0.10 * (rp.limbR / LIMB_R),
+      0.22 * (rp.limbR / LIMB_R),
+    );
+    this.legL = new Limb(rp.thigh, rp.shin, rp.limbR, 0x808080, boot());
+    this.legR = new Limb(rp.thigh, rp.shin, rp.limbR, 0x808080, boot());
+    this.legL.root.position.set(-HIP_W, 0, 0);
+    this.legR.root.position.set( HIP_W, 0, 0);
+    // Legs hang off the root at hip height (not the leaning spine) so a lean
+    // pivots the torso while legs trail from the body's true centre.
+    this.hips.position.y = rp.hipY;
+    this.hips.add(this.legL.root, this.legR.root);
+    this.root.add(this.hips);
+
+    // ── Role badge geometry ─────────────────────────────────────────────────
+    this._buildRoleBadge(role, rp);
+  }
+
+  /** Add a distinctive geometric badge/marking per role. */
+  private _buildRoleBadge(role: RiggerRole, rp: RoleProps): void {
+    switch (role) {
+      case 'anchor': {
+        // Thick collar/gorget: a torus ring at shoulder height — reads as
+        // a heavy neck guard, unmistakably the biggest figure.
+        const badge = new THREE.Group();
+        const gorget = new InkedPart(
+          new THREE.TorusGeometry(rp.shoulderW * 0.55, 0.07, 6, 16),
+          0x808080, 0.10,
+        );
+        gorget.group.rotation.x = Math.PI / 2;
+        gorget.group.position.y = rp.torsoLen + 0.02;
+        badge.add(gorget.group);
+        badge.position.y = rp.hipY;
+        this.roleBadge = badge;
+        this.root.add(badge);
+        break;
+      }
+      case 'spinner': {
+        // Dorsal fin/crest on the back-pack: a thin vertical wedge that makes
+        // the spinner's back silhouette knife-edged and distinctive.
+        const badge = new THREE.Group();
+        const finGeo = new THREE.BoxGeometry(0.04, 0.28, 0.18);
+        const fin = new InkedPart(finGeo, 0x808080, 0.08);
+        fin.group.position.set(0, rp.torsoLen * 0.55 + 0.22, -0.28);
+        badge.add(fin.group);
+        badge.position.y = rp.hipY;
+        this.roleBadge = badge;
+        this.root.add(badge);
+        break;
+      }
+      case 'faithwing': {
+        // Armoured collar ridge: a flat angular plate across the upper chest
+        // that visually doubles as extra armour, broader than the spinner fin.
+        const badge = new THREE.Group();
+        const plateGeo = new THREE.BoxGeometry(rp.shoulderW * 1.6, 0.08, 0.26);
+        const plate = new InkedPart(plateGeo, 0x808080, 0.06);
+        plate.group.position.set(0, rp.torsoLen * 0.82, 0.10);
+        badge.add(plate.group);
+        badge.position.y = rp.hipY;
+        this.roleBadge = badge;
+        this.root.add(badge);
+        break;
+      }
+      case 'freewing': {
+        // Asymmetric arm-blade on the right forearm — a small trailing vane
+        // that reinforces the "artist's reach" and the missing left pauldron.
+        const badge = new THREE.Group();
+        const bladeGeo = new THREE.BoxGeometry(0.03, 0.22, 0.12);
+        const blade = new InkedPart(bladeGeo, 0x808080, 0.06);
+        // Positioned relative to right shoulder (the working arm).
+        blade.group.position.set(rp.shoulderW, -rp.upperArm * 0.6, 0.08);
+        badge.add(blade.group);
+        badge.position.y = rp.hipY + rp.torsoLen + 0.06; // at shoulder height
+        this.roleBadge = badge;
+        this.root.add(badge);
+        break;
+      }
+      case 'reach': {
+        // Wide visor is already handled above. Add a small ring/hoop on each
+        // forearm (clip anchors for pivoting on the goal ring). These tiny
+        // hoops read as distinctive "cuffs" at distance.
+        const badge = new THREE.Group();
+        const cuffGeo = new THREE.TorusGeometry(rp.limbR * 2.2, 0.025, 6, 12);
+        const cuffL = new InkedPart(cuffGeo, 0x808080, 0.06);
+        const cuffR = new InkedPart(cuffGeo.clone(), 0x808080, 0.06);
+        cuffL.group.rotation.x = Math.PI / 2;
+        cuffR.group.rotation.x = Math.PI / 2;
+        // Position at wrist area of each arm.
+        cuffL.group.position.set(-rp.shoulderW, -(rp.upperArm + rp.forearm * 0.75), 0);
+        cuffR.group.position.set( rp.shoulderW, -(rp.upperArm + rp.forearm * 0.75), 0);
+        badge.add(cuffL.group, cuffR.group);
+        badge.position.y = rp.hipY + rp.torsoLen + 0.06; // at shoulder height
+        this.roleBadge = badge;
+        this.root.add(badge);
+        break;
+      }
+    }
+  }
+
   // ── Appearance ─────────────────────────────────────────────────────────────
 
   /** Team/grounded fill colour + emissive + accent colour. */
@@ -270,6 +543,18 @@ export class RiggerFigure {
     this.paulL.setColor(bodyHex);
     this.paulR.setColor(bodyHex);
     this.chestRig.setEmissive(accentHex, emissiveHex === 0 ? 0.0 : 0.85);
+
+    // Role badge colouring: traverse and apply body colour.
+    if (this.roleBadge) {
+      this.roleBadge.traverse((o) => {
+        const m = (o as THREE.Mesh).material;
+        if (m instanceof THREE.MeshToonMaterial) {
+          m.color.setHex(bodyHex);
+          m.emissive.setHex(emissiveHex);
+          m.emissiveIntensity = emissiveInt;
+        }
+      });
+    }
 
     // Team-glow aura: tint to the team emissive (which Rigger.ts already zeroes
     // for grounded/out-of-play), and keep a readable floor for anyone in play

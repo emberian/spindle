@@ -175,6 +175,7 @@ class RiggerInstance {
   }
 
   apply(ps: PlayerSim, isP1: boolean, dt: number, now: number): void {
+    this.figure.setRole(ps.role);
     this.figure.root.visible = true;
     this.figure.root.position.set(ps.p.x, ps.p.y, ps.p.z);
 
