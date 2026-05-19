@@ -93,6 +93,49 @@ pub const GROUND_C: f64 = 1250.0;
 /// → exp(-0.025) computed once, frozen as a literal for bit-identical f64.
 pub const FRICTION_DECAY: f64 = 0.9753099120283326;
 
+/// PLAYER–PLAYER SOFT-BODY COLLISION (the physical substrate for
+/// spacing / screens / picks). A rigger is no longer a point mass that
+/// passes through another rigger: each body has a radius and overlapping
+/// pairs are pushed apart by a momentum-conserving soft spring + damper
+/// applied equal-and-opposite along the contact normal. One O(n²) pass in
+/// `SimWorld::step`, fixed index order, lower-index-first split-borrow
+/// (the exact disjoint pattern proven in the player↔player line solver) ⇒
+/// deterministic, no rng.
+///
+/// `PLAYER_RADIUS` = 0.6 m: a rigger ~1.2 m across — small vs the 45 m
+/// skin / 8 m ring / 640 m field so it never perturbs ring/loop geometry,
+/// but large enough that two riggers contesting the same metre of space
+/// actually obstruct each other (a real screen/pick backstop).
+pub const PLAYER_RADIUS: f64 = 0.6; // m — soft-body collision radius
+/// Penetration push-apart spring. Reduced mass on a symmetric pair is
+/// m/2 = 39 kg ⇒ ω_n = sqrt(COLLIDE_K / 39) ≈ 10.1 rad/s ⇒ ω_n·h ≈
+/// 0.042 ≪ 2 (symplectic Euler, unconditionally stable here). Softer than
+/// CONTACT_K so a brush is a nudge, not a launch.
+pub const COLLIDE_K: f64 = 4000.0;
+/// Collision damping along the contact normal. Near-critical on the
+/// reduced mass: ζ ≈ COLLIDE_C / (2·sqrt(COLLIDE_K·39)) ≈ 0.70 — kills
+/// the bounce so contact is a soft stand-off, no jitter, no overshoot.
+pub const COLLIDE_C: f64 = 550.0;
+
+/// PART B — CONTEST + GARROTE detection (the defensive half made real).
+///
+/// `CONTEST_RADIUS` (m): a LOOSE bell is "contested" when two opposing
+/// non-grounded riggers are BOTH within this radius of it (both committing
+/// to the same loose ball). 6 m ≈ a rigger's reach + a stride — tight
+/// enough that it is a genuine 1:1 over the ball, well inside the 8 m ring
+/// and far below the 45 m skin so it never collides with ring/loop
+/// geometry. Emitted ONCE per loose-bell episode (latched), so the match
+/// SM's Contest path runs in real played/watched/wasm play.
+pub const CONTEST_RADIUS: f64 = 6.0; // m — loose-bell 1:1 contest trigger
+/// `GARROTE_RADIUS` (m): a FOUL — a fired rig line whose taut segment
+/// (player hand → effective anchor) sweeps within this distance of an
+/// OPPOSING rigger's body centre is a garrote (the line wrapping/cutting
+/// across an opponent). = PLAYER_RADIUS (0.6) + 0.4 line-thickness margin
+/// so it triggers on a real body intersection, not a near miss. Segment-
+/// vs-point distance, evaluated per (line, player) pair in fixed id order
+/// ⇒ deterministic, no rng.
+pub const GARROTE_RADIUS: f64 = 1.0; // m — line-vs-opponent-body foul distance
+
 /// Eased-actuator ramp lengths (ticks). TOTAL Δv is unchanged; the budget is
 /// consumed immediately on trigger so cap/determinism semantics are preserved.
 pub const PUSHOFF_RAMP_TICKS: u32 = 18;

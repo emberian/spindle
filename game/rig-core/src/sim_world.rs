@@ -231,6 +231,12 @@ pub struct SimWorld {
     /// carrier inside STRIP_RANGE (deterministic strip hysteresis — a
     /// strip is earned by sustained pressure, not an instant brush).
     strip_press: u32,
+    /// PART B: latched true once a `ContestStarted` has been emitted for the
+    /// CURRENT loose-bell episode, so the 1:1 fires exactly once per loose
+    /// ball (not every tick the two riggers are both near it). Reset on any
+    /// launch/grip/catch. Not a physics quantity (no p/v) so it does not
+    /// enter hash_snapshot; it only gates a one-shot event, deterministically.
+    contest_emitted: bool,
     players: Vec<WorldPlayer>,
     loop_tracker: LoopTracker,
     rng: Rng,
@@ -257,6 +263,7 @@ impl SimWorld {
             release_pos: Vec3::new(0.0, 0.0, 0.0),
             release_tick: 0,
             strip_press: 0,
+            contest_emitted: false,
             players: vec![],
             loop_tracker: LoopTracker::new(),
             rng: Rng::new(seed),
@@ -287,6 +294,7 @@ impl SimWorld {
         self.free_ticks = 0;
         self.release_pos = p;
         self.release_tick = self.tick;
+        self.contest_emitted = false; // new loose-bell episode
         if let Some(id) = thrown_by {
             if self.pass_chain.last().map(|s: &String| s.as_str()) != Some(id) {
                 self.pass_chain.push(id.to_string());
@@ -301,6 +309,7 @@ impl SimWorld {
         self.bell_touched = true;
         self.bell_dead = false;
         self.free_ticks = 0;
+        self.contest_emitted = false;
     }
 
     // ── Internal helpers ──────────────────────────────────────────────────────
@@ -513,6 +522,119 @@ impl SimWorld {
             }
         }
 
+        // PART A — PLAYER↔PLAYER SOFT-BODY COLLISION. Riggers are no longer
+        // point masses that pass through each other: one O(n²) pairwise pass
+        // resolves penetration of two PLAYER_RADIUS spheres with a momentum-
+        // conserving soft spring + damper applied EQUAL-AND-OPPOSITE along
+        // the contact normal. Fixed (i, j) index order with the SAME
+        // lower-index-first `split_at_mut` disjoint-borrow pattern proven in
+        // the player↔player line solver above (sim_world.rs:479-508) ⇒
+        // deterministic, no rng, no HashMap. Symplectic (semi-implicit
+        // Euler), accel-bounded; reduced-mass ω_n·h ≈ 0.042 ≪ 2 (see
+        // tuning.rs COLLIDE_K/COLLIDE_C). Players carry equal mass so the
+        // equal-and-opposite Δv conserves linear momentum exactly. The new
+        // p/v already flow into hash_snapshot (it folds every player p,v),
+        // so this physics cannot silently escape determinism coverage.
+        {
+            let two_r = 2.0 * crate::tuning::PLAYER_RADIUS;
+            let two_r2 = two_r * two_r;
+            let n = self.players.len();
+            for i in 0..n {
+                for j in (i + 1)..n {
+                    // Disjoint &mut to i and j (i < j ⇒ split at j).
+                    let (left, right) = self.players.split_at_mut(j);
+                    let a = &mut left[i];
+                    let b = &mut right[0];
+                    let dx = a.body.p.x - b.body.p.x;
+                    let dy = a.body.p.y - b.body.p.y;
+                    let dz = a.body.p.z - b.body.p.z;
+                    let d2 = dx * dx + dy * dy + dz * dz;
+                    if d2 >= two_r2 || d2 < 1e-18 {
+                        continue;
+                    }
+                    let dist = d2.sqrt();
+                    let inv = 1.0 / dist;
+                    let nx = dx * inv;
+                    let ny = dy * inv;
+                    let nz = dz * inv;
+                    let pen = two_r - dist; // > 0 penetration depth
+                    // Relative velocity projected on the contact normal
+                    // (a relative to b). Positive ⇒ separating.
+                    let rvx = a.body.v.x - b.body.v.x;
+                    let rvy = a.body.v.y - b.body.v.y;
+                    let rvz = a.body.v.z - b.body.v.z;
+                    let v_rel_n = rvx * nx + rvy * ny + rvz * nz;
+                    // Soft push-apart spring − damper along +n on `a`.
+                    let f = crate::tuning::COLLIDE_K * pen
+                        - crate::tuning::COLLIDE_C * v_rel_n;
+                    // Equal-and-opposite Δv (semi-implicit Euler). Equal
+                    // mass ⇒ momentum conserved exactly: +f·n on a, −f·n
+                    // on b, identical |Δv|.
+                    let ka = f * a.body.inv_mass * h;
+                    let kb = f * b.body.inv_mass * h;
+                    a.body.v = Vec3::new(
+                        a.body.v.x + nx * ka,
+                        a.body.v.y + ny * ka,
+                        a.body.v.z + nz * ka,
+                    );
+                    b.body.v = Vec3::new(
+                        b.body.v.x - nx * kb,
+                        b.body.v.y - ny * kb,
+                        b.body.v.z - nz * kb,
+                    );
+                }
+            }
+        }
+
+        // PART B — GARROTE foul detection. A fired rig line whose taut,
+        // attached segment (hand → effective anchor) sweeps within
+        // GARROTE_RADIUS of an OPPOSING rigger's body centre is a foul (the
+        // line cutting/wrapping across an opponent) — independent of bell
+        // state (a garrote is a garrote whether the ball is held or loose).
+        // Per (line, player) pair in fixed Vec id order; first qualifying
+        // hit (by line owner index, then victim index) wins ⇒
+        // deterministic, no rng. Segment-vs-point distance only.
+        {
+            let gr2 = crate::tuning::GARROTE_RADIUS * crate::tuning::GARROTE_RADIUS;
+            let mut garrote_by: Option<String> = None;
+            'g: for li in 0..self.players.len() {
+                let owner = &self.players[li];
+                let line = match owner.body.line.as_ref() {
+                    Some(l) if l.attached && l.taut => l,
+                    _ => continue,
+                };
+                let a = owner.body.p;
+                // Effective far end: a player-bound line tracks the bound
+                // body; otherwise the static world anchor.
+                let b = match line.anchor_player.as_ref() {
+                    Some(aid) => self
+                        .players
+                        .iter()
+                        .find(|t| &t.id == aid)
+                        .map(|t| t.body.p)
+                        .unwrap_or(line.anchor_pos),
+                    None => line.anchor_pos,
+                };
+                let owner_team = owner.team;
+                for vi in 0..self.players.len() {
+                    if vi == li {
+                        continue;
+                    }
+                    let victim = &self.players[vi];
+                    if victim.team == owner_team || victim.body.grounded {
+                        continue;
+                    }
+                    if seg_point_dist2(a, b, victim.body.p) < gr2 {
+                        garrote_by = Some(self.players[li].id.clone());
+                        break 'g;
+                    }
+                }
+            }
+            if let Some(by) = garrote_by {
+                self.events.push(SimEvent::FoulGarrote { by });
+            }
+        }
+
         // Bell integration or tracking.
         if let Some(ref holder_id) = self.bell_held_by.clone() {
             if let Some(idx) = self.find_idx(holder_id) {
@@ -618,6 +740,53 @@ impl SimWorld {
             let bell_v = self.bell.v;
             let thrown_by = self.bell_thrown_by.clone();
 
+            // PART B — CONTEST detection. The bell is LOOSE here. If two
+            // opposing non-grounded riggers are BOTH within CONTEST_RADIUS
+            // of it (both committing to the same loose ball), this is a
+            // real 1:1. Emit `ContestStarted` ONCE per loose-bell episode
+            // (latched) so MatchStateMachine's Contest path runs in real
+            // played/watched/wasm play (it then resolves from the physics
+            // outcome — see match_sm.rs handle_event, no rng). The
+            // "thrower" is the attacking side's closest rigger (team of
+            // bell_thrown_by); the "contester" is the opposing side's
+            // closest. Fixed Vec order, lowest index breaks distance ties
+            // ⇒ deterministic, no rng, no HashMap.
+            if !self.contest_emitted && since_release >= 8 {
+                if let Some(ref tid) = thrown_by {
+                    if let Some(att_team) = self.team_of(tid) {
+                        let cr = crate::tuning::CONTEST_RADIUS;
+                        let mut atk: Option<(usize, f64)> = None;
+                        let mut def: Option<(usize, f64)> = None;
+                        for (k, w) in self.players.iter().enumerate() {
+                            if w.body.grounded {
+                                continue;
+                            }
+                            let d = w.body.p.sub(bell_p).len();
+                            if d > cr {
+                                continue;
+                            }
+                            if w.team == att_team {
+                                if atk.map_or(true, |(_, bd)| d < bd) {
+                                    atk = Some((k, d));
+                                }
+                            } else if def.map_or(true, |(_, bd)| d < bd) {
+                                def = Some((k, d));
+                            }
+                        }
+                        if let (Some((ai, _)), Some((di, _))) = (atk, def) {
+                            let thrower = self.players[ai].id.clone();
+                            let contester = self.players[di].id.clone();
+                            self.events.push(SimEvent::ContestStarted {
+                                thrower,
+                                contester,
+                            });
+                            self.contest_emitted = true;
+                        }
+                    }
+                }
+            }
+
+
             'contact: for w in &self.players {
                 if w.body.grounded {
                     continue;
@@ -642,6 +811,7 @@ impl SimWorld {
                         self.bell_touched = true;
                         self.bell_dead = false;
                         self.free_ticks = 0;
+                        self.contest_emitted = false;
                         self.loop_tracker.on_touch();
                         if self.pass_chain.last().map(|s: &String| s.as_str())
                             != Some(&w.id)
@@ -842,6 +1012,21 @@ pub struct LoopInfo {
 /// Stable hash of a snapshot for determinism tests.
 /// Uses the same FNV-1a + Math.imul scheme as the TS `hashSnapshot` so
 /// cross-language parity checks pass.
+/// Squared distance from point `p` to the segment `a`→`b`. Pure f64
+/// (clamped projection) ⇒ deterministic, identical to the TS twin.
+fn seg_point_dist2(a: Vec3, b: Vec3, p: Vec3) -> f64 {
+    let ab = b.sub(a);
+    let ab2 = ab.dot(ab);
+    let t = if ab2 < 1e-18 {
+        0.0
+    } else {
+        (p.sub(a).dot(ab) / ab2).clamp(0.0, 1.0)
+    };
+    let c = Vec3::new(a.x + ab.x * t, a.y + ab.y * t, a.z + ab.z * t);
+    let d = p.sub(c);
+    d.dot(d)
+}
+
 pub fn hash_snapshot(s: &Snapshot) -> String {
     let round = |n: f64| (n * 1_000_000.0).round() / 1_000_000.0;
     let mut parts: Vec<f64> = vec![
@@ -1259,5 +1444,247 @@ mod tests {
             hash_snapshot(&w.snapshot())
         };
         assert_eq!(launch(1), launch(99999));
+    }
+
+    // ── PART A — player↔player soft-body collision ───────────────────────
+
+    /// Two riggers driven into the same point overlap, then the soft spring
+    /// pushes them apart — and total linear momentum (equal mass ⇒ Σv) is
+    /// conserved by the equal-and-opposite impulse, to f64 precision.
+    #[test]
+    fn player_collision_conserves_momentum_and_separates() {
+        let mut w = SimWorld::new(7);
+        // Two non-grounded players overlapping on the axis (rho ≪ R so no
+        // grounding spring interferes); equal & opposite closing velocity.
+        w.add_player("L", TeamSide::Home, RiggerRole::Spinner, Vec3::new(-0.4, 2.0, 0.0));
+        w.add_player("R", TeamSide::Away, RiggerRole::Reach, Vec3::new(0.4, 2.0, 0.0));
+        w.players[0].body.v = Vec3::new(1.0, 0.0, 0.0);
+        w.players[1].body.v = Vec3::new(-1.0, 0.0, 0.0);
+        w.bell_dead = true; // isolate the player pass
+        let p0 = w.players[0].body.p;
+        let p1 = w.players[1].body.p;
+        let initial_sep = p1.sub(p0).len();
+
+        // The two bodies are mirror-symmetric on the axis (same y,z;
+        // opposite x and vx). The collision normal is therefore purely the
+        // x axis, and axial-x is INERTIAL (no Coriolis on x in the rotating
+        // frame) — so the ONLY thing that can change Σvx is the collision
+        // impulse, which is exactly equal-and-opposite ⇒ Σvx is conserved
+        // to fp precision. (y/z carry the symmetric Coriolis/grounding and
+        // are not the conserved DOF under this asymmetric pair geometry.)
+        let mut max_drift = 0.0_f64;
+        for _ in 0..200 {
+            let sx_before =
+                w.players[0].body.v.x + w.players[1].body.v.x;
+            w.step(&InputFrame::idle(0), SIM_H);
+            let sx_after = w.players[0].body.v.x + w.players[1].body.v.x;
+            let d = (sx_after - sx_before).abs();
+            if d > max_drift {
+                max_drift = d;
+            }
+        }
+        // The pair was pushed apart (separation grew past the rest 2R).
+        let sep = w.players[1].body.p.sub(w.players[0].body.p).len();
+        assert!(
+            sep > initial_sep,
+            "soft collision must separate the overlap: {} -> {}",
+            initial_sep,
+            sep
+        );
+        assert!(
+            sep >= 2.0 * crate::tuning::PLAYER_RADIUS - 0.2,
+            "settles at ≥ ~2·radius, sep = {}",
+            sep
+        );
+        // Momentum conservation along the collision normal (x): collision
+        // adds equal-and-opposite Δvx and x is inertial, so Σvx is exactly
+        // conserved (fp noise only).
+        assert!(
+            max_drift < 1e-9,
+            "collision Σvx change must be ~0 (equal & opposite), got {}",
+            max_drift
+        );
+    }
+
+    /// Player collision is deterministic: identical setups, identical hashes.
+    #[test]
+    fn player_collision_is_deterministic() {
+        let build2 = |seed| {
+            let mut w = SimWorld::new(seed);
+            w.add_player("L", TeamSide::Home, RiggerRole::Spinner, Vec3::new(-0.4, 2.0, 0.3));
+            w.add_player("R", TeamSide::Away, RiggerRole::Reach, Vec3::new(0.4, 1.8, -0.2));
+            w.players[0].body.v = Vec3::new(1.3, 0.2, 0.0);
+            w.players[1].body.v = Vec3::new(-1.1, 0.0, 0.1);
+            w.bell_dead = true;
+            for _ in 0..300 {
+                w.step(&InputFrame::idle(0), SIM_H);
+            }
+            hash_snapshot(&w.snapshot())
+        };
+        assert_eq!(build2(1), build2(2));
+        assert_eq!(build2(1), build2(1));
+    }
+
+    // ── PART B — Contest + Garrote emission, end-to-end through the SM ────
+
+    /// A loose bell with two opposing non-grounded riggers both inside the
+    /// contest radius emits `ContestStarted` exactly once, and a constructed
+    /// contester catch resolves it through the MatchStateMachine.
+    #[test]
+    fn contest_started_emitted_and_resolved_by_match_sm() {
+        use crate::match_sm::{MatchStateMachine, MatchPhase};
+        let mut w = SimWorld::new(3);
+        w.add_player("H", TeamSide::Home, RiggerRole::Spinner, Vec3::new(0.0, 2.0, 0.0));
+        w.add_player("A", TeamSide::Away, RiggerRole::Reach, Vec3::new(3.0, 2.0, 0.0));
+        // Loose bell thrown by H (Home attacking), sitting between them so
+        // both are well within CONTEST_RADIUS.
+        w.launch_bell(
+            Vec3::new(1.5, 2.0, 0.0),
+            Vec3::new(0.0, 0.0, 0.0),
+            Vec3::new(26.0, 0.0, 0.0),
+            Some("H"),
+        );
+
+        let mut saw_contest = 0;
+        // Step past the 8-tick grace; collect events.
+        for _ in 0..20 {
+            let evs = w.step(&InputFrame::idle(0), SIM_H);
+            for e in &evs {
+                if matches!(e, SimEvent::ContestStarted { .. }) {
+                    saw_contest += 1;
+                }
+            }
+        }
+        assert_eq!(
+            saw_contest, 1,
+            "ContestStarted must fire exactly once per loose-bell episode"
+        );
+
+        // It actually drives the match SM's contest path and resolves.
+        use crate::scoring::SimEvent as SE;
+        let mut msm = MatchStateMachine::new(crate::scoring::RingEnd::PlusX, crate::scoring::TeamSide::Home);
+        msm.consume(
+            &[SE::FoulGarrote { by: "__setup__".into() }],
+            &mk_simstate(&w),
+        );
+        msm.consume(
+            &[SE::ContestStarted {
+                thrower: "H".into(),
+                contester: "A".into(),
+            }],
+            &mk_simstate(&w),
+        );
+        assert_eq!(msm.state().phase, MatchPhase::Contest);
+        // Contester (Away) secures it → turnover, contest resolved.
+        let upd = msm.consume(
+            &[SE::BellCaught { by: "A".into() }],
+            &mk_simstate(&w),
+        );
+        assert!(upd.turnover.is_some(), "physics-resolved contest → turnover");
+        assert_ne!(msm.state().phase, MatchPhase::Contest);
+    }
+
+    /// A taut, attached line whose segment sweeps across an opposing body
+    /// emits `FoulGarrote`, which the match SM turns into a fresh cast.
+    #[test]
+    fn foul_garrote_emitted_and_consumed() {
+        use crate::match_sm::MatchStateMachine;
+        let mut w = SimWorld::new(5);
+        w.add_player("H", TeamSide::Home, RiggerRole::Spinner, Vec3::new(0.0, 2.0, 0.0));
+        // Victim sits ON the line H→anchor (anchor at +x), well within
+        // GARROTE_RADIUS of the segment.
+        w.add_player("V", TeamSide::Away, RiggerRole::Reach, Vec3::new(10.0, 2.0, 0.0));
+        w.bell_dead = true;
+        // Give H a taut, attached static line straight down +x past V.
+        w.players[0].body.line = Some(crate::grapple::Line {
+            anchor_pos: Vec3::new(25.0, 2.0, 0.0),
+            rest_len: 25.0,
+            taut: true,
+            attached: true,
+            attach_tick: 0,
+            anchor_player: None,
+        });
+        let evs = w.step(&InputFrame::idle(0), SIM_H);
+        let garrote: Vec<_> = evs
+            .iter()
+            .filter(|e| matches!(e, SimEvent::FoulGarrote { .. }))
+            .collect();
+        assert_eq!(garrote.len(), 1, "one garrote foul expected");
+
+        use crate::scoring::SimEvent as SE;
+        let mut msm = MatchStateMachine::new(crate::scoring::RingEnd::PlusX, crate::scoring::TeamSide::Home);
+        msm.consume(
+            &[SE::FoulGarrote { by: "__s__".into() }],
+            &mk_simstate(&w),
+        );
+        let before = msm.state().cast.throws_left;
+        msm.consume(&[SE::FoulGarrote { by: "H".into() }], &mk_simstate(&w));
+        // Foul garrote re-arms a fresh live cast (throws restored to 3).
+        assert_eq!(msm.state().cast.throws_left, 3);
+        let _ = before;
+    }
+
+    /// DETERMINISM: a full contest + collision sequence is bit-identical
+    /// run==run (new physics state — collision Δv, contest latch — does not
+    /// escape the determinism-hashed surface; hash_snapshot folds every
+    /// player p,v which is exactly what collision mutates).
+    #[test]
+    fn contest_and_collision_sequence_is_bit_identical() {
+        let run = || {
+            let mut w = SimWorld::new(11);
+            w.add_player("H1", TeamSide::Home, RiggerRole::Spinner, Vec3::new(-1.0, 2.0, 0.0));
+            w.add_player("H2", TeamSide::Home, RiggerRole::Anchor, Vec3::new(-0.6, 2.0, 0.4));
+            w.add_player("A1", TeamSide::Away, RiggerRole::Reach, Vec3::new(0.8, 2.0, 0.0));
+            w.players[0].body.v = Vec3::new(2.0, 0.0, 0.0);
+            w.players[2].body.v = Vec3::new(-2.0, 0.0, 0.0);
+            w.launch_bell(
+                Vec3::new(0.0, 2.0, 0.0),
+                Vec3::new(1.0, 0.0, 0.0),
+                Vec3::new(26.0, 0.0, 0.0),
+                Some("H1"),
+            );
+            for _ in 0..400 {
+                w.step(&InputFrame::idle(0), SIM_H);
+            }
+            hash_snapshot(&w.snapshot())
+        };
+        assert_eq!(run(), run());
+    }
+
+    /// Build a match_sm::SimState mirror from the world (test helper).
+    fn mk_simstate(w: &SimWorld) -> crate::scoring::SimState {
+        let s = w.snapshot();
+        crate::scoring::SimState {
+            tick: s.tick,
+            omega: s.omega,
+            bell: crate::scoring::BellState {
+                p: s.bell.p,
+                v: s.bell.v,
+                held_by: s.bell.held_by.clone(),
+                thrown_by: s.bell.thrown_by.clone(),
+                touched_since_throw: s.bell.touched_since_throw,
+                pass_chain: s.bell.pass_chain.clone(),
+            },
+            players: s
+                .players
+                .iter()
+                .map(|p| crate::scoring::PlayerSim {
+                    id: p.id.clone(),
+                    team: match p.team {
+                        TeamSide::Home => crate::scoring::TeamSide::Home,
+                        TeamSide::Away => crate::scoring::TeamSide::Away,
+                    },
+                    role: match p.role {
+                        RiggerRole::Anchor => crate::scoring::RiggerRole::Anchor,
+                        RiggerRole::Spinner => crate::scoring::RiggerRole::Spinner,
+                        RiggerRole::Faithwing => crate::scoring::RiggerRole::Faithwing,
+                        RiggerRole::Freewing => crate::scoring::RiggerRole::Freewing,
+                        RiggerRole::Reach => crate::scoring::RiggerRole::Reach,
+                    },
+                    p: p.p,
+                    v: p.v,
+                })
+                .collect(),
+        }
     }
 }

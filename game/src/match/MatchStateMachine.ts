@@ -187,10 +187,21 @@ export class MatchStateMachine {
    */
   resolveContest(result: { winner: 'thrower' | 'contester' }, _sim: SimState): MatchUpdate {
     const update: MatchUpdate = { resets: [] };
-    if (this._state.phase !== 'contest' || this._state.contest === null) return update;
+    this._resolveContestInto(result, update);
+    return update;
+  }
 
+  /**
+   * Resolve a pending contest, merging effects into an existing update (so a
+   * physics-driven contest resolved mid-consume still propagates its
+   * turnover / inning-end to the caller). Twin of match_sm.rs.
+   */
+  private _resolveContestInto(
+    result: { winner: 'thrower' | 'contester' },
+    update: MatchUpdate,
+  ): void {
+    if (this._state.phase !== 'contest' || this._state.contest === null) return;
     if (result.winner === 'thrower') {
-      // Cast continues from the catch point
       this._state = {
         ...this._state,
         contest: null,
@@ -198,11 +209,8 @@ export class MatchStateMachine {
         message: 'Contest complete — cast continues',
       };
     } else {
-      // Contester wins → turnover at current spotX
       this._applyTurnover(update);
     }
-
-    return update;
   }
 
   // ─── Private: event dispatch ─────────────────────────────────────────────
@@ -223,6 +231,38 @@ export class MatchStateMachine {
     const phase = this._state.phase;
     if (phase === 'dead' || phase === 'inning_break') return;
 
+    // PART B — physics-resolved contest (twin of match_sm.rs). A
+    // `contest_started` from real loose-bell play puts the match in
+    // Contest phase; the duel resolves from the ACTUAL physics with NO
+    // rng (determinism is sacred — Contest.resolveContest's dice path
+    // stays for the headless statistical layer only). A catch by the
+    // CONTESTER's team is a won contest → turnover; a catch by the
+    // THROWER's team, or the bell dying/through-ring, means the cast
+    // continues. Deterministic, id-driven.
+    if (phase === 'contest' && this._state.contest !== null) {
+      const c = this._state.contest;
+      switch (ev.type) {
+        case 'bell_caught': {
+          const byTeam = this._teamOf(sim, ev.by);
+          const contesterTeam = this._teamOf(sim, c.contester);
+          const winner: 'thrower' | 'contester' =
+            byTeam !== null && byTeam === contesterTeam ? 'contester' : 'thrower';
+          this._resolveContestInto({ winner }, update);
+          return;
+        }
+        case 'bell_missed':
+          this._resolveContestInto({ winner: 'thrower' }, update);
+          return;
+        case 'bell_through_ring':
+          this._state = { ...this._state, phase: 'live', contest: null };
+          this._onBellThroughRing(ev, sim, update);
+          return;
+        default:
+          // Bobble/clatter/skin/etc.: contest still in flight.
+          return;
+      }
+    }
+
     switch (ev.type) {
       case 'bell_through_ring':
         this._onBellThroughRing(ev, sim, update);
@@ -235,9 +275,20 @@ export class MatchStateMachine {
         break;
       case 'bell_caught':
       case 'bell_bobble':
-      case 'bell_clatter':
-        if (phase === 'live') this._onThrowSpent(sim, update);
+      case 'bell_clatter': {
+        // A clean catch by a TEAMMATE (same team as the possessing/
+        // attacking side) is a COMPLETED PASS, not a failed throw — it must
+        // not burn a down on its own (only gate progress or a real
+        // failure does). Bobble/clatter and any opponent catch are still
+        // failed/contested throws and spend the down as before.
+        const caughtById =
+          ev.type === 'bell_caught' ? ev.by : null;
+        const completedPass =
+          caughtById !== null &&
+          this._teamOf(sim, caughtById) === this._state.possession;
+        if (phase === 'live') this._onThrowSpent(sim, update, completedPass);
         break;
+      }
       case 'bell_missed':
         if (phase === 'live') this._onBellMissed(sim, update);
         break;
@@ -318,7 +369,17 @@ export class MatchStateMachine {
     // Ground does not end inning or change possession.
   }
 
-  private _onThrowSpent(sim: SimState, update: MatchUpdate): void {
+  /** Team of a player id in the sim, or null if unknown. */
+  private _teamOf(sim: SimState, id: string): TeamSide | null {
+    const pl = sim.players.find((p) => p.id === id);
+    return pl ? pl.team : null;
+  }
+
+  private _onThrowSpent(
+    sim: SimState,
+    update: MatchUpdate,
+    completedPass = false,
+  ): void {
     const s = this._state;
     const dir = attackDir(s.possession);
     const bellX = sim.bell.p.x;
@@ -344,8 +405,18 @@ export class MatchStateMachine {
         cast: { throwsLeft: 3, gate: newGate, spotX: gateX(newGate, dir) },
         message: `Gate cleared → ${newGate}`,
       };
+    } else if (completedPass) {
+      // Completed pass that did not clear a gate: possession is retained by
+      // a teammate, the cast LIVES — do NOT burn a down. Track the ball's
+      // new spot so subsequent gate progress is measured from here.
+      this._state = {
+        ...s,
+        cast: { ...s.cast, spotX: bellX },
+        message: `Pass completed — cast continues`,
+      };
     } else {
-      // Did not clear the current gate — burn a throw.
+      // Did not clear the current gate and the throw was NOT retained by a
+      // teammate (failed/contested/opponent) — burn a throw.
       const newLeft = (s.cast.throwsLeft - 1) as 0 | 1 | 2 | 3;
       this._state = {
         ...s,
@@ -429,7 +500,25 @@ export class MatchStateMachine {
     update.inningEnd = { inning: s.inning };
 
     if (s.spine) {
-      // Spine sudden-death: any score decides the match
+      // SUDDEN-DEATH CORRECTNESS (twin of match_sm.rs): a spine inning ENDS
+      // the match only when a team has actually pulled ahead. A turnover-
+      // and-clear in a still-tied spine inning does NOT default-win for
+      // Away (the old `scoreHome > scoreAway` → false bug): the spine
+      // CONTINUES with the other team casting. Only a real score resolves it.
+      if (s.scoreHome === s.scoreAway) {
+        const next: TeamSide = s.possession === 'home' ? 'away' : 'home';
+        this._state = {
+          ...s,
+          inning: s.inning + 1,
+          possession: next,
+          contest: null,
+          cast: initialCast(next),
+          phase: 'spine',
+          message: `Spine still tied — ${next} to cast (sudden death)`,
+        };
+        update.resets.push('pushoff', 'set');
+        return;
+      }
       const winner: TeamSide = s.scoreHome > s.scoreAway ? 'home' : 'away';
       this._state = {
         ...s,

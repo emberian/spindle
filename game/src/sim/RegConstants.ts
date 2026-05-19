@@ -35,6 +35,27 @@ export const FEEL = {
   // exp(-6 * (1/240)) precomputed once; no per-step exp() either side.
   FRICTION_DECAY: 0.9753099120283326,
 
+  // PLAYER–PLAYER SOFT-BODY COLLISION — verbatim mirror of tuning.rs.
+  // A rigger has a radius; overlapping pairs are pushed apart by a
+  // momentum-conserving soft spring + damper applied equal-and-opposite
+  // along the contact normal (one O(n²) pass, fixed order, deterministic).
+  // PLAYER_RADIUS 0.6 m (rigger ~1.2 m across — small vs 45 m skin / 8 m
+  // ring so ring/loop geometry is untouched, big enough to screen/pick).
+  // COLLIDE_K 4000 ⇒ ω_n = sqrt(4000/39) ≈ 10.1 rad/s, ω_n·h ≈ 0.042 ≪ 2.
+  // COLLIDE_C 550 ⇒ ζ ≈ 0.70 on the reduced mass (soft stand-off, no bounce).
+  PLAYER_RADIUS: 0.6, // m — soft-body collision radius
+  COLLIDE_K: 4000, // penetration push-apart spring
+  COLLIDE_C: 550, // collision normal damping (near-critical, reduced mass)
+
+  // PART B — CONTEST + GARROTE detection — verbatim mirror of tuning.rs.
+  // CONTEST_RADIUS 6 m: a loose bell with two opposing non-grounded
+  // riggers both inside it is a 1:1 contest (emitted once per loose-bell
+  // episode). GARROTE_RADIUS 1.0 m = PLAYER_RADIUS + 0.4 line margin: a
+  // fired line's taut segment sweeping this close to an opposing body
+  // centre is a garrote foul. Segment-vs-point, fixed id order, no rng.
+  CONTEST_RADIUS: 6.0, // m — loose-bell 1:1 contest trigger
+  GARROTE_RADIUS: 1.0, // m — line-vs-opponent-body foul distance
+
   PUSHOFF_RAMP_TICKS: 18, // eased pushoff ramp length (ticks)
   THRUMBLER_RAMP_TICKS: 12, // eased thrumbler ramp length (ticks)
 

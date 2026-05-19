@@ -202,25 +202,54 @@ describe('Scoring.scoreFor — scoring table', () => {
 // ─── Cast & turnover mechanics ────────────────────────────────────────────────
 
 describe('MatchStateMachine — cast & turnover', () => {
-  it('3 unproductive throws → turnover (throwsLeft reaches 0)', () => {
+  // RE-BASELINE (Part D): "3 unproductive throws → turnover" now means 3
+  // FAILED throws. A bell_caught by a TEAMMATE is a COMPLETED PASS that
+  // retains possession and must NOT burn a down (the down-burn bug fix);
+  // only a failed/none-retained throw spends one. A missed throw always
+  // burns; three exhaust the cast and turn the ball over.
+  it('3 unproductive (failed) throws → turnover (throwsLeft reaches 0)', () => {
     const msm = new MatchStateMachine('+x', 'home');
     toLive(msm);
     expect(msm.state.phase).toBe('live');
 
-    // Bell at x=5, well short of first gate (80 m for home attacking +x)
     const sim = makeSim({ bellX: 5, passChain: ['hp'], players: [makePlayer('hp', 'home')] });
-    const catchEv: SimEvent = { type: 'bell_caught', by: 'hp' };
+    const miss: SimEvent = { type: 'bell_missed', end: '+x' };
 
-    msm.consume([catchEv], sim);
+    msm.consume([miss], sim);
     expect(msm.state.cast.throwsLeft).toBe(2);
+    msm.resumeLive();
 
-    msm.consume([catchEv], sim);
+    msm.consume([miss], sim);
     expect(msm.state.cast.throwsLeft).toBe(1);
+    msm.resumeLive();
 
-    const upd = msm.consume([catchEv], sim);
+    const upd = msm.consume([miss], sim);
     expect(upd.turnover).toBeDefined();
     expect(upd.turnover!.team).toBe('away'); // possession flips
     expect(upd.inningEnd).toBeDefined();
+  });
+
+  // PART D — the down-burn bug fix, isolated: a completed pass (catch by a
+  // TEAMMATE that does not clear a gate) does NOT burn a down, while a
+  // failed throw (a missed throw, or a catch by an OPPONENT) does.
+  it('completed pass keeps the down; a failed throw burns it', () => {
+    const msm = new MatchStateMachine('+x', 'home');
+    toLive(msm);
+    const sim = makeSim({
+      bellX: 5,
+      passChain: ['hp2'],
+      players: [makePlayer('hp', 'home'), makePlayer('hp2', 'home'), makePlayer('ap', 'away')],
+    });
+    // Teammate catch short of a gate → completed pass, cast continues.
+    msm.consume([{ type: 'bell_caught', by: 'hp2' }], sim);
+    expect(msm.state.cast.throwsLeft).toBe(3);
+    // Opponent catch → failed/contested throw, burns one.
+    msm.consume([{ type: 'bell_caught', by: 'ap' }], sim);
+    expect(msm.state.cast.throwsLeft).toBe(2);
+    // Missed throw also burns.
+    msm.resumeLive();
+    msm.consume([{ type: 'bell_missed', end: '+x' }], sim);
+    expect(msm.state.cast.throwsLeft).toBe(1);
   });
 
   it('clearing a gate resets throwsLeft=3 and advances gate', () => {
@@ -401,17 +430,24 @@ describe('MatchStateMachine — innings, spine, winner', () => {
   }
 
   /**
-   * End an inning via turnover (no score): burn 3 throws short of the gate.
+   * End an inning via turnover (no score): burn 3 FAILED throws short of
+   * the gate. RE-BASELINE (Part D): a `bell_caught` by a teammate is now a
+   * COMPLETED PASS that retains possession and does NOT burn a down (the
+   * down-burn bug fix). A missed throw always burns; three exhaust the
+   * cast and turn the ball over (resumeLive re-arms between misses like the
+   * runtime does for a dead ball).
    */
   function turnoverInning(msm: MatchStateMachine): void {
     if (msm.state.phase !== 'live') toLive(msm);
     const team = msm.state.possession;
     const pid = team + '-p';
     const sim = makeSim({ bellX: 5, passChain: [pid], players: [makePlayer(pid, team)] });
-    const catchEv: SimEvent = { type: 'bell_caught', by: pid };
-    msm.consume([catchEv], sim);
-    msm.consume([catchEv], sim);
-    msm.consume([catchEv], sim);
+    const miss: SimEvent = { type: 'bell_missed', end: '+x' };
+    msm.consume([miss], sim);
+    msm.resumeLive();
+    msm.consume([miss], sim);
+    msm.resumeLive();
+    msm.consume([miss], sim);
   }
 
   it('home scores all 9 innings → home wins, phase final', () => {
@@ -451,6 +487,36 @@ describe('MatchStateMachine — innings, spine, winner', () => {
     msm.consume([{ type: 'bell_through_ring', end: spineEnd, touched: true, loopTier: 'none' }], sim);
 
     expect(msm.state.winner).toBe(spinePossession);
+    expect(msm.state.phase).toBe('final');
+  });
+
+  // PART D — spine sudden-death default-win bug fix: a tied spine inning
+  // that ends on a turnover must NOT default-win for Away. Spine CONTINUES
+  // until a team actually scores; only then does that team win.
+  it('tied spine + turnover continues spine; a score then decides it', () => {
+    const msm = new MatchStateMachine('+x', 'home');
+    for (let i = 0; i < 8; i++) scoreInning(msm, i % 2 === 0 ? 'home' : 'away');
+    turnoverInning(msm); // tie after 9 → spine
+    expect(msm.state.spine).toBe(true);
+    expect(msm.state.phase).toBe('spine');
+    expect(msm.state.winner).toBeNull();
+
+    // Turnover in the still-tied spine inning: must NOT end the match
+    // (the old bug handed Away a default win via scoreHome > scoreAway).
+    turnoverInning(msm);
+    expect(msm.state.winner).toBeNull();
+    expect(msm.state.spine).toBe(true);
+    expect(msm.state.phase).toBe('spine');
+    expect(msm.state.scoreHome).toBe(msm.state.scoreAway);
+
+    // A real score in spine decides it for the scorer.
+    toLive(msm);
+    const poss = msm.state.possession;
+    const pid = poss + '-spx';
+    const end: '+x' | '-x' = poss === 'home' ? '+x' : '-x';
+    const sim = makeSim({ passChain: [pid], players: [makePlayer(pid, poss)] });
+    msm.consume([{ type: 'bell_through_ring', end, touched: true, loopTier: 'none' }], sim);
+    expect(msm.state.winner).toBe(poss);
     expect(msm.state.phase).toBe('final');
   });
 

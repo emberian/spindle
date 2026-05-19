@@ -37,6 +37,11 @@ export class SimWorld {
   passChain: string[] = [];
   releasePos: Vec3 = { x: 0, y: 0, z: 0 };
   releaseTick = 0;
+  // PART B (twin of sim_world.rs): latched once a `contest_started` has
+  // been emitted for the current loose-bell episode (one-shot per loose
+  // ball). Reset on launch/grip/catch. Not a physics quantity ⇒ not in
+  // hashSnapshot; only gates a deterministic one-shot event.
+  private contestEmitted = false;
   players: World[] = [];
   private loop = new LoopTracker();
   private rng: Rng;
@@ -60,6 +65,7 @@ export class SimWorld {
     this.bellThrownBy = null;
     this.bellTouched = true;
     this.passChain = [];
+    this.contestEmitted = false;
     this.bell.p = { ...w.body.p };
     this.bell.v = { x: 0, y: 0, z: 0 };
     this.bell.w = { x: 0, y: 0, z: 0 };
@@ -73,6 +79,7 @@ export class SimWorld {
     this.bellHeldBy = null;
     this.bellThrownBy = thrownBy;
     this.bellTouched = false;
+    this.contestEmitted = false; // new loose-bell episode
     this.releasePos = { ...p };
     this.releaseTick = this.tick;
     if (thrownBy) this.passChain.push(thrownBy);
@@ -159,6 +166,73 @@ export class SimWorld {
       }
     }
 
+    // PART A — PLAYER↔PLAYER SOFT-BODY COLLISION (twin of
+    // rig-core/src/sim_world.rs). One O(n²) pairwise pass resolves
+    // penetration of two PLAYER_RADIUS spheres with a momentum-conserving
+    // soft spring + damper applied EQUAL-AND-OPPOSITE along the contact
+    // normal. Fixed (i, j) index order ⇒ deterministic, no Math.random.
+    // Symplectic; equal player mass ⇒ linear momentum conserved exactly.
+    {
+      const twoR = 2 * FEEL.PLAYER_RADIUS;
+      const twoR2 = twoR * twoR;
+      const n = this.players.length;
+      for (let i = 0; i < n; i++) {
+        for (let j = i + 1; j < n; j++) {
+          const a = this.players[i].body;
+          const b = this.players[j].body;
+          const dx = a.p.x - b.p.x;
+          const dy = a.p.y - b.p.y;
+          const dz = a.p.z - b.p.z;
+          const d2 = dx * dx + dy * dy + dz * dz;
+          if (d2 >= twoR2 || d2 < 1e-18) continue;
+          const dist = Math.sqrt(d2);
+          const inv = 1 / dist;
+          const nx = dx * inv;
+          const ny = dy * inv;
+          const nz = dz * inv;
+          const pen = twoR - dist;
+          const rvx = a.v.x - b.v.x;
+          const rvy = a.v.y - b.v.y;
+          const rvz = a.v.z - b.v.z;
+          const vRelN = rvx * nx + rvy * ny + rvz * nz;
+          const f = FEEL.COLLIDE_K * pen - FEEL.COLLIDE_C * vRelN;
+          const ka = f * a.invMass * h;
+          const kb = f * b.invMass * h;
+          a.v = { x: a.v.x + nx * ka, y: a.v.y + ny * ka, z: a.v.z + nz * ka };
+          b.v = { x: b.v.x - nx * kb, y: b.v.y - ny * kb, z: b.v.z - nz * kb };
+        }
+      }
+    }
+
+    // PART B — GARROTE foul detection (twin of sim_world.rs). A fired line
+    // whose taut, attached segment (hand → effective anchor) sweeps within
+    // GARROTE_RADIUS of an OPPOSING rigger's body centre is a foul —
+    // independent of bell state. Per (line, victim) pair, fixed id order;
+    // first hit wins ⇒ deterministic, no Math.random.
+    {
+      const gr2 = FEEL.GARROTE_RADIUS * FEEL.GARROTE_RADIUS;
+      let garroteBy: string | null = null;
+      outer: for (let li = 0; li < this.players.length; li++) {
+        const owner = this.players[li];
+        const ln = owner.body.line;
+        if (!ln || !ln.attached || !ln.taut) continue;
+        const a = owner.body.p;
+        const b = ln.anchorBody ? ln.anchorBody.p : ln.anchorPos;
+        for (let vi = 0; vi < this.players.length; vi++) {
+          if (vi === li) continue;
+          const victim = this.players[vi];
+          if (victim.team === owner.team || victim.body.grounded) continue;
+          if (segPointDist2(a, b, victim.body.p) < gr2) {
+            garroteBy = owner.id;
+            break outer;
+          }
+        }
+      }
+      if (garroteBy !== null) {
+        this.events.push({ type: 'foul_garrote', by: garroteBy });
+      }
+    }
+
     // Bell
     if (this.bellHeldBy) {
       const holder = this.find(this.bellHeldBy);
@@ -200,6 +274,41 @@ export class SimWorld {
       // contact briefly, and ignores its thrower until it has clearly
       // separated — you cannot bobble your own throw.
       const sinceRelease = this.tick - this.releaseTick;
+
+      // PART B — CONTEST detection (twin of sim_world.rs). Loose bell: if
+      // two opposing non-grounded riggers are BOTH within CONTEST_RADIUS
+      // of it, emit `contest_started` ONCE per loose-bell episode so the
+      // match SM's Contest path runs (it resolves from the physics, no
+      // rng). Thrower = attacking side's closest rigger; contester =
+      // opposing side's closest. Fixed order, lowest index breaks ties.
+      if (!this.contestEmitted && sinceRelease >= 8 && this.bellThrownBy) {
+        const attTeam = this.teamOf(this.bellThrownBy);
+        if (attTeam) {
+          const cr = FEEL.CONTEST_RADIUS;
+          let atk: { i: number; d: number } | null = null;
+          let def: { i: number; d: number } | null = null;
+          for (let k = 0; k < this.players.length; k++) {
+            const w = this.players[k];
+            if (w.body.grounded) continue;
+            const d = vlen(vsub(w.body.p, this.bell.p));
+            if (d > cr) continue;
+            if (w.team === attTeam) {
+              if (atk === null || d < atk.d) atk = { i: k, d };
+            } else if (def === null || d < def.d) {
+              def = { i: k, d };
+            }
+          }
+          if (atk !== null && def !== null) {
+            this.events.push({
+              type: 'contest_started',
+              thrower: this.players[atk.i].id,
+              contester: this.players[def.i].id,
+            });
+            this.contestEmitted = true;
+          }
+        }
+      }
+
       for (const w of this.players) {
         if (w.body.grounded) continue;
         if (sinceRelease < 8) continue;
@@ -212,6 +321,7 @@ export class SimWorld {
         if (r === 'caught') {
           this.bellHeldBy = w.id;
           this.bellTouched = true;
+          this.contestEmitted = false;
           this.loop.onTouch();
           if (this.passChain[this.passChain.length - 1] !== w.id) this.passChain.push(w.id);
           this.events.push({ type: 'bell_caught', by: w.id });
@@ -323,6 +433,27 @@ export class SimWorld {
       rngCursor: this.rng.cursor(),
     };
   }
+}
+
+// Squared distance from point `p` to segment `a`→`b` (clamped projection).
+// Pure; byte-identical to rig-core/src/sim_world.rs seg_point_dist2.
+function segPointDist2(a: Vec3, b: Vec3, p: Vec3): number {
+  const abx = b.x - a.x;
+  const aby = b.y - a.y;
+  const abz = b.z - a.z;
+  const ab2 = abx * abx + aby * aby + abz * abz;
+  let t = 0;
+  if (ab2 >= 1e-18) {
+    t = ((p.x - a.x) * abx + (p.y - a.y) * aby + (p.z - a.z) * abz) / ab2;
+    t = t < 0 ? 0 : t > 1 ? 1 : t;
+  }
+  const cx = a.x + abx * t;
+  const cy = a.y + aby * t;
+  const cz = a.z + abz * t;
+  const dx = p.x - cx;
+  const dy = p.y - cy;
+  const dz = p.z - cz;
+  return dx * dx + dy * dy + dz * dz;
 }
 
 // Stable hash of a snapshot for determinism tests.

@@ -235,10 +235,17 @@ impl MatchStateMachine {
     /// Resolve a pending contest. (TS `resolveContest`, 188–206)
     pub fn resolve_contest(&mut self, result: ContestOutcome, _sim: &SimState) -> MatchUpdate {
         let mut update = MatchUpdate::default();
-        if self.state.phase != MatchPhase::Contest || self.state.contest.is_none() {
-            return update;
-        }
+        self.resolve_contest_into(result, &mut update);
+        update
+    }
 
+    /// Resolve a pending contest, merging effects into an existing update
+    /// (so a physics-driven contest resolved mid-`consume` still propagates
+    /// its turnover / inning-end to the caller).
+    fn resolve_contest_into(&mut self, result: ContestOutcome, update: &mut MatchUpdate) {
+        if self.state.phase != MatchPhase::Contest || self.state.contest.is_none() {
+            return;
+        }
         match result.winner {
             ContestWinner::Thrower => {
                 self.state.contest = None;
@@ -246,10 +253,9 @@ impl MatchStateMachine {
                 self.state.message = "Contest complete — cast continues".to_string();
             }
             ContestWinner::Contester => {
-                self.apply_turnover(&mut update);
+                self.apply_turnover(update);
             }
         }
-        update
     }
 
     // ─── Private: event dispatch (TS _handleEvent, 210–250) ──────────────────
@@ -269,6 +275,59 @@ impl MatchStateMachine {
             return;
         }
 
+        // PART B — physics-resolved contest. A `ContestStarted` emitted from
+        // real loose-bell play (sim_world.rs) puts the match in Contest
+        // phase. The duel is then resolved by the ACTUAL physics, with NO
+        // rng (determinism is sacred — `resolve_contest`'s dice path stays
+        // for the headless statistical layer only): whoever the sim awards
+        // the loose bell to decides it. A catch by the CONTESTER's team is
+        // a won contest → turnover; a catch by the THROWER's team, or the
+        // bell going dead/through-ring, means the contester failed → the
+        // cast continues (thrower wins). Deterministic, id-driven.
+        if phase == MatchPhase::Contest {
+            if let Some(c) = self.state.contest.clone() {
+                match ev {
+                    SimEvent::BellCaught { by } => {
+                        let by_team = self.team_of_sim(sim, by);
+                        let contester_team = self.team_of_sim(sim, &c.contester);
+                        let winner = if by_team.is_some() && by_team == contester_team {
+                            ContestWinner::Contester
+                        } else {
+                            ContestWinner::Thrower
+                        };
+                        self.resolve_contest_into(ContestOutcome { winner }, update);
+                        return;
+                    }
+                    SimEvent::BellMissed { .. } => {
+                        // Loose bell died with no one securing it — the
+                        // contester did not win possession: cast continues.
+                        self.resolve_contest_into(
+                            ContestOutcome { winner: ContestWinner::Thrower },
+                            update,
+                        );
+                        return;
+                    }
+                    SimEvent::BellThroughRing { .. } => {
+                        // Score during a contest: clear the contest, then
+                        // score normally (the through-ring path ends the
+                        // inning anyway).
+                        self.state.phase = MatchPhase::Live;
+                        self.state.contest = None;
+                        self.on_bell_through_ring(ev, sim, update);
+                        return;
+                    }
+                    SimEvent::FoulGarrote { .. } => {
+                        self.on_foul_garrote(update);
+                        return;
+                    }
+                    _ => {
+                        // Bobble/clatter/skin/etc.: contest still in flight.
+                        return;
+                    }
+                }
+            }
+        }
+
         match ev {
             SimEvent::BellThroughRing { .. } => self.on_bell_through_ring(ev, sim, update),
             SimEvent::ContestStarted { .. } => {
@@ -281,7 +340,18 @@ impl MatchStateMachine {
             | SimEvent::BellBobble { .. }
             | SimEvent::BellClatter { .. } => {
                 if phase == MatchPhase::Live {
-                    self.on_throw_spent(sim, update);
+                    // A clean catch by a TEAMMATE (same team as the
+                    // possessing/attacking side) is a COMPLETED PASS, not a
+                    // failed throw — it must not burn a down on its own.
+                    // Bobble/clatter and any opponent catch are still
+                    // failed/contested throws and spend the down.
+                    let completed_pass = match ev {
+                        SimEvent::BellCaught { by } => {
+                            self.team_of_sim(sim, by) == Some(self.state.possession)
+                        }
+                        _ => false,
+                    };
+                    self.on_throw_spent(sim, update, completed_pass);
                 }
             }
             SimEvent::BellMissed { .. } => {
@@ -376,8 +446,18 @@ impl MatchStateMachine {
         // Ground does not end inning or change possession.
     }
 
+    /// Team of a player id in the sim, or `None` if unknown.
+    fn team_of_sim(&self, sim: &SimState, id: &str) -> Option<TeamSide> {
+        sim.players.iter().find(|p| p.id == id).map(|p| p.team)
+    }
+
     /// TS `_onThrowSpent` (321–356).
-    fn on_throw_spent(&mut self, sim: &SimState, update: &mut MatchUpdate) {
+    fn on_throw_spent(
+        &mut self,
+        sim: &SimState,
+        update: &mut MatchUpdate,
+        completed_pass: bool,
+    ) {
         let dir = attack_dir(self.state.possession);
         let bell_x = sim.bell.p.x;
 
@@ -408,8 +488,15 @@ impl MatchStateMachine {
                 Gate::Mouth => "mouth",
             };
             self.state.message = format!("Gate cleared → {}", gate_name);
+        } else if completed_pass {
+            // Completed pass that did not clear a gate: possession retained
+            // by a teammate, the cast LIVES — do NOT burn a down. Track the
+            // ball's new spot so later gate progress measures from here.
+            self.state.cast.spot_x = bell_x;
+            self.state.message = "Pass completed — cast continues".to_string();
         } else {
-            // Did not clear current gate — burn a throw.
+            // Did not clear current gate and the throw was NOT retained by a
+            // teammate (failed/contested/opponent) — burn a throw.
             let new_left = self.state.cast.throws_left - 1;
             self.state.cast.throws_left = new_left;
             self.state.cast.spot_x = bell_x;
@@ -487,6 +574,30 @@ impl MatchStateMachine {
         });
 
         if self.state.spine {
+            // SUDDEN-DEATH CORRECTNESS: a spine inning ENDS the match only
+            // when a team has actually pulled ahead. A turnover-and-clear in
+            // a still-tied spine inning does NOT default-win for Away (the
+            // old `score_home > score_away` → false bug): the spine
+            // CONTINUES with the other team casting. Only a real score
+            // (score_home != score_away) resolves it; the scorer wins.
+            if self.state.score_home == self.state.score_away {
+                let new_inning = self.state.inning + 1;
+                let next = self.state.possession.other();
+                self.state.inning = new_inning;
+                self.state.possession = next;
+                self.state.contest = None;
+                self.state.cast = initial_cast(next);
+                self.state.phase = MatchPhase::Spine;
+                let poss = match next {
+                    TeamSide::Home => "home",
+                    TeamSide::Away => "away",
+                };
+                self.state.message =
+                    format!("Spine still tied — {} to cast (sudden death)", poss);
+                update.resets.push(Reset::Pushoff);
+                update.resets.push(Reset::Set);
+                return;
+            }
             let winner = if self.state.score_home > self.state.score_away {
                 TeamSide::Home
             } else {
@@ -614,6 +725,12 @@ mod tests {
 
     // ── cast & turnover ──
 
+    /// RE-BASELINE (Part D): "three unproductive throws → turnover" now
+    /// means three FAILED throws. A `bell_caught` by a TEAMMATE is a
+    /// COMPLETED PASS that retains possession and must NOT burn a down (the
+    /// down-burn bug fix); only a failed/none-retained throw spends one. A
+    /// missed throw (`bell_missed`) is the canonical failed throw and always
+    /// burns; three of them exhaust the cast and turn the ball over.
     #[test]
     fn three_unproductive_throws_turnover() {
         let mut msm = MatchStateMachine::new(RingEnd::PlusX, TeamSide::Home);
@@ -621,16 +738,55 @@ mod tests {
         assert_eq!(msm.state().phase, MatchPhase::Live);
 
         let sim = make_sim(5.0, &["hp"], vec![make_player("hp", TeamSide::Home)]);
-        let catch = SimEvent::BellCaught { by: "hp".into() };
+        let miss = SimEvent::BellMissed { end: RingEnd::PlusX };
 
-        msm.consume(std::slice::from_ref(&catch), &sim);
+        msm.consume(std::slice::from_ref(&miss), &sim);
         assert_eq!(msm.state().cast.throws_left, 2);
-        msm.consume(std::slice::from_ref(&catch), &sim);
+        msm.resume_live();
+        msm.consume(std::slice::from_ref(&miss), &sim);
         assert_eq!(msm.state().cast.throws_left, 1);
-        let upd = msm.consume(std::slice::from_ref(&catch), &sim);
+        msm.resume_live();
+        let upd = msm.consume(std::slice::from_ref(&miss), &sim);
         assert!(upd.turnover.is_some());
         assert_eq!(upd.turnover.unwrap().team, TeamSide::Away);
         assert!(upd.inning_end.is_some());
+    }
+
+    /// PART D — the down-burn bug fix, isolated: a completed pass (catch by
+    /// a TEAMMATE that does not clear a gate) does NOT burn a down, while a
+    /// failed throw (a missed throw, or a catch by an OPPONENT) does.
+    #[test]
+    fn completed_pass_keeps_down_failed_throw_burns_it() {
+        let mut msm = MatchStateMachine::new(RingEnd::PlusX, TeamSide::Home);
+        to_live(&mut msm);
+        // Possession is Home. A teammate (Home) catch short of a gate is a
+        // completed pass → cast continues, throws_left untouched.
+        let sim_team = make_sim(
+            5.0,
+            &["hp2"],
+            vec![
+                make_player("hp", TeamSide::Home),
+                make_player("hp2", TeamSide::Home),
+                make_player("ap", TeamSide::Away),
+            ],
+        );
+        msm.consume(&[SimEvent::BellCaught { by: "hp2".into() }], &sim_team);
+        assert_eq!(
+            msm.state().cast.throws_left,
+            3,
+            "completed pass to a teammate must NOT burn a down"
+        );
+        // A catch by an OPPONENT is a failed/contested throw → burns one.
+        msm.consume(&[SimEvent::BellCaught { by: "ap".into() }], &sim_team);
+        assert_eq!(
+            msm.state().cast.throws_left,
+            2,
+            "an opponent catch is a failed throw and spends a down"
+        );
+        // A missed throw also burns.
+        msm.resume_live();
+        msm.consume(&[SimEvent::BellMissed { end: RingEnd::PlusX }], &sim_team);
+        assert_eq!(msm.state().cast.throws_left, 1);
     }
 
     #[test]
@@ -808,11 +964,19 @@ mod tests {
             TeamSide::Home => "home-p",
             TeamSide::Away => "away-p",
         };
+        // RE-BASELINE (Part D): a turnover-by-cast-exhaustion must come from
+        // FAILED throws, not teammate catches. A `bell_caught` by a teammate
+        // is now a COMPLETED PASS that retains possession and does NOT burn
+        // a down (the down-burn bug fix). Three failed throws (`bell_missed`,
+        // which always burns) is the real way a cast turns the ball over;
+        // resumeLive re-arms the dead ball between misses like the runtime.
         let sim = make_sim(5.0, &[pid], vec![make_player(pid, team)]);
-        let catch = SimEvent::BellCaught { by: pid.into() };
-        msm.consume(std::slice::from_ref(&catch), &sim);
-        msm.consume(std::slice::from_ref(&catch), &sim);
-        msm.consume(std::slice::from_ref(&catch), &sim);
+        let miss = SimEvent::BellMissed { end: RingEnd::PlusX };
+        msm.consume(std::slice::from_ref(&miss), &sim);
+        msm.resume_live();
+        msm.consume(std::slice::from_ref(&miss), &sim);
+        msm.resume_live();
+        msm.consume(std::slice::from_ref(&miss), &sim);
     }
 
     #[test]
@@ -882,6 +1046,60 @@ mod tests {
             &sim,
         );
         assert_eq!(msm.state().winner, Some(spine_poss));
+        assert_eq!(msm.state().phase, MatchPhase::Final);
+    }
+
+    /// PART D — spine sudden-death default-win bug fix: a tied spine inning
+    /// that ends on a turnover (turnover-and-clear) must NOT default-win for
+    /// Away. The spine CONTINUES until a team actually scores; only then
+    /// does that team win.
+    #[test]
+    fn spine_turnover_continues_spine_then_score_wins() {
+        let mut msm = MatchStateMachine::new(RingEnd::PlusX, TeamSide::Home);
+        for i in 0..8 {
+            score_inning(
+                &mut msm,
+                if i % 2 == 0 { TeamSide::Home } else { TeamSide::Away },
+            );
+        }
+        turnover_inning(&mut msm); // tie after 9 → spine
+        assert!(msm.state().spine);
+        assert_eq!(msm.state().phase, MatchPhase::Spine);
+        assert!(msm.state().winner.is_none());
+
+        // A turnover in the (still-tied) spine inning: must NOT end the
+        // match — the old bug resolved `score_home > score_away` → false
+        // and handed Away a default win. Spine must CONTINUE.
+        turnover_inning(&mut msm);
+        assert!(
+            msm.state().winner.is_none(),
+            "a tied-spine turnover must not default-win the match"
+        );
+        assert!(msm.state().spine, "still spine");
+        assert_eq!(msm.state().phase, MatchPhase::Spine);
+        assert_eq!(msm.state().score_home, msm.state().score_away);
+
+        // Now a real score in spine decides it for the scorer.
+        to_live(&mut msm);
+        let poss = msm.state().possession;
+        let pid = match poss {
+            TeamSide::Home => "home-spx",
+            TeamSide::Away => "away-spx",
+        };
+        let end = match poss {
+            TeamSide::Home => RingEnd::PlusX,
+            TeamSide::Away => RingEnd::MinusX,
+        };
+        let sim = make_sim(0.0, &[pid], vec![make_player(pid, poss)]);
+        msm.consume(
+            &[SimEvent::BellThroughRing {
+                end,
+                touched: true,
+                loop_tier: LoopTier::None,
+            }],
+            &sim,
+        );
+        assert_eq!(msm.state().winner, Some(poss));
         assert_eq!(msm.state().phase, MatchPhase::Final);
     }
 

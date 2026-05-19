@@ -284,6 +284,163 @@ fn is_dive_committer(
     pack[0].id == player.id
 }
 
+/// PART C — DEFENSIVE CONTEST. The single committed contester of an
+/// OPPONENT-controlled bell, gated by the Director's `contest_commit`.
+///
+/// Active iff: the Director set `contest_commit` for our team, AND the
+/// opponent either holds the bell or just threw it (a loose bell thrown by
+/// an opponent — a pass we can pick / strip), AND this rigger wins a
+/// deterministic best-gap compare among our NON-grounded defenders that are
+/// reasonably near the ball. Exactly ONE contester (mirrors the
+/// `is_dive_committer` single-committer discipline: argmin gap, id
+/// tie-break). Returns `false` when the bell is OURS (the dive path owns
+/// that) so the two single-committer disciplines never overlap.
+/// Deterministic — pure geometry + canon predictor, no rng.
+fn is_contest_committer(
+    player: &PlayerSim,
+    state: &SimState,
+    m: &MatchState,
+    director: &DirectorState,
+) -> bool {
+    if !director.contest_commit {
+        return false;
+    }
+    // Who controls the bell? Held by an opponent, OR loose but thrown by an
+    // opponent (an opposing pass in flight we can contest / pick).
+    let opp_controls = match state.bell.held_by.as_deref() {
+        Some(hid) => state
+            .players
+            .iter()
+            .find(|p| p.id == hid)
+            .map(|p| p.team != player.team)
+            .unwrap_or(false),
+        None => match state.bell.thrown_by.as_deref() {
+            Some(tid) => state
+                .players
+                .iter()
+                .find(|p| p.id == tid)
+                .map(|p| p.team != player.team)
+                .unwrap_or(false),
+            None => false,
+        },
+    };
+    if !opp_controls {
+        return false;
+    }
+    // It must also be OUR cast-defense (we are not in possession).
+    if m.possession == player.team {
+        return false;
+    }
+    // Our eligible contesters: non-grounded teammates reasonably near the
+    // ball that are NOT themselves the bell carrier.
+    let near = 70.0_f64;
+    let mut pack: Vec<&PlayerSim> = state
+        .players
+        .iter()
+        .filter(|p| {
+            p.team == player.team
+                && state.bell.held_by.as_deref() != Some(p.id.as_str())
+                && vlen(vsub(state.bell.p, p.p)) < near
+        })
+        .collect();
+    if pack.is_empty() {
+        return false;
+    }
+    // Single committer: argmin predicted intercept gap, id tie-break —
+    // the exact deterministic discipline used by `is_dive_committer`.
+    pack.sort_by(|a, b| {
+        let ga = dive_intercept_gap(a.p, a.v, state);
+        let gb = dive_intercept_gap(b.p, b.v, state);
+        if (ga - gb).abs() > 1e-9 {
+            ga.partial_cmp(&gb).unwrap()
+        } else {
+            a.id.cmp(&b.id)
+        }
+    });
+    pack[0].id == player.id
+}
+
+/// PART C — the committed defender's lane-interception target + powered-hook
+/// fire. Reuses the SAME machinery as offense (no new predictor): for a
+/// HELD bell we solve the lane the carrier is most likely to pass into with
+/// `solve_lead_velocity` (the canon Coriolis lead solver) toward the
+/// opponent's best free receiver and drive to that interception point; for
+/// a LOOSE opponent-thrown bell we use `bell_rendezvous` (efe::roll_forward
+/// predictor) exactly like the dive. The anchor is fired downrange so the
+/// winch pulls us onto a contesting track. `snatch_vs_clatter` decides
+/// whether we commit catch_intent (go for the clean strip/snatch) or just
+/// disrupt (clatter); `grapple_risk` gates whether we fire the powered
+/// hook at all vs. close under free-flight + thrumbler. Deterministic.
+fn defensive_contest_input(
+    player: &PlayerSim,
+    state: &SimState,
+    profile: &TeamProfile,
+) -> (Vec3, Vec3, bool, bool) {
+    // (target, fire_anchor_dir_basis, want_catch_intent, fire_hook)
+    let want_catch = profile.snatch_vs_clatter >= 0.5;
+    let fire_hook = profile.grapple_risk >= 0.4;
+
+    if let Some(hid) = state.bell.held_by.clone() {
+        // Held by the carrier: solve the most dangerous outward pass lane
+        // (carrier → their best-separated teammate) with the canon lead
+        // solver and station on that interception point so a real pass
+        // runs into us (a played pick); failing a clean read, pressure the
+        // carrier directly (drives the sim's STRIP_PRESS mechanic).
+        let carrier = state.players.iter().find(|p| p.id == hid);
+        if let Some(carrier) = carrier {
+            // Their best outlet = the opposing teammate with the most
+            // open separation from us (deterministic argmax, id tie-break).
+            let mut best: Option<(&PlayerSim, f64)> = None;
+            for p in state.players.iter() {
+                if p.team != carrier.team || p.id == carrier.id {
+                    continue;
+                }
+                let sep = vlen(vsub(p.p, player.p));
+                let better = match best {
+                    None => true,
+                    Some((bp, bs)) => sep > bs || ((sep - bs).abs() < 1e-9 && p.id < bp.id),
+                };
+                if better {
+                    best = Some((p, sep));
+                }
+            }
+            if let Some((outlet, _)) = best {
+                // Canon Coriolis lead solver — the SAME one offense uses to
+                // lead a receiver. The interception point is where a pass
+                // to that outlet would actually fly.
+                if let Some(lr) = solve_lead_velocity(
+                    carrier.p,
+                    24.0, // ≈ a strong pass speed
+                    outlet.p,
+                    outlet.v,
+                    state.omega,
+                ) {
+                    let aim = vnorm(vsub(lr.intercept, player.p));
+                    return (lr.intercept, aim, want_catch, fire_hook);
+                }
+            }
+            // No readable lane: pressure the carrier (strip approach).
+            let aim = vnorm(vsub(carrier.p, player.p));
+            return (carrier.p, aim, want_catch, fire_hook);
+        }
+    }
+
+    // Loose opponent-thrown bell: rendezvous exactly like the dive
+    // (efe::roll_forward predictor) and contest the catch / pick it.
+    let (ip, bv) = bell_rendezvous(player, state);
+    let bspeed = vlen(bv);
+    let bvdir = if bspeed > 1e-3 {
+        vscale(bv, 1.0 / bspeed)
+    } else {
+        let t = vsub(ip, player.p);
+        let tl = vlen(t);
+        if tl > 1e-6 { vscale(t, 1.0 / tl) } else { Vec3::new(1.0, 0.0, 0.0) }
+    };
+    let aim = vnorm(vsub(ip, player.p));
+    let _ = bvdir;
+    (ip, aim, want_catch, fire_hook)
+}
+
 /// Predicted catch point AND the bell's velocity THERE. Same canon RK4 +
 /// skin-bounce predictor (`efe::roll_forward`) the recover/intercept path
 /// uses; the lead horizon is chosen deterministically so the rigger and the
@@ -821,6 +978,76 @@ pub fn compute_player_input(
                 catch_intent: true,
             };
         }
+    }
+
+    // ── PART C — DEFENSIVE CONTEST (active defense; consumes
+    // director.contest_commit) ───────────────────────────────────────────
+    // The Director computes `contest_commit` (director.rs should_contest)
+    // and, until now, NOTHING non-test read it — marking was a passive
+    // standoff and `snatch_vs_clatter` / `grapple_risk` drove no defensive
+    // action. Now: when the Director has committed us to a contest and the
+    // OPPONENT controls the bell (holds it or just threw it), the single
+    // deterministically-selected contester (is_contest_committer — argmin
+    // intercept gap, id tie-break, exactly one, mirroring the dive's
+    // single-committer discipline) solves a lane-interception point with
+    // the canon predictors (`solve_lead_velocity` for a held bell's
+    // outward pass lane / `bell_rendezvous` = efe::roll_forward for a loose
+    // pass — NO new predictor) and drives a POWERED-HOOK approach to
+    // contest the catch / press a strip. `snatch_vs_clatter` gates
+    // catch_intent (clean snatch vs. disrupt); `grapple_risk` gates firing
+    // the hook vs. closing under free-flight. This is the change that moves
+    // denial / turnover / pass-chain off the floor. Deterministic, no rng.
+    if is_contest_committer(player, state, m, director) {
+        let (tgt, aim0, want_catch, fire_hook) =
+            defensive_contest_input(player, state, profile);
+        let aim_dither = cache.value.as_ref().map(|c| c.aim_dither).unwrap_or_else(v3z);
+        let nav_aim = vnorm(vadd(aim0, aim_dither));
+        let to_tgt = vsub(tgt, player.p);
+        let gap = vlen(to_tgt);
+        let has_line = player.line.is_some();
+        // Fire the powered hook ONCE (commit-once, then ride physics —
+        // grapple latency locks it; mirrors the dive). Anchor downrange
+        // past the interception point so the winch drags us onto the
+        // contesting track. Only if grapple_risk clears the gate AND we
+        // have no line in flight/attached AND the target is far enough that
+        // a hook actually helps (close-in we just settle onto it).
+        let fire = if fire_hook && !has_line && gap > 12.0 {
+            let dir = if gap > 1e-6 { vscale(to_tgt, 1.0 / gap) } else { nav_aim };
+            let mut anchor = vadd(tgt, vscale(dir, 12.0));
+            let arho = (anchor.y * anchor.y + anchor.z * anchor.z).sqrt();
+            let max_r = REG_R - 1.0;
+            if arho > max_r && arho > 1e-6 {
+                let s = max_r / arho;
+                anchor.y *= s;
+                anchor.z *= s;
+            }
+            Some(anchor)
+        } else {
+            None
+        };
+        let reel_cmd: i32 = if has_line || fire.is_some() { -1 } else { 0 };
+        let pushoff = should_pushoff(player, tgt);
+        let thrumbler = if fire.is_none() && !has_line {
+            settle_thrumbler(player, tgt)
+        } else {
+            v3z()
+        };
+        return PlayerInput {
+            id: player.id.clone(),
+            aim: nav_aim,
+            fire_line_at: fire,
+            reel: reel_cmd,
+            release: false,
+            pushoff,
+            throw_charge: 0.0,
+            throw_released: false,
+            throw_spin: 0.0,
+            thrumbler,
+            // snatch_vs_clatter high ⇒ go for the clean strip/snatch (the
+            // sim widens the catch / strip envelope on catch_intent);
+            // low ⇒ just disrupt (clatter) without committing to the grab.
+            catch_intent: want_catch,
+        };
     }
 
     // Otherwise execute committed navigation toward the cached target.
