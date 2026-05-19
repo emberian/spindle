@@ -220,7 +220,7 @@ fn d2(a: Vec3, b: Vec3) -> f64 {
 }
 
 #[inline]
-fn norm3(v: Vec3) -> Vec3 {
+pub fn norm3(v: Vec3) -> Vec3 {
     let m = (v.x * v.x + v.y * v.y + v.z * v.z).sqrt();
     if m > 1e-9 {
         Vec3::new(v.x / m, v.y / m, v.z / m)
@@ -236,7 +236,7 @@ fn norm3(v: Vec3) -> Vec3 {
 /// relational pass head's teammate-k pick) consume the EXACT same slot
 /// ordering ⇒ "pass to teammate-k" addresses the same feature the policy
 /// saw. Pure: no rng, no clock.
-fn sorted_others<'a>(
+pub fn sorted_others<'a>(
     obs: &'a Observation,
     me: &ObsPlayer,
     self_id: &str,
