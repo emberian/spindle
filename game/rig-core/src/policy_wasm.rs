@@ -80,19 +80,50 @@ fn build_observation(
     mat: &MatchState,
     controlled_ids: &[String],
 ) -> Observation {
+    // Controlled side = the team of the controlled ids (default Home if
+    // none / mixed). Same inference the gym's `reward_side` makes.
+    let ctrl_side = if !controlled_ids.is_empty()
+        && controlled_ids.iter().all(|id| {
+            sim.players
+                .iter()
+                .find(|p| &p.id == id)
+                .map(|p| p.team == TeamSide::Away)
+                .unwrap_or(false)
+        }) {
+        TeamSide::Away
+    } else {
+        TeamSide::Home
+    };
+    // DERIVED Director hints — the SAME pure `obs_director_hints` the
+    // native gym uses (fixed baseline profile + fixed seeded rng), so the
+    // browser policy sees identical assignment/gate features to training.
+    let hints =
+        crate::ai::director::obs_director_hints(sim, mat, ctrl_side);
+
     let players = sim
         .players
         .iter()
-        .map(|p| ObsPlayer {
-            id: p.id.clone(),
-            team: team_code(p.team),
-            role: role_code(p.role),
-            p: p.p,
-            v: p.v,
-            // The frozen contract carries a static `anchorPos` + `restLen`
-            // when a line is out — the gym's `line_anchor`/`line_rest_len`.
-            line_anchor: p.line.as_ref().map(|l| l.anchor_pos),
-            line_rest_len: p.line.as_ref().map(|l| l.rest_len),
+        .map(|p| {
+            let assignment = hints
+                .assignments
+                .iter()
+                .find(|(id, _, _)| id == &p.id)
+                .map(|(_, job, mark)| crate::rl::policy::ObsAssignment {
+                    job: *job,
+                    mark_id: mark.clone(),
+                });
+            ObsPlayer {
+                id: p.id.clone(),
+                team: team_code(p.team),
+                role: role_code(p.role),
+                p: p.p,
+                v: p.v,
+                // The frozen contract carries a static `anchorPos` +
+                // `restLen` when a line is out.
+                line_anchor: p.line.as_ref().map(|l| l.anchor_pos),
+                line_rest_len: p.line.as_ref().map(|l| l.rest_len),
+                assignment,
+            }
         })
         .collect();
     Observation {
@@ -108,6 +139,8 @@ fn build_observation(
         phase: phase_code(mat.phase),
         players,
         controlled_ids: controlled_ids.to_vec(),
+        attack_sign: hints.attack_sign,
+        gate_plane_x: hints.gate_plane_x,
     }
 }
 

@@ -96,6 +96,35 @@ pub struct RewardConfig {
     /// Which side the controlled riggers' reward is scored FROM. If
     /// `None`, inferred from the first controlled id's roster team.
     pub reward_side: Option<TeamSide>,
+    /// OPTIONAL **potential-based reward shaping** discount γ.
+    ///
+    /// `None` (the DEFAULT) ⇒ shaping is entirely OFF and `Reward.total`
+    /// is byte-identical to before (production / `RewardConfig::default()`
+    /// is unchanged). `Some(γ)` ⇒ `total` gets an EXTRA additive term of
+    /// the strict Ng-Harada-Russell form `F = γ·Φ(s′) − Φ(s)`, where Φ is
+    /// the bounded potential `shaping_potential` (gate progress of the
+    /// possessing side, scored from the reward side, + completed-pass
+    /// progress). ONLY the learner sets this; the raw intrinsic
+    /// components (`possession_held`/`gate_advanced`/… ) are reported
+    /// UNCHANGED — shaping affects ONLY `total`.
+    ///
+    /// ── POLICY-INVARIANCE (why this cannot change the optimum) ───────
+    /// Ng, Harada & Russell (1999): for ANY potential Φ:S→ℝ, augmenting
+    /// the reward with `F(s,s′)=γ·Φ(s′)−Φ(s)` leaves the set of optimal
+    /// policies UNCHANGED, because over any trajectory the shaping
+    /// telescopes:  Σ_{t} γ^t F(s_t,s_{t+1}) = −Φ(s_0) + (boundary γ^T
+    /// Φ(s_T)) — it adds only a constant (the start-state potential, the
+    /// same for every policy from a fixed reset) plus a vanishing
+    /// terminal term, NOT any state-/action-dependent bias. So the
+    /// argmax over policies of the shaped return equals the argmax of the
+    /// pure-intrinsic return: the pure-intrinsic optimum is PRESERVED;
+    /// shaping only DENSIFIES the gradient (a non-zero per-step signal
+    /// toward gate/pass progress instead of the near-flat sparse reward).
+    /// It is therefore NOT a composite ranker / not a new objective —
+    /// the objective is still the pure intrinsic reward. We use the SAME
+    /// `γ` the learner's return uses so the telescoping is exact. Φ is
+    /// bounded (each component ∈ [0,1]) so F stays O(1) and finite.
+    pub shaping_gamma: Option<f64>,
 }
 
 impl Default for RewardConfig {
@@ -108,8 +137,37 @@ impl Default for RewardConfig {
             w_bell_out: 0.05,
             w_terminal: 1.0,
             reward_side: None,
+            // Shaping OFF by default ⇒ production `total` byte-unchanged.
+            shaping_gamma: None,
         }
     }
+}
+
+/// The bounded shaping potential Φ(state) ∈ roughly [-1, 2], scored from
+/// `r_side` (the reward side). PURE function of public match/bell state:
+///   * `gate_term`  = (cast gate ordinal / 2) ∈ {0, .5, 1}, SIGNED by
+///     whether the side that currently possesses is the reward side
+///     (+) or the opponent (−) — so driving the reward side's cast
+///     forward raises Φ, the opponent's lowers it;
+///   * `pass_term`  = min(pass_chain_len, CAP)/CAP ∈ [0,1] — completed
+///     in-possession pass progress (a longer kept chain = more Φ),
+///     SIGNED the same way (only meaningful while possessed).
+/// Bounded ⇒ `F=γΦ′−Φ` is O(1). No rng/clock; deterministic.
+fn shaping_potential(
+    gate_ord_val: i32,
+    possession_is_reward_side: bool,
+    pass_chain_len: usize,
+    possessed: bool,
+) -> f64 {
+    const PASS_CAP: f64 = 6.0;
+    let sign = if possession_is_reward_side { 1.0 } else { -1.0 };
+    let gate_term = sign * (gate_ord_val as f64 / 2.0);
+    let pass_term = if possessed {
+        sign * ((pass_chain_len as f64).min(PASS_CAP) / PASS_CAP)
+    } else {
+        0.0
+    };
+    gate_term + pass_term
 }
 
 /// Re-exported team discriminant for the reward side (the gym's own
@@ -213,6 +271,10 @@ pub struct Snapshot {
     scenario: Scenario,
     elapsed: u64,
     prev_gate_ord: i32,
+    /// Previous-step shaping potential Φ(s) (only used when
+    /// `reward_config.shaping_gamma` is `Some`; carried in the snapshot so
+    /// a restore continues the SAME shaped trajectory). Default 0.0.
+    prev_phi: f64,
     done: bool,
 }
 
@@ -299,6 +361,7 @@ pub struct RigEnv {
     scenario: Scenario,
     elapsed: u64,
     prev_gate_ord: i32,
+    prev_phi: f64,
     done: bool,
 }
 
@@ -315,6 +378,7 @@ impl RigEnv {
             scenario: Scenario::self_play(),
             elapsed: 0,
             prev_gate_ord: 0,
+            prev_phi: 0.0,
             done: false,
         }
     }
@@ -339,26 +403,53 @@ impl RigEnv {
     fn build_observation(&self) -> Observation {
         let snap = self.sim.snapshot();
         let ms = self.mat.state();
+
+        // DERIVED Director hints for the controlled side (the reward side
+        // — `controlled_ids`' team / inferred). Pure `run_director` over
+        // the public state with a fixed baseline profile + fixed seeded
+        // rng; IDENTICAL to the `policy_wasm` build so the policy sees the
+        // same assignment-conditioned features in training & inference.
+        let ctrl_ai_side = match self.reward_side() {
+            scoring::TeamSide::Home => ai::TeamSide::Home,
+            scoring::TeamSide::Away => ai::TeamSide::Away,
+        };
+        let ai_sim = conv::snap_to_ai(&snap);
+        let ai_match = conv::msm_to_ai(self.mat.state());
+        let hints = crate::ai::director::obs_director_hints(
+            &ai_sim, &ai_match, ctrl_ai_side,
+        );
+
         let players = snap
             .players
             .iter()
-            .map(|p| ObsPlayer {
-                id: p.id.clone(),
-                team: match p.team {
-                    crate::sim_world::TeamSide::Home => 0,
-                    crate::sim_world::TeamSide::Away => 1,
-                },
-                role: match p.role {
-                    crate::sim_world::RiggerRole::Anchor => 0,
-                    crate::sim_world::RiggerRole::Spinner => 1,
-                    crate::sim_world::RiggerRole::Faithwing => 2,
-                    crate::sim_world::RiggerRole::Freewing => 3,
-                    crate::sim_world::RiggerRole::Reach => 4,
-                },
-                p: p.p,
-                v: p.v,
-                line_anchor: p.line_anchor,
-                line_rest_len: p.line_rest_len,
+            .map(|p| {
+                let assignment = hints
+                    .assignments
+                    .iter()
+                    .find(|(id, _, _)| id == &p.id)
+                    .map(|(_, job, mark)| crate::rl::policy::ObsAssignment {
+                        job: *job,
+                        mark_id: mark.clone(),
+                    });
+                ObsPlayer {
+                    id: p.id.clone(),
+                    team: match p.team {
+                        crate::sim_world::TeamSide::Home => 0,
+                        crate::sim_world::TeamSide::Away => 1,
+                    },
+                    role: match p.role {
+                        crate::sim_world::RiggerRole::Anchor => 0,
+                        crate::sim_world::RiggerRole::Spinner => 1,
+                        crate::sim_world::RiggerRole::Faithwing => 2,
+                        crate::sim_world::RiggerRole::Freewing => 3,
+                        crate::sim_world::RiggerRole::Reach => 4,
+                    },
+                    p: p.p,
+                    v: p.v,
+                    line_anchor: p.line_anchor,
+                    line_rest_len: p.line_rest_len,
+                    assignment,
+                }
             })
             .collect();
         Observation {
@@ -378,7 +469,27 @@ impl RigEnv {
             phase: phase_code(ms.phase),
             players,
             controlled_ids: self.scenario.controlled_ids.clone(),
+            attack_sign: hints.attack_sign,
+            gate_plane_x: hints.gate_plane_x,
         }
+    }
+
+    /// The shaping potential Φ of the CURRENT state, scored from the
+    /// reward side. Pure read of the live triad (gate ordinal,
+    /// possession team, bell pass-chain length, possessed flag). Used
+    /// only when `reward_config.shaping_gamma` is `Some`.
+    fn current_phi(&self) -> f64 {
+        let r_side = self.reward_side();
+        let ms = self.mat.state();
+        let snap = self.sim.snapshot();
+        let possession_is_reward =
+            team_scoring_to_gym(ms.possession) == team_scoring_to_gym(r_side);
+        shaping_potential(
+            gate_ord(ms.cast.gate),
+            possession_is_reward,
+            snap.bell.pass_chain.len(),
+            snap.bell.held_by.is_some(),
+        )
     }
 }
 
@@ -443,6 +554,10 @@ impl Env for RigEnv {
         self.scenario = scenario.clone();
         self.elapsed = 0;
         self.prev_gate_ord = gate_ord(self.mat.state().cast.gate);
+        // Φ(s_0): the start-state potential. Always computed (cheap); only
+        // CONSUMED in `step` when shaping is enabled — so the default path
+        // is byte-unchanged.
+        self.prev_phi = self.current_phi();
         self.done = self.mat.state().winner.is_some();
         self.build_observation()
     }
@@ -573,12 +688,37 @@ impl Env for RigEnv {
             None => 0.0,
         };
 
-        let total = cfg.w_possession * possession_held
+        let intrinsic_total = cfg.w_possession * possession_held
             + cfg.w_gate * gate_advanced
             + cfg.w_score * scored
             + cfg.w_contest * contest_won
             + cfg.w_bell_out * bell_out_this_step
             + terminal;
+
+        // ── OPTIONAL potential-based shaping (policy-invariant) ────────
+        // `total` = intrinsic + (γ·Φ(s′) − Φ(s)) IFF shaping is enabled;
+        // otherwise `total` is the byte-unchanged intrinsic sum. Φ(s′) is
+        // read on the post-consume, PRE-rearm state (the same point the
+        // post-step possession/gate signals are read), Φ(s) is the value
+        // carried from the previous step (`prev_phi`). The raw intrinsic
+        // components below are reported UNCHANGED — shaping touches only
+        // `total`. The telescoping sum makes this provably leave the
+        // pure-intrinsic optimum unchanged (see `RewardConfig`).
+        let total = match cfg.shaping_gamma {
+            Some(gamma) => {
+                let phi_s = self.prev_phi;
+                let phi_next = self.current_phi();
+                self.prev_phi = phi_next;
+                intrinsic_total + (gamma * phi_next - phi_s)
+            }
+            None => {
+                // Keep `prev_phi` tracking the live state even when OFF so
+                // toggling on mid-episode (tests) stays well-defined; this
+                // does NOT affect `total` (production path byte-unchanged).
+                self.prev_phi = self.current_phi();
+                intrinsic_total
+            }
+        };
 
         let reward = Reward {
             possession_held,
@@ -633,6 +773,7 @@ impl Env for RigEnv {
             scenario: self.scenario.clone(),
             elapsed: self.elapsed,
             prev_gate_ord: self.prev_gate_ord,
+            prev_phi: self.prev_phi,
             done: self.done,
         }
     }
@@ -645,6 +786,7 @@ impl Env for RigEnv {
         self.scenario = s.scenario.clone();
         self.elapsed = s.elapsed;
         self.prev_gate_ord = s.prev_gate_ord;
+        self.prev_phi = s.prev_phi;
         self.done = s.done;
         // Rebuild the (non-state) team configs from the restored scenario.
         self.cfgs = vec![
@@ -678,6 +820,99 @@ mod tests {
             controlled_ids: controlled.iter().map(|s| s.to_string()).collect(),
             max_ticks,
             reward_config: RewardConfig::default(),
+        }
+    }
+
+    /// Φ POLICY-INVARIANCE (the written proof, as an executable check).
+    /// For ANY fixed trajectory the discounted shaping sum telescopes:
+    ///   Σ_{t=0}^{T-1} γ^t (γ·Φ(s_{t+1}) − Φ(s_t))
+    ///     = −Φ(s_0) + γ^T·Φ(s_T)
+    /// — it adds ONLY the start-state constant −Φ(s_0) (identical for
+    /// every policy from a fixed reset) plus a vanishing γ^T boundary
+    /// term, NO state-/action-dependent bias. So the shaped return ranks
+    /// policies identically to the pure-intrinsic return ⇒ the
+    /// pure-intrinsic optimum is preserved. This asserts the identity to
+    /// f64 tolerance over a deterministic Φ sequence — a pure unit check,
+    /// NO env/trainer.
+    #[test]
+    fn potential_shaping_telescopes_policy_invariant() {
+        let gamma = 0.997_f64;
+        // An arbitrary deterministic bounded Φ sequence (the shape of Φ
+        // is irrelevant to invariance — telescoping holds for ANY Φ).
+        let phi: Vec<f64> = (0..64)
+            .map(|i| ((i as f64 * 0.37).sin() + 0.25 * ((i % 5) as f64)))
+            .collect();
+        let mut discounted_sum = 0.0_f64;
+        for t in 0..phi.len() - 1 {
+            let f = gamma * phi[t + 1] - phi[t];
+            discounted_sum += gamma.powi(t as i32) * f;
+        }
+        let closed_form = -phi[0]
+            + gamma.powi((phi.len() - 1) as i32) * phi[phi.len() - 1];
+        assert!(
+            (discounted_sum - closed_form).abs() < 1e-9,
+            "shaping must telescope to a policy-independent constant: \
+             {discounted_sum} vs {closed_form}"
+        );
+        // And `shaping_potential` itself is bounded + sign-correct: the
+        // reward side advancing its cast raises Φ; the opponent lowers it.
+        let mine = shaping_potential(2, true, 4, true);
+        let theirs = shaping_potential(2, false, 4, true);
+        assert!(mine > 0.0 && theirs < 0.0 && mine == -theirs);
+        assert!(mine.abs() <= 2.0, "Φ must stay bounded/O(1)");
+    }
+
+    /// Shaping is DEFAULT-OFF and byte-unchanged: with the production
+    /// `RewardConfig::default()` (shaping_gamma = None) every step's
+    /// `total` is bit-identical to the explicit pure-intrinsic sum; and
+    /// turning shaping ON changes `total` while leaving every raw
+    /// intrinsic component bit-identical.
+    #[test]
+    fn shaping_default_off_and_only_affects_total() {
+        let base = scen(&[], 200);
+        assert!(base.reward_config.shaping_gamma.is_none());
+
+        let mut off = RigEnv::new();
+        off.reset(123, &base);
+        let mut on_env = RigEnv::new();
+        let mut on_sc = scen(&[], 200);
+        on_sc.reward_config.shaping_gamma = Some(0.997);
+        on_env.reset(123, &on_sc);
+
+        for _ in 0..200 {
+            let so = off.step(&[]);
+            let sn = on_env.step(&[]);
+            // DEFAULT path: total == the explicit intrinsic weighted sum.
+            let c = base.reward_config;
+            let recomputed = c.w_possession * so.reward.possession_held
+                + c.w_gate * so.reward.gate_advanced
+                + c.w_score * so.reward.scored
+                + c.w_contest * so.reward.contest_won
+                + c.w_bell_out * so.reward.bell_out
+                + so.reward.terminal;
+            assert_eq!(
+                so.reward.total.to_bits(),
+                recomputed.to_bits(),
+                "default (shaping off) total must be the pure intrinsic sum"
+            );
+            // Raw components are reported UNCHANGED whether shaping is on.
+            assert_eq!(
+                so.reward.possession_held.to_bits(),
+                sn.reward.possession_held.to_bits()
+            );
+            assert_eq!(
+                so.reward.gate_advanced.to_bits(),
+                sn.reward.gate_advanced.to_bits()
+            );
+            assert_eq!(so.reward.scored.to_bits(), sn.reward.scored.to_bits());
+            assert_eq!(
+                so.reward.contest_won.to_bits(),
+                sn.reward.contest_won.to_bits()
+            );
+            assert!(sn.reward.total.is_finite());
+            if so.done || sn.done {
+                break;
+            }
         }
     }
 
