@@ -75,7 +75,7 @@ use crate::math::Vec3;
 use crate::planner::Rollout;
 
 // ── Canonical __rigtune defaults (mirrors planner.rs; kept in sync) ──────────
-pub(crate) const W_MOM: f64 = 0.6;
+pub(crate) const W_MOM: f64 = 2.5;
 pub(crate) const W_SPACE: f64 = 0.0;
 pub(crate) const DEFENDER_DANGER: f64 = 6.0;
 

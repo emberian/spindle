@@ -21,8 +21,8 @@ use crate::tuning::{L, R};
 /// Swoop release gate — canonical defaults (the TS `__rigtune` knobs are a
 /// dev-only runtime affordance; the native kernel takes fixed params, with
 /// tunables to be threaded explicitly when the optimizer moves to Rust).
-pub const SWOOP_MIN_V: f64 = 8.0;
-pub const SWOOP_ALIGN: f64 = 0.6;
+pub const SWOOP_MIN_V: f64 = 5.0;
+pub const SWOOP_ALIGN: f64 = 0.3;
 
 #[derive(Clone, Copy, Debug)]
 pub struct Rollout {
@@ -99,11 +99,15 @@ pub fn rollout_primitive(
 
     let to_t = target.sub(p);
     let dl = to_t.len();
-    let term = if dl > 1e-6 {
+    let aligned = if dl > 1e-6 {
         v.dot(to_t.scale(1.0 / dl)).max(0.0)
     } else {
         0.0
     };
+    // Blend aligned speed with raw speed — reward momentum even if not perfectly aimed
+    // (Coriolis will curve the trajectory, and fast players can re-grapple to correct)
+    let raw_speed = v.len();
+    let term = aligned + 0.15 * raw_speed;
     Rollout { p, v, min_dist, term }
 }
 
@@ -247,7 +251,7 @@ pub struct Plan {
 }
 
 // ── Canonical __rigtune defaults (TS GrapplePlanner.ts:180-211) ──────────────
-const W_MOM: f64 = 0.6; // TS W_MOM_D
+const W_MOM: f64 = 2.5; // TS W_MOM_D — raised to make swing momentum competitive
 const W_SPACE: f64 = 0.0; // TS tune('wSpace', 0) default
 const RRT_REPLAN: f64 = 30.0; // TS tune('rrtReplan', 30) default
 
@@ -1685,8 +1689,8 @@ fn build_coord_anchors(
 // moving body — the coordination texture we want. The bonus is bounded so it
 // biases selection toward a teammate relay WHEN it genuinely advances the
 // traverse, without ever swamping the primary min_dist objective (tens of m).
-const RELAY_W_TEAM: f64 = 14.0; // slingshot off a teammate (fast traverse / set-up)
-const RELAY_W_OPP: f64 = 9.0; // tether/contest an opponent on the lane
+const RELAY_W_TEAM: f64 = 56.0; // slingshot off a teammate (fast traverse / set-up)
+const RELAY_W_OPP: f64 = 32.0; // tether/contest an opponent on the lane
 const RELAY_MIN_GAIN: f64 = 6.0; // anchor must shorten the to-target gap by ≥ this
 
 /// Negative cost (a bonus) for using a moving BODY as a relay anchor. Pure
@@ -2268,7 +2272,9 @@ pub fn plan_grapple(
         let (pd_r, c_r) = score_plan(*spar, -1);
         candidates.push((*spar, -1, pd_r, true, c_r));
         let (pd_s, c_s) = score_plan(*spar, 0);
-        candidates.push((*spar, 0, pd_s, true, c_s));
+        // Swing bias: free-swings build momentum that pays off over multiple hops.
+        // Give them a fixed discount so they can compete with straight winches.
+        candidates.push((*spar, 0, pd_s, true, c_s - 4.0));
     }
 
     // Candidate 2: skin anchor (TS GP.ts:766-782). Predicate + point are

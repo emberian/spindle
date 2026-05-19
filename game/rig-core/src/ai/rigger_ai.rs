@@ -2047,45 +2047,43 @@ fn navigate_to(
         reel: commit.last_anchor_reel,
     });
 
-    // ── GRAPPLE COMMITMENT: if we have an active taut line and our swing
-    // is making progress toward the target, RIDE THE ARC instead of
-    // re-planning every tick. This eliminates micro-jitter from perpetual
-    // re-planning around a moving optimal anchor.
+    // ── GRAPPLE COMMITMENT: if we have an active attached line and our
+    // swing is making progress toward the target, RIDE THE ARC instead
+    // of re-planning every tick. Only for ACTIVE WINCH (reel=-1) — a
+    // free swing (reel=0) needs to flow through to the swoop release
+    // check to decide when to release.
     if let Some(line) = &player.line {
         if line.taut {
-            let to_target = vsub(target, player.p);
-            let dist = vlen(to_target);
-            let speed = vlen(player.v);
-            // "Making progress" = closing on target at a reasonable rate.
-            let closing = if dist > 1e-6 && speed > 1e-6 {
-                vdot(player.v, to_target) / (speed * dist)
-            } else {
-                0.0
-            };
-
-            // Ride the arc if: we're closing on target (align > 0.1),
-            // OR we're far and fast (momentum-rich — let it play out),
-            // AND target hasn't jumped dramatically from what we planned for.
-            let target_stable = match commit.last_anchor_pos {
-                Some(ap) => vlen(vsub(target, ap)) < 60.0,
-                None => false,
-            };
-
-            if target_stable && (closing > 0.1 || (speed > 10.0 && dist > 20.0)) {
-                // Keep riding the current swing. Don't replan.
-                let reel = commit.last_anchor_reel;
-                let aim = if dist > 1e-6 {
-                    vnorm(to_target)
+            // Only commit on reel=-1 (active winch). Free swings (reel=0)
+            // must flow through to the release check below.
+            let currently_winching = commit.last_anchor_reel == -1;
+            if currently_winching {
+                let to_target = vsub(target, player.p);
+                let dist = vlen(to_target);
+                let speed = vlen(player.v);
+                let closing = if dist > 1e-6 && speed > 1e-6 {
+                    vdot(player.v, to_target) / (speed * dist)
                 } else {
-                    Vec3::new(1.0, 0.0, 0.0)
+                    0.0
                 };
-                return PartialInput {
-                    aim: Some(aim),
-                    fire_line_at: Some(None), // don't re-fire
-                    reel: Some(reel),
-                    release: Some(false),
-                    pushoff: Some(false),
+                let target_stable = match commit.last_anchor_pos {
+                    Some(ap) => vlen(vsub(target, ap)) < 60.0,
+                    None => false,
                 };
+                if target_stable && (closing > 0.1 || (speed > 10.0 && dist > 20.0)) {
+                    let aim = if dist > 1e-6 {
+                        vnorm(to_target)
+                    } else {
+                        Vec3::new(1.0, 0.0, 0.0)
+                    };
+                    return PartialInput {
+                        aim: Some(aim),
+                        fire_line_at: Some(None),
+                        reel: Some(-1),
+                        release: Some(false),
+                        pushoff: Some(false),
+                    };
+                }
             }
         }
     }
@@ -2147,6 +2145,7 @@ fn navigate_to(
 
                         if (speed_ok && align_ok) || momentum_release {
                             commit.last_anchor_pos = None;
+                            commit.last_anchor_reel = -1; // Reset so next tick replans fresh
                             let soar_aim = vnorm(player.v);
                             let mut pi = plan_to_input(None, soar_aim);
                             pi.release = Some(true);
