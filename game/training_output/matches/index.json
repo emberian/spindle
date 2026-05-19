@@ -1,0 +1,95 @@
+[
+  {
+    "id": "gen4_seed1234",
+    "gen": 4,
+    "home_policy": "trained_gen4",
+    "away_policy": "population_best",
+    "score_home": 3,
+    "score_away": 2,
+    "winner": "home",
+    "ticks": 6400,
+    "seed": 1234,
+    "snapshot_positions": [
+      {"home": [[-40,-20],[-20,30],[10,-40],[35,15]], "away": [[40,20],[20,-30],[-10,40],[-35,-15]], "bell": [5,3]},
+      {"home": [[-35,-18],[-15,28],[12,-38],[38,18]], "away": [[38,18],[18,-28],[-8,38],[-32,-12]], "bell": [8,5]},
+      {"home": [[-30,-15],[-10,25],[15,-35],[40,20]], "away": [[35,15],[15,-25],[-5,35],[-30,-10]], "bell": [12,8]}
+    ]
+  },
+  {
+    "id": "gen4_seed1235",
+    "gen": 4,
+    "home_policy": "trained_gen4",
+    "away_policy": "population_random",
+    "score_home": 1,
+    "score_away": 4,
+    "winner": "away",
+    "ticks": 7200,
+    "seed": 1235,
+    "snapshot_positions": [
+      {"home": [[-50,-10],[-30,20],[0,-50],[25,5]], "away": [[50,10],[30,-20],[0,50],[-25,-5]], "bell": [-10,15]},
+      {"home": [[-45,-8],[-25,18],[5,-45],[28,8]], "away": [[45,8],[25,-18],[5,45],[-22,-2]], "bell": [-5,18]}
+    ]
+  },
+  {
+    "id": "gen8_seed1234",
+    "gen": 8,
+    "home_policy": "trained_gen8",
+    "away_policy": "population_best",
+    "score_home": 5,
+    "score_away": 3,
+    "winner": "home",
+    "ticks": 8000,
+    "seed": 1234,
+    "snapshot_positions": [
+      {"home": [[-30,-25],[-10,35],[20,-30],[45,10]], "away": [[30,25],[10,-35],[-20,30],[-45,-10]], "bell": [0,0]},
+      {"home": [[-25,-22],[-5,32],[22,-28],[48,12]], "away": [[28,22],[8,-32],[-18,28],[-42,-8]], "bell": [3,2]},
+      {"home": [[-20,-18],[0,28],[25,-25],[50,15]], "away": [[25,18],[5,-28],[-15,25],[-38,-5]], "bell": [8,5]}
+    ]
+  },
+  {
+    "id": "gen8_seed1235",
+    "gen": 8,
+    "home_policy": "trained_gen8",
+    "away_policy": "population_random",
+    "score_home": 4,
+    "score_away": 4,
+    "winner": null,
+    "ticks": 8000,
+    "seed": 1235,
+    "snapshot_positions": [
+      {"home": [[-35,-15],[-15,25],[10,-40],[35,20]], "away": [[35,15],[15,-25],[-10,40],[-35,-20]], "bell": [0,10]},
+      {"home": [[-32,-12],[-12,22],[13,-37],[38,22]], "away": [[32,12],[12,-22],[-7,37],[-32,-17]], "bell": [2,12]}
+    ]
+  },
+  {
+    "id": "gen12_seed1234",
+    "gen": 12,
+    "home_policy": "trained_gen12",
+    "away_policy": "population_best",
+    "score_home": 6,
+    "score_away": 2,
+    "winner": "home",
+    "ticks": 7800,
+    "seed": 1234,
+    "snapshot_positions": [
+      {"home": [[-20,-30],[0,40],[30,-20],[50,5]], "away": [[20,30],[0,-40],[-30,20],[-50,-5]], "bell": [10,-5]},
+      {"home": [[-15,-28],[5,38],[32,-18],[52,8]], "away": [[18,28],[-2,-38],[-28,18],[-48,-2]], "bell": [15,-2]},
+      {"home": [[-10,-25],[10,35],[35,-15],[55,10]], "away": [[15,25],[-5,-35],[-25,15],[-45,0]], "bell": [20,0]}
+    ]
+  },
+  {
+    "id": "gen12_seed1236",
+    "gen": 12,
+    "home_policy": "trained_gen12",
+    "away_policy": "population_oldest",
+    "score_home": 7,
+    "score_away": 1,
+    "winner": "home",
+    "ticks": 5200,
+    "seed": 1236,
+    "snapshot_positions": [
+      {"home": [[-15,-20],[5,30],[25,-25],[45,15]], "away": [[60,20],[40,-30],[-50,40],[-55,-15]], "bell": [0,5]},
+      {"home": [[-10,-18],[10,28],[28,-22],[48,18]], "away": [[55,18],[35,-28],[-45,38],[-50,-12]], "bell": [5,8]}
+    ]
+  }
+]
