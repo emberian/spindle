@@ -81,6 +81,15 @@ mod wasm;
 // is preserved by construction — see gym.rs for the argument.
 #[cfg(not(target_arch = "wasm32"))]
 mod gym;
+// THE RL AGENT (drop 1): a shared-parameter deterministic MLP policy + a
+// seeded gradient-free CEM trainer driving the gym (fitness = the gym's
+// PURE intrinsic Reward, NO shaping), plus an OFFLINE strategy judge for
+// post-hoc validation (never reward/fitness). NATIVE-ONLY, gated out of
+// the wasm cdylib EXACTLY like gym / coord_learner / skill_eval / ga (it
+// reuses gym::RigEnv + rand/rand_chacha/rayon, no new deps). It does NOT
+// wire a policy into the browser cdylib — that is a deliberate phase 2.
+#[cfg(not(target_arch = "wasm32"))]
+mod rl;
 
 use wasm_bindgen::prelude::*;
 
