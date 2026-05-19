@@ -1,0 +1,190 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The Training Plan — curriculum, league play, and honest swarm behavior</title>
+<meta name="description" content="How RIG should train interesting swarm behavior: curriculum first, primitive baseline as scaffolding, PyTorch/JAX learning over a deterministic Rust gym, and league-style evaluation.">
+<link rel="canonical" href="https://emberian.github.io/spindle/explainer/training.html">
+<meta property="og:type" content="article">
+<meta property="og:title" content="The Training Plan — curriculum, league play, and honest swarm behavior">
+<meta property="og:description" content="The serious path for RIG learning: drills before self-play, tactical actions before raw chaos, and a league that rewards useful variety.">
+<meta property="og:image" content="https://emberian.github.io/spindle/explainer/og.svg">
+<meta property="og:url" content="https://emberian.github.io/spindle/explainer/training.html">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="The Training Plan — RIG">
+<meta name="twitter:description" content="Curriculum, role conditioning, league play, and a candid reset of what the current swarm learner can and cannot do.">
+<meta name="twitter:image" content="https://emberian.github.io/spindle/explainer/og.svg">
+<link rel="stylesheet" href="explainer.css">
+</head>
+<body>
+<div class="stars"></div><div class="glow"></div>
+
+<header class="site"><div class="wrap">
+  <a class="brand" href="index.html">R<b>I</b>G</a>
+  <nav class="site">
+    <a href="index.html">What is RIG</a>
+    <a href="sport.html">The Sport</a>
+    <a href="physics.html">The Physics</a>
+    <a href="swarm.html">The Swarm</a>
+    <a href="learning.html">Watching It Learn</a>
+    <a href="training.html" aria-current="page">Training Plan</a>
+    <a href="tech.html">How It's Built</a>
+    <a href="vision.html">Why</a>
+  </nav>
+</div></header>
+
+<main><div class="wrap">
+
+<section>
+  <span class="tag">Training plan</span>
+  <h1>The goal is not motion. The goal is readable team play.</h1>
+  <p class="lede">RIG already has the rare part: a deterministic game that can replay a swarm's choices frame-for-frame. The learning plan has to respect what the arena is actually asking for. Four agents need to learn timing, spacing, possession, defense, and when a pass is worth more than a safe hold. That is too much to ask from one cold start self-play run.</p>
+  <p>The current baseline AI is useful as scaffolding, but it is not an expert. It is a hand-built controller with primitive habits, not a source of polished sport wisdom. Training should borrow its low-level mechanics where they help, then outgrow it.</p>
+</section>
+
+<section>
+  <h2>Start with a curriculum</h2>
+  <p>A good swarm should be taught in stages, because the full game hides the signal. If the first lesson is four-on-four adversarial play, the learner can get rewarded for the easiest stable behavior: keep the bell, avoid risk, and never learn how to advance the cast.</p>
+
+  <ol class="ladder">
+    <li>
+      <b>Move and catch</b>
+      <span>Single-rigger drills: grapple, brake, recover, catch a free bell, avoid the skin.</span>
+    </li>
+    <li>
+      <b>Pass with a receiver</b>
+      <span>Two-rigger drills where the useful action is a lead pass, not a throw at the teammate's current body.</span>
+    </li>
+    <li>
+      <b>Advance the cast</b>
+      <span>Small-sided possession tasks where reward is signed field progress through the gates, not raw pass count.</span>
+    </li>
+    <li>
+      <b>Play baseline teams</b>
+      <span>Four learned riggers against the hand-built side, using fixed seeds so every improvement is comparable.</span>
+    </li>
+    <li>
+      <b>Enter the league</b>
+      <span>Self-play only after the team can already move the bell with purpose.</span>
+    </li>
+  </ol>
+</section>
+
+<section>
+  <h2>Raise the action level</h2>
+  <p>Raw aim/reel/fire controls are expressive, but they make the learner discover basic piloting and team tactics at the same time. That is a slow way to get an interesting sport. A better split is tactical intent from the learner, low-level execution from controllers.</p>
+
+  <div class="grid">
+    <div class="card">
+      <h3>Policy chooses intent</h3>
+      <p>Carry, receive, lead-pass to space, mark, screen, recover, pressure, or hold shape.</p>
+    </div>
+    <div class="card">
+      <h3>Controller executes motion</h3>
+      <p>The existing grappling controller can turn intent into line targets, reel choices, catch posture, and throws.</p>
+    </div>
+    <div class="card">
+      <h3>End-to-end remains possible</h3>
+      <p>Once tactics work, lower-level residual actions can let the learner improve on the controller instead of being trapped by it.</p>
+    </div>
+  </div>
+
+  <blockquote class="pull">Do not make the swarm rediscover hands before it learns the sport.</blockquote>
+</section>
+
+<section>
+  <h2>Use the baseline carefully</h2>
+  <p>The baseline AI is valuable because it knows how to produce legal-ish inputs and keep the match moving. It is not valuable because it plays RIG beautifully. That distinction matters.</p>
+
+  <ul class="clean">
+    <li><b>Good use:</b> behavior cloning for basic mechanics, warm starts, and a stable opponent in early drills.</li>
+    <li><b>Bad use:</b> treating the baseline as an expert demonstration of scoring strategy.</li>
+    <li><b>Best use:</b> let the learner imitate enough to stand up, then reward it for beating and surpassing the scaffold.</li>
+  </ul>
+</section>
+
+<section>
+  <h2>Train with real gradients</h2>
+  <p>The current native learner proves the loop exists, but evolution strategies over a 24k-parameter attention actor and a 34k-parameter critic are not the serious scaling path. The Rust simulator should do what it is best at: fast, deterministic rollout. PyTorch or JAX should do what they are best at: backpropagation, optimizers, batching, recurrent policies, and diagnostics.</p>
+
+  <figure>
+    <svg viewBox="0 0 760 230" role="img" aria-label="Training stack: Rust gym emits rollouts, Python learner updates policy, browser loads actor weights">
+      <g font-family="ui-sans-serif,system-ui,sans-serif" font-size="14" font-weight="700">
+        <rect x="35" y="70" width="190" height="82" rx="10" fill="#1b1f29" stroke="#1aa6b7"/>
+        <text x="130" y="104" text-anchor="middle" fill="#f4f1ea">Rust gym</text>
+        <text x="130" y="126" text-anchor="middle" fill="#6b7079" font-size="12">deterministic rollout</text>
+
+        <rect x="285" y="70" width="190" height="82" rx="10" fill="#1b1f29" stroke="#d4602a"/>
+        <text x="380" y="104" text-anchor="middle" fill="#f4f1ea">PyTorch / JAX</text>
+        <text x="380" y="126" text-anchor="middle" fill="#6b7079" font-size="12">MAPPO, IPPO, PPO</text>
+
+        <rect x="535" y="70" width="190" height="82" rx="10" fill="#1b1f29" stroke="#1aa6b7"/>
+        <text x="630" y="104" text-anchor="middle" fill="#f4f1ea">Browser actor</text>
+        <text x="630" y="126" text-anchor="middle" fill="#6b7079" font-size="12">watchable wasm policy</text>
+
+        <path d="M225 111 H285" stroke="#262b36" stroke-width="3"/>
+        <path d="M475 111 H535" stroke="#262b36" stroke-width="3"/>
+        <path d="M630 152 C630 198 130 198 130 152" stroke="#262b36" stroke-width="2" fill="none" stroke-dasharray="5 7"/>
+        <text x="380" y="205" text-anchor="middle" fill="#6b7079" font-size="12">export actor weights, replay on identical seeds</text>
+      </g>
+    </svg>
+    <figcaption>The clean split: compiled deterministic sim for data, ML framework for learning, wasm for watching.</figcaption>
+  </figure>
+</section>
+
+<section>
+  <h2>Reward field progress, not hoarding</h2>
+  <p>Keep-away is not a mysterious failure mode. It is the obvious basin when possession and pass chains are easier than scoring. The dense signal should point toward useful possession: advancing the cast, creating a catchable lead, breaking pressure, and turning defense into field position.</p>
+
+  <div class="callout">
+    <b>Rule of thumb:</b> a pass should be rewarded because it creates an advantage, not because the counter went up.
+  </div>
+</section>
+
+<section>
+  <h2>Make a league, not one champion</h2>
+  <p>A single best policy is not enough for an adversarial sport. It can overfit to the opponent it sees most and forget how to handle older tricks. A league keeps pressure on the swarm from multiple directions: main agents, exploiters, older snapshots, and style-diverse teams.</p>
+
+  <div class="grid">
+    <div class="card">
+      <h3>Main agents</h3>
+      <p>Train against the full distribution and carry the current best general game.</p>
+    </div>
+    <div class="card">
+      <h3>Exploiters</h3>
+      <p>Hunt weaknesses in the main agent so fragile habits get exposed early.</p>
+    </div>
+    <div class="card">
+      <h3>Archive teams</h3>
+      <p>Preserve old and weird strategies so progress does not collapse into one local style.</p>
+    </div>
+  </div>
+</section>
+
+<section>
+  <h2>Judge interesting behavior directly</h2>
+  <p>Winning still matters. But for a watchable swarm, the dashboard should also show what kind of policy is emerging: gate clears, successful lead passes, interceptions, pressure breaks, time-to-shot, possession value, spacing, and diversity of solutions. That is where MAP-Elites-style archives fit: not as the reward, but as a way to keep several high-performing behaviors alive.</p>
+
+  <blockquote class="pull">The scoreboard says who won. The archive says what kind of team they became.</blockquote>
+
+  <div class="cta">
+    <a class="btn btn-primary" href="learning.html">Back to watching it learn</a>
+    <a class="btn btn-ghost" href="tech.html">How the stack works →</a>
+  </div>
+</section>
+
+</div></main>
+
+<footer class="site"><div class="wrap">
+  <div class="row">
+    <a href="index.html">What is RIG</a><a href="sport.html">The Sport</a>
+    <a href="physics.html">The Physics</a><a href="swarm.html">The Swarm</a>
+    <a href="learning.html">Watching It Learn</a><a href="training.html">Training Plan</a>
+    <a href="tech.html">How It's Built</a><a href="vision.html">Why</a><a href="../">Watch live</a>
+  </div>
+  RIG — a living experiment in playable multi-agent coordination, honest about what the current learner can do and what the next one must learn.
+</div></footer>
+
+</body>
+</html>

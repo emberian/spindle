@@ -23,7 +23,9 @@ use super::decision_types::{
 use super::efe;
 use super::gate_solve::{solve_gate_throw, THROW_MAX_SPEED, THROW_MIN_SPEED};
 use super::lead_predict::solve_lead_velocity;
-use super::orientation::{attack_ring_x, attack_sign, defend_ring_x, forward_progress};
+use super::orientation::{
+    attack_ring_x, attack_sign, defend_ring_x, forward_progress, gate_world_x,
+};
 use super::plan_bridge::{plan_grapple, GrapplePlan, Sticky};
 use super::profile::{Difficulty, TeamProfile};
 use super::rng::AiRng;
@@ -124,7 +126,12 @@ fn axis_radius(p: Vec3) -> f64 {
 // predicate from `system.rs` to label each rigger's intent. It is a pure
 // deterministic read (no rng, no cache mutation) so re-evaluating it never
 // perturbs the emitted InputFrame or the determinism hash.
-pub(crate) fn wants_catch(player: &PlayerSim, state: &SimState, assignment: &PlayerAssignment) -> bool {
+pub(crate) fn wants_catch(
+    player: &PlayerSim,
+    state: &SimState,
+    assignment: &PlayerAssignment,
+    active_pass_target: Option<&str>,
+) -> bool {
     if state.bell.held_by.is_some() {
         return false;
     }
@@ -136,8 +143,43 @@ pub(crate) fn wants_catch(player: &PlayerSim, state: &SimState, assignment: &Pla
     if gap > 70.0 {
         return false;
     }
-    // Directed outlets always commit (recover pack, staged receiver).
-    if matches!(assignment.job, Job::Recover | Job::Receive | Job::Support) {
+
+    let thrown_by_team = state
+        .bell
+        .thrown_by
+        .as_deref()
+        .and_then(|tid| state.players.iter().find(|p| p.id == tid))
+        .map(|p| p.team);
+    let friendly_pass = thrown_by_team == Some(player.team);
+
+    // If we know the intended catcher of our own in-flight pass, only that
+    // rigger gets the automatic committed catch envelope. Other teammates
+    // keep their spacing unless the ball is practically hitting them.
+    if friendly_pass {
+        if let Some(tid) = active_pass_target {
+            let target_valid = state
+                .players
+                .iter()
+                .any(|p| p.id == tid && p.team == player.team);
+            if target_valid {
+                if tid == player.id {
+                    return true;
+                }
+                let bs = vlen(state.bell.v);
+                let closing = if bs < 1e-3 {
+                    gap < 8.0
+                } else {
+                    -vdot(state.bell.v, to_bell) / (bs * gap.max(1e-6)) > 0.75
+                        && gap < 16.0
+                };
+                return closing;
+            }
+        }
+    }
+
+    // Directed ball roles commit automatically. `Support` is deliberately not
+    // included: it is spacing/coverage, not an implicit second receiver.
+    if matches!(assignment.job, Job::Recover | Job::Receive) {
         return true;
     }
     // Anyone else commits only if the bell is actually coming at them.
@@ -216,11 +258,12 @@ pub(crate) fn is_dive_committer(
     state: &SimState,
     director: &DirectorState,
     assignment: &PlayerAssignment,
+    active_pass_target: Option<&str>,
 ) -> bool {
     if state.bell.held_by.is_some() {
         return false;
     }
-    if !wants_catch(player, state, assignment) {
+    if !wants_catch(player, state, assignment, active_pass_target) {
         return false;
     }
     // The SHADOW never dives via this path — it holds the rebound locus.
@@ -244,7 +287,7 @@ pub(crate) fn is_dive_committer(
                 && director
                     .assignments
                     .get(&pp.id)
-                    .map(|a| wants_catch(pp, state, a))
+                    .map(|a| wants_catch(pp, state, a, active_pass_target))
                     .unwrap_or(false)
         })
         .unwrap_or(false);
@@ -267,7 +310,7 @@ pub(crate) fn is_dive_committer(
                 Some(a) => {
                     a.job == Job::Recover
                         && !a.is_shadow()
-                        && wants_catch(p, state, a)
+                        && wants_catch(p, state, a, active_pass_target)
                 }
                 None => false,
             }
@@ -640,6 +683,7 @@ pub fn compute_player_input(
     director: &DirectorState,
     difficulty: Difficulty,
     rng: &mut AiRng,
+    active_pass_target: Option<&str>,
     cache: &mut PlayerCommitCache,
     director_refreshed: bool,
     director_interval: f64,
@@ -860,7 +904,7 @@ pub fn compute_player_input(
             radius_slot: 0.45,
             pressure: 0.0,
         });
-    let catch_intent = wants_catch(player, state, &cur_assignment);
+    let catch_intent = wants_catch(player, state, &cur_assignment, active_pass_target);
 
     // ── LOOSE-BELL DECISIVE DIVE (dominates coverage / w-max / nav) ───────
     // The gawk-ring fix: when the bell is loose and ours-to-take, the
@@ -889,7 +933,13 @@ pub fn compute_player_input(
         let commit_dive = if already && still_takeable {
             true
         } else {
-            is_dive_committer(player, state, director, &cur_assignment)
+            is_dive_committer(
+                player,
+                state,
+                director,
+                &cur_assignment,
+                active_pass_target,
+            )
         };
 
         if let Some(c) = cache.value.as_mut() {
@@ -2173,7 +2223,7 @@ mod tests {
         let mut cache = PlayerCommitCache::default();
         let out = compute_player_input(
             &player, &state, &m, &profile, &dir, Difficulty::Pro, &mut rng,
-            &mut cache, true, 30.0,
+            None, &mut cache, true, 30.0,
         );
         (out, cache.value.unwrap())
     }
@@ -2263,7 +2313,7 @@ mod tests {
         let mut cache = PlayerCommitCache::default();
         let out = compute_player_input(
             &player, &state, &m, &style_to_profile("balanced", "medium"),
-            &dir, Difficulty::Pro, &mut rng, &mut cache, true, 30.0,
+            &dir, Difficulty::Pro, &mut rng, None, &mut cache, true, 30.0,
         );
         assert!(
             out.fire_line_at.is_some(),
@@ -2298,7 +2348,7 @@ mod tests {
         let mut cache2 = PlayerCommitCache::default();
         let out2 = compute_player_input(
             &h2, &state, &m, &style_to_profile("balanced", "medium"),
-            &dir, Difficulty::Pro, &mut rng2, &mut cache2, true, 30.0,
+            &dir, Difficulty::Pro, &mut rng2, None, &mut cache2, true, 30.0,
         );
         assert!(
             cache2.value.as_ref().unwrap().dive_commit_tick < 0.0,
@@ -2323,7 +2373,7 @@ mod tests {
         let mut rng1 = AiRng::make(424242, 100, 0);
         let o = compute_player_input(
             &player, &state, &m, &profile, &dir, Difficulty::Pro, &mut rng1,
-            &mut cache, true, 30.0,
+            None, &mut cache, true, 30.0,
         );
         assert!(o.aim.x.is_finite() && o.aim.y.is_finite() && o.aim.z.is_finite());
         let c1 = cache.value.clone().expect("commit persists");
@@ -2332,7 +2382,7 @@ mod tests {
         let mut rng2 = AiRng::make(424242, 101, 0);
         compute_player_input(
             &player, &state, &m, &profile, &dir, Difficulty::Pro, &mut rng2,
-            &mut cache, false, 30.0,
+            None, &mut cache, false, 30.0,
         );
         let c2 = cache.value.clone().expect("commit persists");
         assert_eq!(c2.hold_ticks, 1.0, "second tick still holding → 1");

@@ -40,36 +40,35 @@ import { grappleHand } from './RigGrapple';
 
 const SAG_SEGMENTS = 24;
 
-// World-space line radii (m). DELIBERATELY THIN: a taut hauling cable reads
-// as a crisp stroke, not a rope. Eight of these must not merge into a blob,
-// so the radius is a fraction of the old 0.42 and there is no halo tube.
-// Tethers are CONTEXT, not focus: the riggers + bell must dominate. These are
-// a fraction of even the previous "thin" values so 8 simultaneous hauls read
-// as faint guide-threads, never a glowing web.
-const TAUT_RADIUS = 0.075;  // hauling: a taut, energised cable (still recessive)
-const SLACK_RADIUS = 0.035; // slack/inactive: near-invisible thread
-const P1_RADIUS_BOOST = 0.035;
+// World-space line radii (m). Thick enough to read at play distance in a 45m
+// tube — grapple is THE core mechanic and must be visible, but still shaped
+// so 8 simultaneous hauls stay separable (no halo/double-tube).
+const TAUT_RADIUS = 0.16;   // hauling: clearly visible energised cable
+const SLACK_RADIUS = 0.06;  // slack/inactive: faint but not invisible
+const P1_RADIUS_BOOST = 0.05;
 
-// Chord length (m) over which a tether fades toward minimum opacity: a long
-// haul spans the playspace and would dominate, so longer = more recessive.
-const LEN_FADE_NEAR = 30;   // ≤ this: full (already-low) strength
-const LEN_FADE_FAR  = 260;  // ≥ this: faded to the long-haul floor
+// Chord length (m) over which a tether fades — gentler than before so long
+// grapples stay readable (the mechanic IS the long haul).
+const LEN_FADE_NEAR = 60;   // ≤ this: full strength
+const LEN_FADE_FAR  = 300;  // ≥ this: faded to the long-haul floor
 
-// Small typed anchor sizes (m) — unobtrusive context markers, shrunk further
-// so the node never competes with a rigger body or the bell.
-const ANCHOR_SIZE = 0.22;
-const HAND_SIZE = 0.13;
+// Typed anchor sizes (m) — visible endpoint markers.
+const ANCHOR_SIZE = 0.35;
+const HAND_SIZE = 0.2;
 
-// GRAPPLE LATENCY (Gap 1): a fired-but-not-yet-attached claw is a TRAVELLING
-// PROJECTILE, not a hauling cable. While `!ls.attached` the sim is paying out
-// flight — there is no constraint force yet — so we draw a small claw head
-// flying hand→anchor with a thin pay-out line trailing it. Progress along the
-// flight is RENDER-ONLY: derived from CLAW_SPEED + the hand→anchor distance +
-// render time since the unattached line first appeared. It never re-enters
-// sim.step (the established hard rule); it only has to LOOK like the same
-// latency the sim is enforcing (ceil(dist / CLAW_SPEED / h) ticks).
-const CLAW_HEAD_SIZE = 0.16; // m — the flying bite (slightly bigger than HAND)
-const FLIGHT_RADIUS = 0.03;  // m — pay-out thread: thinner even than SLACK
+// GRAPPLE LATENCY: the in-flight claw should be clearly visible — it's the
+// "action moment" of the throw. Render-only progress (CLAW_SPEED · elapsed).
+const CLAW_HEAD_SIZE = 0.32; // m — the flying bite: crisp and readable
+const FLIGHT_RADIUS = 0.09;  // m — pay-out thread: visible trailing line
+
+// Glow tube: additive halo around the rope that feeds into UnrealBloomPass.
+const GLOW_RADIUS_MULT = 2.2;   // width relative to the solid rope
+const GLOW_OPACITY_TAUT = 0.28;
+const GLOW_OPACITY_FLIGHT = 0.35;
+const GLOW_OPACITY_SLACK = 0.08;
+
+// Claw point-light sprite (bloom-friendly bright dot on the flying hook).
+const CLAW_SPRITE_SIZE = 1.4;   // world units
 
 // Fallback hand offset (figure-local) if Rigger hasn't published a hand yet.
 const HAND_FALLBACK_LOCAL = new THREE.Vector3(0.42, 1.55, 0.55);
@@ -140,13 +139,16 @@ class LineInstance {
   readonly group = new THREE.Group();
 
   private rope: THREE.Mesh;        // thin team-colour tube (the tether)
+  private glow: THREE.Mesh;        // additive halo tube (feeds bloom)
   private spar: THREE.Mesh;        // octahedron anchor (structural bite)
   private skin: THREE.Mesh;        // flat ring anchor (free-space skin point)
   private ring: THREE.Mesh;        // cube anchor (the goal ring)
   private hand: THREE.Mesh;        // node where the line leaves the rigger
   private endNode: THREE.Mesh;     // node at the FAR end for player↔player
   private clawHead: THREE.Mesh;    // the in-flight bite (GRAPPLE LATENCY)
+  private clawSprite: THREE.Sprite; // bright bloom point on flying claw
   private curGeo: THREE.TubeGeometry | null = null;
+  private curGlowGeo: THREE.TubeGeometry | null = null;
 
   private active = false;
   private fire = 0;
@@ -161,12 +163,6 @@ class LineInstance {
   private wasAttached = true;
 
   constructor() {
-    // Tether: one thin tube. NOT additive — a normal translucent stroke so
-    // eight of them stay crisp and recessive instead of blooming into a
-    // glowing mass that competes with the bell.
-    // vertexColors: lets us fade the tube toward the ANCHOR end (the rigger
-    // end stays readable as "this line belongs to that figure"; the far end
-    // dissolves so a long haul reads as a hint, not a hard cable).
     this.rope = new THREE.Mesh(
       new THREE.BufferGeometry(),
       new THREE.MeshBasicMaterial({
@@ -176,6 +172,17 @@ class LineInstance {
     );
     this.rope.frustumCulled = false;
     this.rope.renderOrder = 1;
+
+    // Glow halo: wider additive tube around the rope — picked up by bloom.
+    this.glow = new THREE.Mesh(
+      new THREE.BufferGeometry(),
+      new THREE.MeshBasicMaterial({
+        color: PAL.cyan, transparent: true, opacity: 0,
+        blending: THREE.AdditiveBlending, depthWrite: false,
+      }),
+    );
+    this.glow.frustumCulled = false;
+    this.glow.renderOrder = 0;
 
     // Typed anchor nodes — small, additive (a single small node is a bounded
     // emitter), only the one matching anchorType is shown per frame.
@@ -205,37 +212,38 @@ class LineInstance {
     this.endNode = new THREE.Mesh(new THREE.SphereGeometry(HAND_SIZE * 1.25, 8, 6), anchorMat());
     this.endNode.renderOrder = 2;
 
-    // The flying claw head: an octahedron (a structural BITE, same shape
-    // language as a spar anchor) — small, crisp, additive, only lit while
-    // the line is unattached. It reads as "thrown, not yet bitten".
     this.clawHead = new THREE.Mesh(
       new THREE.OctahedronGeometry(CLAW_HEAD_SIZE, 0), anchorMat(),
     );
     this.clawHead.renderOrder = 2;
 
+    // Bright bloom sprite on the flying claw — a hot point of light.
+    const spriteMat = new THREE.SpriteMaterial({
+      color: PAL.paper, transparent: true, opacity: 0,
+      blending: THREE.AdditiveBlending, depthWrite: false,
+    });
+    this.clawSprite = new THREE.Sprite(spriteMat);
+    this.clawSprite.scale.setScalar(CLAW_SPRITE_SIZE);
+    this.clawSprite.visible = false;
+
     this.group.add(
-      this.rope, this.spar, this.skin, this.ring, this.hand, this.endNode,
-      this.clawHead,
+      this.glow, this.rope,
+      this.spar, this.skin, this.ring, this.hand, this.endNode,
+      this.clawHead, this.clawSprite,
     );
     this.group.visible = false;
   }
 
   private rebuild(radius: number): void {
     const curve = new THREE.CatmullRomCurve3(_pts, false, 'catmullrom', 0);
-    // 4 radial segments: a thin tube doesn't need 6, fewer verts for 8 tethers.
     const RADIAL = 4;
     const g = new THREE.TubeGeometry(curve, SAG_SEGMENTS, radius, RADIAL, false);
-    // Per-vertex brightness fade along the length: ~1 at the rigger (hand)
-    // end, fading to a faint tail at the anchor end so the line points back
-    // to its figure but never reads as a hard structural cable across the
-    // whole playspace. TubeGeometry orders verts ring-by-ring along the path.
     const ringCount = SAG_SEGMENTS + 1;
-    const vpr = RADIAL + 1; // verts per ring
+    const vpr = RADIAL + 1;
     const total = ringCount * vpr;
     const col = new Float32Array(total * 3);
     for (let r = 0; r < ringCount; r++) {
-      const t = r / SAG_SEGMENTS;            // 0 = hand end, 1 = anchor end
-      // Stay bright over the first third, then ease down to a 0.15 tail.
+      const t = r / SAG_SEGMENTS;
       const f = 0.15 + 0.85 * Math.pow(1 - THREE.MathUtils.smoothstep(t, 0.25, 1), 1.1);
       for (let k = 0; k < vpr; k++) {
         const i = (r * vpr + k) * 3;
@@ -246,6 +254,12 @@ class LineInstance {
     this.rope.geometry = g;
     this.curGeo?.dispose();
     this.curGeo = g;
+
+    // Glow tube: same path, wider radius, no vertex colors (uniform additive).
+    const glowG = new THREE.TubeGeometry(curve, SAG_SEGMENTS, radius * GLOW_RADIUS_MULT, RADIAL, false);
+    this.glow.geometry = glowG;
+    this.curGlowGeo?.dispose();
+    this.curGlowGeo = glowG;
   }
 
   /** @param targetPos live world pos of the grappled player, or null. */
@@ -264,6 +278,8 @@ class LineInstance {
       this.flightT = 0;
       this.wasAttached = true;
       this.clawHead.visible = false;
+      this.clawSprite.visible = false;
+      this.glow.visible = false;
       return;
     }
     this.group.visible = true;
@@ -309,22 +325,32 @@ class LineInstance {
 
       const teamColF = ps.team === 'home' ? PAL.cyan : PAL.orange;
       const rmF = this.rope.material as THREE.MeshBasicMaterial;
-      rmF.color.setHex(teamColF);
-      rmF.opacity = 0.22; // a faint flying thread — recessive, but trackable
+      rmF.color.setHex(blendHex(teamColF, PAL.paper, 0.25));
+      rmF.opacity = 0.55;
 
-      // The head: crisp, additive, paper-tinted so the BITE reads against the
-      // dim thread; a gentle spin + slight scale pulse sells "in flight".
+      // Glow tube on the pay-out thread
+      const gmF = this.glow.material as THREE.MeshBasicMaterial;
+      gmF.color.setHex(teamColF);
+      gmF.opacity = GLOW_OPACITY_FLIGHT;
+      this.glow.visible = true;
+
       const tF = now * 0.001;
       const cm = this.clawHead.material as THREE.MeshBasicMaterial;
-      cm.color.setHex(blendHex(teamColF, PAL.paper, 0.55));
-      cm.opacity = 0.7;
+      cm.color.setHex(blendHex(teamColF, PAL.paper, 0.6));
+      cm.opacity = 0.9;
       this.clawHead.position.copy(_claw);
-      this.clawHead.rotation.set(tF * 5.0, tF * 6.5, 0);
-      this.clawHead.scale.setScalar(1 + 0.12 * Math.sin(tF * 22));
+      this.clawHead.rotation.set(tF * 7.0, tF * 9.0, 0);
+      this.clawHead.scale.setScalar(1.1 + 0.2 * Math.sin(tF * 28));
       this.clawHead.visible = true;
 
-      // No cable, no anchor node, no hand node while flying — JUST the
-      // thread + the travelling bite, so the throw reads cleanly.
+      // Bright bloom sprite on the claw — hot point of light selling the throw
+      const sm = this.clawSprite.material as THREE.SpriteMaterial;
+      sm.color.setHex(blendHex(teamColF, PAL.paper, 0.7));
+      sm.opacity = 0.7 + 0.2 * Math.sin(tF * 30);
+      this.clawSprite.position.copy(_claw);
+      this.clawSprite.scale.setScalar(CLAW_SPRITE_SIZE * (1.0 + 0.15 * Math.sin(tF * 24)));
+      this.clawSprite.visible = true;
+
       this.spar.visible = false;
       this.skin.visible = false;
       this.ring.visible = false;
@@ -335,6 +361,7 @@ class LineInstance {
     }
     // Attached: the claw has bitten — hand off to the cable renderer below.
     this.clawHead.visible = false;
+    this.clawSprite.visible = false;
     this.hand.visible = true;
     this.wasAttached = true;
 
@@ -360,8 +387,8 @@ class LineInstance {
     const baseR = taut ? TAUT_RADIUS : SLACK_RADIUS;
     const radius = baseR
       + (isP1 ? P1_RADIUS_BOOST : 0)
-      + this.snapKick * 0.04
-      + (reelingIn ? 0.02 : 0);
+      + this.snapKick * 0.08
+      + (reelingIn ? 0.06 : 0);
     this.rebuild(radius);
 
     const teamCol = ps.team === 'home' ? PAL.cyan : PAL.orange;
@@ -379,12 +406,19 @@ class LineInstance {
     const lenT = THREE.MathUtils.clamp(
       (chord - LEN_FADE_NEAR) / (LEN_FADE_FAR - LEN_FADE_NEAR), 0, 1,
     );
-    const lenFade = 1 - lenT * 0.70;            // long haul → 30% strength
-    // Player↔player stays a touch more visible (that rigger↔rigger link is
-    // the coordination we DO want to read) but is still secondary.
-    const tautBase  = isPlayerAnchor ? 0.42 : 0.34;
-    const slackBase = 0.07;                     // slack ≈ invisible context
-    rm.opacity = (taut ? tautBase : slackBase) * lenFade;
+    const lenFade = 1 - lenT * 0.45;            // long haul → 55% strength
+    const tautBase  = isPlayerAnchor ? 0.72 : 0.65;
+    const slackBase = 0.20;
+    const reelBoost = reelingIn ? 0.15 : 0;
+    rm.opacity = (taut ? tautBase + reelBoost : slackBase) * lenFade;
+
+    // Glow halo on the attached cable
+    const gm = this.glow.material as THREE.MeshBasicMaterial;
+    gm.color.setHex(teamCol);
+    const glowBase = taut ? GLOW_OPACITY_TAUT : GLOW_OPACITY_SLACK;
+    const glowReelBoost = reelingIn ? 0.12 : 0;
+    gm.opacity = (glowBase + glowReelBoost + this.snapKick * 0.2) * lenFade;
+    this.glow.visible = true;
 
     // ── Typed anchor: show ONLY the node matching anchorType ────────────────
     this.spar.visible = false;
@@ -396,11 +430,9 @@ class LineInstance {
     const aScale = 1 + this.snapKick * 0.35;
 
     if (isPlayerAnchor) {
-      // rigger→rigger: a node welded to the live target figure + the hand
-      // node. Two linked dots on a thin line = readable coordination.
       const em = this.endNode.material as THREE.MeshBasicMaterial;
-      em.color.setHex(blendHex(teamCol, PAL.paper, 0.45));
-      em.opacity = (taut ? 0.6 : 0.3) * lenFade;
+      em.color.setHex(blendHex(teamCol, PAL.paper, 0.5));
+      em.opacity = (taut ? 0.85 : 0.45) * lenFade;
       this.endNode.position.copy(_to);
       this.endNode.scale.setScalar(aScale);
       this.endNode.visible = true;
@@ -408,21 +440,19 @@ class LineInstance {
       const node =
         kind === 'spar' ? this.spar :
         kind === 'ring' ? this.ring :
-        this.skin; // 'skin' (and player-with-no-target fallback)
+        this.skin;
       const nm = node.material as THREE.MeshBasicMaterial;
-      nm.color.setHex(taut ? blendHex(teamCol, PAL.paper, 0.3) : teamCol);
-      nm.opacity = (taut ? 0.5 : 0.18) * lenFade;
+      nm.color.setHex(taut ? blendHex(teamCol, PAL.paper, 0.4) : teamCol);
+      nm.opacity = (taut ? 0.75 : 0.30) * lenFade;
       node.position.copy(_to);
       node.rotation.set(t * 0.6, t * 0.8, 0);
       node.scale.setScalar(aScale);
       node.visible = true;
     }
 
-    // Hand node: the line visibly LEAVES the rigger (small, dim — context,
-    // not a focal point).
     const hm = this.hand.material as THREE.MeshBasicMaterial;
-    hm.color.setHex(blendHex(teamCol, PAL.paper, 0.25));
-    hm.opacity = (taut ? 0.4 : 0.15) * lenFade;
+    hm.color.setHex(blendHex(teamCol, PAL.paper, 0.35));
+    hm.opacity = (taut ? 0.65 : 0.25) * lenFade;
     this.hand.position.copy(_from);
   }
 
@@ -433,6 +463,8 @@ class LineInstance {
     this.flightT = 0;
     this.wasAttached = true;
     this.clawHead.visible = false;
+    this.clawSprite.visible = false;
+    this.glow.visible = false;
   }
 }
 

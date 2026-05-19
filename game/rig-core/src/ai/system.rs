@@ -71,6 +71,11 @@ pub struct AiSystem {
     /// wasm method. NEVER folded into the InputFrame, `Snapshot`, or
     /// `hash_snapshot` — it cannot perturb the sim or determinism.
     last_debug: Vec<AiDebugRec>,
+    /// AI-side pass contract: when a carrier releases a teammate-targeted
+    /// pass, remember the intended catcher for that team's in-flight ball so
+    /// non-target teammates keep their spacing instead of all swarming the
+    /// same friendly pass.
+    active_pass_targets: HashMap<(u8, usize), String>,
 }
 
 impl AiSystem {
@@ -122,6 +127,18 @@ impl AiSystem {
 
             // Director: update at ~2 Hz.
             let dir_key = (side_tag(cfg.side), ci);
+            let own_throw_in_flight = sim_state.bell.held_by.is_none()
+                && sim_state
+                    .bell
+                    .thrown_by
+                    .as_deref()
+                    .and_then(|tid| sim_state.players.iter().find(|p| p.id == tid))
+                    .map(|p| p.team == cfg.side)
+                    .unwrap_or(false);
+            if !own_throw_in_flight {
+                self.active_pass_targets.remove(&dir_key);
+            }
+            let active_pass_target = self.active_pass_targets.get(&dir_key).cloned();
             let needs_director_update = match self.director_caches.get(&dir_key) {
                 None => true,
                 Some(dc) => tick - dc.last_updated_tick >= DIRECTOR_TICK_INTERVAL,
@@ -150,6 +167,7 @@ impl AiSystem {
             // the latter — no per-tick DirectorState clone needed.
             let director = &self.director_caches[&dir_key].state;
             let commit_cache = &mut self.commit_cache;
+            let mut released_pass_target: Option<String> = None;
 
             for (pi, &p_idx) in team_players.iter().enumerate() {
                 let player = &sim_state.players[p_idx];
@@ -177,10 +195,20 @@ impl AiSystem {
                     director,
                     cfg.difficulty,
                     &mut player_rng,
+                    active_pass_target.as_deref(),
                     commit,
                     director_refreshed,
                     DIRECTOR_TICK_INTERVAL,
                 );
+                if input.throw_released {
+                    if let Some(target_id) = commit
+                        .value
+                        .as_ref()
+                        .and_then(|c| c.throw_target_id.clone())
+                    {
+                        released_pass_target = Some(target_id);
+                    }
+                }
                 inputs.push(input);
 
                 // ── RENDER-ONLY legibility record ────────────────────────
@@ -204,12 +232,21 @@ impl AiSystem {
                     director.recover_id.as_deref() == Some(player.id.as_str());
                 let is_shadow = assignment.is_shadow();
                 let is_outlet = assignment.job == Job::Receive;
-                let is_diver =
-                    is_dive_committer(player, sim_state, director, &assignment);
+                let is_diver = is_dive_committer(
+                    player,
+                    sim_state,
+                    director,
+                    &assignment,
+                    active_pass_target.as_deref(),
+                );
                 let is_contester = !is_diver
                     && is_contest_committer(player, sim_state, match_state, director);
-                let catching =
-                    wants_catch(player, sim_state, &assignment);
+                let catching = wants_catch(
+                    player,
+                    sim_state,
+                    &assignment,
+                    active_pass_target.as_deref(),
+                );
                 let have_bell =
                     sim_state.bell.held_by.as_deref() == Some(player.id.as_str());
                 // Committed point this rigger is acting on, in priority
@@ -247,6 +284,9 @@ impl AiSystem {
                     controlled_by: "baseline",
                 });
             }
+            if let Some(target_id) = released_pass_target {
+                self.active_pass_targets.insert(dir_key, target_id);
+            }
         }
 
         InputFrame { tick, players: inputs }
@@ -257,6 +297,7 @@ impl AiSystem {
         self.director_caches.clear();
         self.commit_cache.clear();
         self.last_debug.clear();
+        self.active_pass_targets.clear();
     }
 
     /// RENDER-ONLY: the legibility records produced by the last `tick`,

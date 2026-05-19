@@ -246,6 +246,7 @@ async function runMatch(
   gameSeed: number,
   onEnd: (winner: TeamSide, scoreHome: number, scoreAway: number) => void,
 ): Promise<void> {
+  audio.start();
   const sim: WasmSim = await createWasmSim(gameSeed);
   for (const r of ROSTER) {
     const k = ROSTER.indexOf(r);
@@ -565,6 +566,7 @@ async function runWatch(
     away: 'baseline',
   },
 ): Promise<void> {
+  audio.start();
   // Which roster ids the trained RL policy drives this match (opt-in via
   // the spectate toggle). Empty ⇒ pure baseline AI for everyone (the
   // byte-unchanged production path). The other team's riggers fall to the
@@ -974,6 +976,7 @@ async function runReplay(
   data: ReplayData,
   onEnd: () => void,
 ): Promise<void> {
+  audio.start();
   const sim: WasmSim = await createWasmSim(data.meta.seed);
   const roster = data.roster;
   for (let k = 0; k < roster.length; k++) {

@@ -4,11 +4,11 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Watching It Learn — RIG as a Gym, and a visualizer</title>
-<meta name="description" content="The deterministic core is wrapped as a Gym (reset/step/snapshot/restore, an agent-control selector). A shared-parameter neural swarm policy trained by evolution strategies; reward is the game's own outcome with policy-invariant potential shaping. The web game is the visualizer.">
+<meta name="description" content="The deterministic core is wrapped as a Gym and the web game visualizes learned policies. The current trainer proves the loop; the serious path is curriculum, real gradients, and league-style evaluation.">
 <link rel="canonical" href="https://emberian.github.io/spindle/explainer/learning.html">
 <meta property="og:type" content="article">
 <meta property="og:title" content="Watching It Learn — RIG as a Gym, and a visualizer">
-<meta property="og:description" content="One shared network, every rigger an egocentric view, coordination must emerge. The web game is the visualizer for a learned swarm.">
+<meta property="og:description" content="One shared network, every rigger an egocentric view, coordination must emerge. The current learner is a starting point, not the final training recipe.">
 <meta property="og:image" content="https://emberian.github.io/spindle/explainer/og.svg">
 <meta property="og:url" content="https://emberian.github.io/spindle/explainer/learning.html">
 <meta name="twitter:card" content="summary_large_image">
@@ -28,6 +28,7 @@
     <a href="physics.html">The Physics</a>
     <a href="swarm.html">The Swarm</a>
     <a href="learning.html" aria-current="page">Watching It Learn</a>
+    <a href="training.html">Training Plan</a>
     <a href="tech.html">How It's Built</a>
     <a href="vision.html">Why</a>
   </nav>
@@ -38,7 +39,7 @@
 <section>
   <span class="tag">Watching it learn</span>
   <h1>The web game is the visualizer.</h1>
-  <p class="lede">Most learned policies live in a log file. This one lives in the same arena you watch for fun: select a team to be the learned swarm, press play, and the match you see is the policy running — deterministically, replayable frame-for-frame, no separate demo, no cherry-picked clip.</p>
+  <p class="lede">Most learned policies live in a log file. This one is meant to live in the same arena you watch for fun: select a team to be the learned swarm, press play, and the match you see is the policy running — deterministically, replayable frame-for-frame, no separate demo, no cherry-picked clip.</p>
 </section>
 
 <section>
@@ -74,22 +75,27 @@
 </section>
 
 <section>
-  <h2>How it's trained</h2>
+  <h2>Where the learner stands</h2>
+  <p>The current native learner is a proof that the loop is wired: rollouts can be collected, weights can drive the browser, and the same seed can be replayed. It is not yet the training recipe to trust for beautiful team sport. The present evolution-strategy path is useful for experiments, but the serious path is curriculum learning and real gradient-based training over the Python bridge.</p>
   <div class="grid">
     <div class="card">
-      <h3>Gradient-free evolution strategies</h3>
-      <p>The shared network is trained by evolution strategies — perturb the weights, run deterministic matches, keep what wins. No backprop through the simulator required; the engine just has to play, repeatably, which it does.</p>
+      <h3>Current loop</h3>
+      <p>Native Rust rollouts, shared neural actor, deterministic evaluation, and browser-deployable weights.</p>
     </div>
     <div class="card">
-      <h3>An evolutionary learner on the controller itself</h3>
-      <p>Alongside the neural swarm, an evolutionary learner tunes the structured controller's own parameters — two routes up the same mountain, both judged by the same game.</p>
+      <h3>Known gap</h3>
+      <p>Cold-start self-play can settle into keep-away, and the old baseline controller is only a scaffold, not an expert.</p>
+    </div>
+    <div class="card">
+      <h3>Next recipe</h3>
+      <p>Teach movement, passing, gate progress, and pressure in stages; then move into league-style self-play.</p>
     </div>
   </div>
 </section>
 
 <section>
   <h2>The reward is the game itself</h2>
-  <p>This is the part that keeps it honest. The reward is the match's own outcome — possession, score, contest — not a hand-tuned ranker quietly teaching the agents to look good. To densify a signal that would otherwise be painfully sparse, RIG uses <strong>potential-based shaping that is provably policy-invariant</strong>: it makes the gradient less lonely without changing which policy is optimal. Strategic quality is assessed separately, by an <strong>offline judge</strong>, so the thing being optimised and the thing being graded for craft are not the same knob.</p>
+  <p>This is the part that keeps it honest. The reward starts from the match's own outcome — possession, score, contest — not a hand-tuned ranker quietly teaching the agents to look good. Dense signals still matter, but they have to point at useful field progress rather than easy hoarding. Strategic quality is assessed separately, by an <strong>offline judge</strong>, so the thing being optimised and the thing being graded for craft are not the same knob.</p>
 
   <blockquote class="pull">It's optimised for <span>winning the game</span>, not for impressing a metric.</blockquote>
 </section>
@@ -97,11 +103,11 @@
 <section>
   <h2>Then you just watch it</h2>
   <p>The payoff: there is no gap between training and demo. The learned weights load into the same browser game. Pick the learned swarm as a side, run the match, and what you see is exactly what the policy does — and because it's deterministic, you can replay the same match, scrub it, and compare a later version against an earlier one on the identical seed.</p>
-  <p>You can literally watch it get better.</p>
+  <p>The promise is not that today's swarm is already brilliant. The promise is that when it improves, the improvement will be visible in the sport itself.</p>
 
   <div class="cta">
     <a class="btn btn-primary" href="../">▶ Watch the learned swarm</a>
-    <a class="btn btn-ghost" href="tech.html">How it's built →</a>
+    <a class="btn btn-ghost" href="training.html">The training plan →</a>
   </div>
 </section>
 
@@ -111,7 +117,8 @@
   <div class="row">
     <a href="index.html">What is RIG</a><a href="sport.html">The Sport</a>
     <a href="physics.html">The Physics</a><a href="swarm.html">The Swarm</a>
-    <a href="learning.html">Watching It Learn</a><a href="tech.html">How It's Built</a>
+    <a href="learning.html">Watching It Learn</a><a href="training.html">Training Plan</a>
+    <a href="tech.html">How It's Built</a>
     <a href="vision.html">Why</a><a href="../">Watch live</a>
   </div>
   RIG — a living experiment in playable multi-agent coordination.

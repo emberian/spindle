@@ -182,6 +182,60 @@ ul.clean li::before { content: ""; position: absolute; left: 4px; top: 19px; wid
 ul.clean li:last-child { border-bottom: 0; }
 ul.clean b { color: var(--paper); }
 
+ol.ladder {
+  list-style: none;
+  counter-reset: ladder;
+  padding: 0;
+  margin: 30px 0;
+  display: grid;
+  gap: 12px;
+}
+ol.ladder li {
+  counter-increment: ladder;
+  display: grid;
+  grid-template-columns: 46px 1fr;
+  gap: 16px;
+  align-items: start;
+  padding: 18px;
+  background: var(--bg-2);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+}
+ol.ladder li::before {
+  content: counter(ladder);
+  display: grid;
+  place-items: center;
+  width: 34px;
+  height: 34px;
+  border-radius: 50%;
+  background: rgba(26,166,183,.16);
+  border: 1px solid rgba(26,166,183,.55);
+  color: var(--cyan);
+  font-weight: 800;
+  font-size: 15px;
+}
+ol.ladder b {
+  display: block;
+  color: var(--paper);
+  font-size: 18px;
+  margin-bottom: 2px;
+}
+ol.ladder span {
+  display: block;
+  color: #c7c4bc;
+  font-size: 15px;
+}
+
+.callout {
+  margin: 30px 0;
+  padding: 18px 20px;
+  background: rgba(26,166,183,.08);
+  border: 1px solid rgba(26,166,183,.35);
+  border-radius: 12px;
+  color: #d9d6cd;
+}
+.callout b { color: var(--cyan); }
+
 footer.site {
   border-top: 1px solid var(--line); padding: 40px 0 64px;
   color: var(--dim); font-size: 14px;
@@ -214,4 +268,6 @@ footer.site .row { display: flex; gap: 8px 20px; flex-wrap: wrap; margin-bottom:
   section { padding: 44px 0; }
   nav.site { width: 100%; margin-left: 0; }
   header.site .wrap { gap: 10px; }
+  ol.ladder li { grid-template-columns: 38px 1fr; padding: 15px; gap: 12px; }
+  ol.ladder li::before { width: 30px; height: 30px; }
 }
