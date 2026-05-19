@@ -25,9 +25,17 @@ pub mod policy;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod train;
 
+#[cfg(not(target_arch = "wasm32"))]
+pub mod self_play;
+
 pub use policy::{
     Observation, ObsPlayer, RlPolicy, FEAT_W, K, OUT_W, PARAM_W,
 };
 
 #[cfg(not(target_arch = "wasm32"))]
 pub use train::{judge, train_policy, JudgeSignals, TrainConfig, Trained};
+
+#[cfg(not(target_arch = "wasm32"))]
+pub use self_play::{
+    run_self_play, Population, SelfPlayConfig, SelfPlayEnv, SelfPlayResult,
+};
