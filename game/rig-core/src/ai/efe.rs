@@ -302,6 +302,293 @@ impl VolumeModel {
     }
 }
 
+// ─── Pass-success generative-model primitives ───────────────────────────────
+//
+// These score **passing lane quality** rather than the old "response gap"
+// measure. They answer: "would a pass TO this position succeed?" and "is
+// this throw a good idea?" — enabling off-ball players to seek positions
+// with high reception quality (wide basins of successful throws) and the
+// throw controller to pick passes that maximize expected value.
+
+/// Defender closing speed assumption (grapple-aided dash), m/s.
+const DEF_CLOSE_SPEED: f64 = 22.0;
+/// Default ball flight speed when estimating from position only, m/s.
+const DEFAULT_BALL_SPEED: f64 = 22.0;
+/// Catch radius — generous "can reach the ball" envelope, m.
+const CATCH_RADIUS: f64 = 12.0;
+/// Pass flight horizon cap, seconds.
+const PASS_HORIZON: f64 = 1.5;
+
+/// Score in [0, 1]: "If the carrier threw to a receiver at `candidate_p`
+/// moving at `candidate_v`, how likely is successful reception?"
+///
+/// Models four factors:
+/// 1. Lane occlusion — defenders blocking the throw line.
+/// 2. Defender closing time — can a defender reach the catch point before
+///    the ball arrives?
+/// 3. Coriolis-lane quality — does the predicted throw endpoint actually
+///    land near the candidate (Coriolis curves it)?
+/// 4. Separation — raw distance from nearest defender at the candidate.
+pub fn reception_quality(
+    carrier_p: Vec3,
+    candidate_p: Vec3,
+    candidate_v: Vec3,
+    defenders: &[Vec3],
+    omega: f64,
+    skin_r: f64,
+) -> f64 {
+    let lane = candidate_p.sub(carrier_p);
+    let lane_len = lane.len();
+    if lane_len < 1e-6 {
+        return 0.0;
+    }
+    let lane_dir = lane.norm();
+
+    // Ball flight time (straight-line estimate).
+    let flight_time = lane_len / DEFAULT_BALL_SPEED;
+
+    // ─── 1. Lane occlusion ───
+    // For each defender: project onto the throw line, measure perpendicular
+    // distance. A defender within a "blocking corridor" along the lane
+    // degrades the score.
+    let mut occlusion = 0.0_f64;
+    let corridor_half_width = 5.0; // meters — how close to the lane center counts
+    for &dp in defenders {
+        let to_def = dp.sub(carrier_p);
+        let proj_t = to_def.dot(lane_dir) / lane_len; // normalized [0,1] along lane
+        if proj_t < 0.05 || proj_t > 0.95 {
+            continue; // behind carrier or past receiver — not blocking
+        }
+        // Perpendicular distance from the lane line
+        let proj_point = carrier_p.add(lane_dir.scale(proj_t * lane_len));
+        let perp_dist = dp.sub(proj_point).len();
+        if perp_dist < corridor_half_width {
+            // Stronger occlusion when closer to the line center
+            occlusion += 1.0 - (perp_dist / corridor_half_width);
+        }
+    }
+    let occlusion_score = 1.0 / (1.0 + occlusion); // 1 = clear lane, → 0 = blocked
+
+    // ─── 2. Defender closing time ───
+    // Can any defender reach the catch point before the ball arrives?
+    // Predicted catch point: candidate moves during flight time.
+    let catch_point = candidate_p.add(candidate_v.scale(flight_time.min(PASS_HORIZON)));
+    let mut worst_closing_ratio = 0.0_f64; // 0 = no threat, 1+ = defender arrives first
+    for &dp in defenders {
+        let def_dist = dp.sub(catch_point).len();
+        let def_close_time = def_dist / DEF_CLOSE_SPEED;
+        if def_close_time < flight_time {
+            // Defender arrives before the ball — threat!
+            let ratio = 1.0 - (def_close_time / flight_time.max(1e-6));
+            worst_closing_ratio = worst_closing_ratio.max(ratio);
+        }
+    }
+    let closing_score = 1.0 - worst_closing_ratio; // 1 = safe, 0 = defender beats ball
+
+    // ─── 3. Coriolis-lane quality ───
+    // Throw the ball at the naive straight-line velocity and see where it
+    // actually lands after Coriolis drift.
+    let throw_v = lane_dir.scale(DEFAULT_BALL_SPEED);
+    let arrived = roll_forward(carrier_p, throw_v, omega, flight_time.min(PASS_HORIZON), skin_r);
+    let endpoint_error = arrived.p.sub(catch_point).len();
+    // Score: 1.0 when error is 0, falls off as the curve drifts the ball away.
+    let coriolis_score = 1.0 / (1.0 + endpoint_error / CATCH_RADIUS);
+
+    // ─── 4. Separation from nearest defender at candidate pos ───
+    let mut min_def_dist = f64::INFINITY;
+    for &dp in defenders {
+        let d = dp.sub(candidate_p).len();
+        if d < min_def_dist {
+            min_def_dist = d;
+        }
+    }
+    // Saturating sigmoid: full credit at ~20m separation, half at ~8m.
+    let sep_score = if defenders.is_empty() {
+        1.0
+    } else {
+        (min_def_dist / 16.0).min(1.0)
+    };
+
+    // ─── Combine (geometric mean keeps all factors load-bearing) ───
+    let raw = occlusion_score * closing_score * coriolis_score * sep_score;
+    raw.clamp(0.0, 1.0)
+}
+
+/// Score a specific world-velocity throw. Returns expected value in [0, 1+].
+///
+/// Rolls the ball with `roll_forward` for ~1.5s, finds which teammate (if any)
+/// can reach the predicted endpoint, multiplies by `reception_quality` at that
+/// point, adds forward-progress value, penalizes wall/backward throws.
+///
+/// `teammates` is `&[(position, velocity)]` so we can predict where each
+/// teammate will drift during ball flight.
+pub fn pass_outcome_ev(
+    from_p: Vec3,
+    v0: Vec3,
+    teammates: &[(Vec3, Vec3)],
+    defenders: &[Vec3],
+    omega: f64,
+    skin_r: f64,
+) -> f64 {
+    let speed = v0.len();
+    if speed < 1e-3 {
+        return 0.0;
+    }
+
+    // Roll the ball forward for the pass horizon.
+    let arrived = roll_forward(from_p, v0, omega, PASS_HORIZON, skin_r);
+
+    // ─── Skin-wall penalty ───
+    // If the ball ended up plastered against the skin, it's a bad throw.
+    let rho = arrived.p.y.hypot(arrived.p.z);
+    let skin_penalty = if rho > skin_r * 0.92 { 0.3 } else { 1.0 };
+
+    // ─── Find best teammate who can reach the endpoint ───
+    // Teammates are rolled forward briefly to their predicted position at
+    // catch time.
+    let mut best_rq = 0.0_f64;
+    let mut any_reachable = false;
+    for &(tp, tv) in teammates {
+        // Predict where the teammate will be at ball-arrival time.
+        let tm_future = tp.add(tv.scale(PASS_HORIZON));
+        // Can the teammate reach the arrived point within PASS_HORIZON?
+        let dist = tm_future.sub(arrived.p).len();
+        // Teammate has the flight time to close from their predicted pos.
+        let reachable = dist < CATCH_RADIUS + DEF_CLOSE_SPEED * PASS_HORIZON * 0.5;
+        if !reachable {
+            continue;
+        }
+        any_reachable = true;
+        // Score this teammate's reception quality at the arrival point.
+        let rq = reception_quality(
+            from_p,
+            arrived.p,
+            tv,
+            defenders,
+            omega,
+            skin_r,
+        );
+        if rq > best_rq {
+            best_rq = rq;
+        }
+    }
+
+    if !any_reachable {
+        return 0.0;
+    }
+
+    // ─── Forward-progress bonus ───
+    // Advancing toward the attack end (positive x direction as a convention
+    // here — the caller normalizes by team). Measured as fraction of tube
+    // length advanced. Mild bonus, not dominant.
+    let dx = arrived.p.x - from_p.x;
+    let tube_half = crate::tuning::GATE_X;
+    let progress_bonus = (dx / tube_half).clamp(-0.2, 0.3);
+
+    // ─── Backward penalty ───
+    let backward_penalty = if dx < -20.0 { 0.5 } else { 1.0 };
+
+    let raw = (best_rq + progress_bonus) * skin_penalty * backward_penalty;
+    raw.max(0.0)
+}
+
+/// Basin width: how MANY throw angles from carrier would result in a
+/// successful pass to `candidate_p`?
+///
+/// Samples a small fan of throw directions from carrier → candidate
+/// (varying angle ±), rolls each with the predictor, counts how many
+/// arrive within catch range AND aren't intercepted. Returns the fraction
+/// [0, 1]. A wide basin means the receiver is in a forgiving position —
+/// many throws work — which is what off-ball players should seek.
+pub fn reception_basin_width(
+    carrier_p: Vec3,
+    candidate_p: Vec3,
+    candidate_v: Vec3,
+    defenders: &[Vec3],
+    omega: f64,
+    skin_r: f64,
+) -> f64 {
+    let lane = candidate_p.sub(carrier_p);
+    let lane_len = lane.len();
+    if lane_len < 1e-6 {
+        return 0.0;
+    }
+    let lane_dir = lane.norm();
+
+    // Flight time estimate.
+    let flight_time = (lane_len / DEFAULT_BALL_SPEED).min(PASS_HORIZON);
+
+    // Predicted catch point (receiver drifts during flight).
+    let catch_point = candidate_p.add(candidate_v.scale(flight_time));
+
+    // Build a perpendicular basis for fanning throw angles. Pick two
+    // vectors orthogonal to lane_dir.
+    let perp1 = {
+        // Cross with a non-parallel axis to get a perpendicular.
+        let seed = if lane_dir.x.abs() < 0.9 {
+            Vec3::new(1.0, 0.0, 0.0)
+        } else {
+            Vec3::new(0.0, 1.0, 0.0)
+        };
+        lane_dir.cross(seed).norm()
+    };
+    let perp2 = lane_dir.cross(perp1).norm();
+
+    // Fan: sample 9 throw directions (center + 8 ring at ± angular offset).
+    // Angular spread: ±6 degrees ≈ ±0.105 rad — reasonable aiming error band.
+    const N_RING: usize = 8;
+    const SPREAD_RAD: f64 = 0.105;
+    let mut hits = 0_u32;
+    let total = 1 + N_RING;
+
+    // Helper: test a single throw direction.
+    let test_throw = |dir: Vec3| -> bool {
+        let throw_v = dir.scale(DEFAULT_BALL_SPEED);
+        let arrived = roll_forward(carrier_p, throw_v, omega, flight_time, skin_r);
+
+        // Does the ball arrive within catch radius of where the receiver will be?
+        let miss_dist = arrived.p.sub(catch_point).len();
+        if miss_dist > CATCH_RADIUS {
+            return false;
+        }
+
+        // Is a defender able to intercept? Check if any defender can reach the
+        // arrival point before the ball.
+        for &dp in defenders {
+            let def_dist = dp.sub(arrived.p).len();
+            let def_time = def_dist / DEF_CLOSE_SPEED;
+            if def_time < flight_time * 0.85 {
+                // Defender arrives comfortably before the ball — intercepted.
+                return false;
+            }
+        }
+        true
+    };
+
+    // Center shot.
+    if test_throw(lane_dir) {
+        hits += 1;
+    }
+
+    // Ring samples.
+    for i in 0..N_RING {
+        let angle = std::f64::consts::TAU * (i as f64) / (N_RING as f64);
+        let offset_y = SPREAD_RAD * angle.cos();
+        let offset_z = SPREAD_RAD * angle.sin();
+        // Perturbed direction: rotate lane_dir by small angular offset in
+        // the perp1/perp2 plane.
+        let perturbed = lane_dir
+            .add(perp1.scale(offset_y))
+            .add(perp2.scale(offset_z))
+            .norm();
+        if test_throw(perturbed) {
+            hits += 1;
+        }
+    }
+
+    hits as f64 / total as f64
+}
+
 /// Pragmatic + epistemic decomposition of Expected Free Energy for a
 /// candidate world target the agent could move toward (or hold). LOWER EFE
 /// is better (free energy is minimized). Each term is bounded so no single
@@ -430,6 +717,110 @@ mod tests {
             contact_ref: None,
             grounded: false,
         }
+    }
+
+    // ─── Pass-primitive tests ─────────────────────────────────────────────
+
+    #[test]
+    fn reception_quality_clear_lane_beats_blocked() {
+        // Use a short pass (~30m) so Coriolis drift is small and the score
+        // stays high for a clean lane.
+        let carrier = Vec3::new(0.0, 5.0, 0.0);
+        let receiver = Vec3::new(28.0, 5.0, 0.0);
+        let rv = Vec3::new(0.0, 0.0, 0.0);
+        // No defenders — perfect lane.
+        let clear = reception_quality(carrier, receiver, rv, &[], W, SKIN);
+        // Defender sitting in the middle of the lane.
+        let blocked = reception_quality(
+            carrier,
+            receiver,
+            rv,
+            &[Vec3::new(14.0, 5.0, 0.0)],
+            W,
+            SKIN,
+        );
+        assert!(clear > blocked, "clear {clear} should beat blocked {blocked}");
+        assert!(clear > 0.4, "a short open lane should score well: {clear}");
+    }
+
+    #[test]
+    fn reception_quality_far_defender_is_fine() {
+        // Short pass, defender well off to the side.
+        let carrier = Vec3::new(0.0, 5.0, 0.0);
+        let receiver = Vec3::new(25.0, 5.0, 0.0);
+        let rv = Vec3::new(0.0, 0.0, 0.0);
+        let score = reception_quality(
+            carrier,
+            receiver,
+            rv,
+            &[Vec3::new(12.0, 40.0, 0.0)],
+            W,
+            SKIN,
+        );
+        assert!(score > 0.3, "far defender shouldn't kill the score: {score}");
+    }
+
+    #[test]
+    fn pass_outcome_ev_good_pass_scores_positive() {
+        let from = Vec3::new(0.0, 5.0, 0.0);
+        // Throw forward toward a teammate.
+        let v0 = Vec3::new(22.0, 0.0, 0.0);
+        let teammates = &[(Vec3::new(30.0, 5.0, 0.0), Vec3::new(0.0, 0.0, 0.0))];
+        let defenders = &[Vec3::new(-50.0, 0.0, 0.0)]; // far away
+        let ev = pass_outcome_ev(from, v0, teammates, defenders, W, SKIN);
+        assert!(ev > 0.0, "a good forward pass should score positive: {ev}");
+    }
+
+    #[test]
+    fn pass_outcome_ev_no_teammate_scores_zero() {
+        let from = Vec3::new(0.0, 5.0, 0.0);
+        let v0 = Vec3::new(22.0, 0.0, 0.0);
+        // No teammates anywhere near the landing zone.
+        let teammates = &[(Vec3::new(-200.0, 0.0, 0.0), Vec3::new(0.0, 0.0, 0.0))];
+        let ev = pass_outcome_ev(from, v0, teammates, &[], W, SKIN);
+        assert_eq!(ev, 0.0, "unreachable teammate should yield 0");
+    }
+
+    #[test]
+    fn basin_width_open_field_is_wide() {
+        let carrier = Vec3::new(0.0, 5.0, 0.0);
+        let receiver = Vec3::new(25.0, 5.0, 0.0);
+        let rv = Vec3::new(0.0, 0.0, 0.0);
+        // No defenders — basin should be wide (most angles work).
+        let basin = reception_basin_width(carrier, receiver, rv, &[], W, SKIN);
+        assert!(basin > 0.5, "open-field basin should be wide: {basin}");
+    }
+
+    #[test]
+    fn basin_width_shrinks_with_close_defender() {
+        let carrier = Vec3::new(0.0, 5.0, 0.0);
+        let receiver = Vec3::new(25.0, 5.0, 0.0);
+        let rv = Vec3::new(0.0, 0.0, 0.0);
+        let open = reception_basin_width(carrier, receiver, rv, &[], W, SKIN);
+        // Defender right at the catch point.
+        let tight = reception_basin_width(
+            carrier,
+            receiver,
+            rv,
+            &[Vec3::new(24.0, 5.0, 0.0)],
+            W,
+            SKIN,
+        );
+        assert!(
+            open >= tight,
+            "defender at catch point should shrink basin: open={open} tight={tight}"
+        );
+    }
+
+    #[test]
+    fn reception_quality_is_deterministic() {
+        let c = Vec3::new(-10.0, 3.0, 2.0);
+        let r = Vec3::new(40.0, -5.0, 1.0);
+        let rv = Vec3::new(2.0, 0.5, 0.0);
+        let defs = &[Vec3::new(15.0, 0.0, 0.0), Vec3::new(20.0, -3.0, 1.0)];
+        let a = reception_quality(c, r, rv, defs, W, SKIN);
+        let b = reception_quality(c, r, rv, defs, W, SKIN);
+        assert_eq!(a.to_bits(), b.to_bits(), "must be deterministic");
     }
 
     #[test]

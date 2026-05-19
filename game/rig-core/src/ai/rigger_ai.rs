@@ -17,8 +17,8 @@
 //! `crate::ai::profile::Difficulty`.
 
 use super::decision_types::{
-    difficulty_scaling, CastPosture, DifficultyScaling, DirectorState, Job, PlayerAssignment,
-    PlayerCommit, PlayerCommitCache,
+    difficulty_scaling, CastPosture, DifficultyScaling, DirectorState, Job, PlayRole,
+    PlayerAssignment, PlayerCommit, PlayerCommitCache,
 };
 use super::efe;
 use super::gate_solve::{solve_gate_throw, THROW_MAX_SPEED, THROW_MIN_SPEED};
@@ -108,8 +108,8 @@ fn predict_skin_bounce(st: &mut PointState) {
 }
 
 // ── C3: athletic micro-control constants (RiggerAI.ts:72-85) ─────────────────
-const SETTLE_RADIUS: f64 = 6.0;
-const MICRO_DV_MAX: f64 = 2.0;
+const SETTLE_RADIUS: f64 = 18.0; // was 6.0 — covers grapple dead zone
+const MICRO_DV_MAX: f64 = 3.5; // was 2.0 — stronger corrections
 const PUSHOFF_ALIGN_COS: f64 = 0.35;
 
 fn axis_radius(p: Vec3) -> f64 {
@@ -1128,7 +1128,11 @@ pub fn compute_player_input(
     ));
 
     let pushoff = should_pushoff(player, target);
-    let thrumbler = settle_thrumbler(player, target);
+    let thrumbler = if catch_intent {
+        catch_brake_thrumbler(player, state)
+    } else {
+        settle_thrumbler(player, target)
+    };
 
     PlayerInput {
         id: player.id.clone(),
@@ -1210,6 +1214,28 @@ fn decide_nav_target(
     rng: &mut AiRng,
     style: Option<RoleStyle>,
 ) -> Vec3 {
+    // ── COORDINATED PLAY OVERRIDE ──────────────────────────────────────
+    // If the Director has an active play and assigned this player a role
+    // with a concrete target, navigate there. Play targets are designed
+    // to interlock — following them creates pass opportunities by
+    // construction. Only override if the play target is still reasonable
+    // (not stale, player isn't in a hard override state like dive).
+    if let Some(ref play) = director.active_play {
+        if let Some(pa) = play.assignments.get(&player.id) {
+            // Play targets take priority over independent positioning for:
+            // - Carrier: play tells them WHERE to carry to (not just "forward")
+            // - PrimaryReceiver / SecondaryReceiver: play tells them where to cut
+            // - Screen / DeepOption: play tells them where to station
+            //
+            // Do NOT override: Recover job (dive is time-critical), or if
+            // the player is the dive committer (handled elsewhere).
+            let dominated_by_dive = assignment.job == Job::Recover;
+            if !dominated_by_dive {
+                return pa.target;
+            }
+        }
+    }
+
     // RECOVER — WEAKEST USEFUL GRAPPLE toward the loose bell. The old code
     // either stern-chased or aimed a single argmin lead point. Instead we
     // predict the bell BAND (generative model) and go boldly for the band
@@ -1267,33 +1293,203 @@ fn decide_nav_target(
         return ip;
     }
 
-    // CARRIER: actively gain ground toward OUR attacking ring
-    // (keyed off ACTUAL possession too).
+    // CARRIER: pressure-reactive carrying — juke defenders, advance toward
+    // the best outlet teammate so passing lanes shorten as we drive.
     if assignment.job == Job::Carry
         || state.bell.held_by.as_deref() == Some(player.id.as_str())
     {
         let sgn = attack_sign(player.team);
         let ring_x = attack_ring_x(player.team);
-        let dist_to_ring = (ring_x - player.p.x).abs();
-        let step = 110.0_f64.min(dist_to_ring);
-        let ahead_x = player.p.x + sgn * step;
-        let r = axis_radius(player.p);
-        let target_r = r.min(6.0);
-        let yz_len = if r > 1e-6 { r } else { 1.0 };
-        return Vec3::new(
-            ahead_x,
-            (player.p.y / yz_len) * target_r,
-            (player.p.z / yz_len) * target_r,
-        );
+        let skin_r = REG_R;
+
+        // If the play system assigned us a carry target, use it as our
+        // destination (the play already factors in gate positioning and
+        // outlet alignment). Still apply pressure-juke on top.
+        let play_base = director.active_play.as_ref()
+            .and_then(|p| p.assignments.get(&player.id))
+            .map(|pa| pa.target);
+
+        // Gather defender positions.
+        let defenders: Vec<Vec3> = state
+            .players
+            .iter()
+            .filter(|p| p.team != player.team)
+            .map(|p| p.p)
+            .collect();
+
+        // Find nearest defender and their closing speed.
+        let mut nearest_def: Option<&Vec3> = None;
+        let mut nearest_dist = f64::INFINITY;
+        for dp in defenders.iter() {
+            let d = vlen(vsub(*dp, player.p));
+            if d < nearest_dist {
+                nearest_dist = d;
+                nearest_def = Some(dp);
+            }
+        }
+
+        // Baseline: use play target if available, else advance toward attack ring.
+        let (mut target_x, mut target_y, mut target_z) = if let Some(pt) = play_base {
+            (pt.x, pt.y, pt.z)
+        } else {
+            let dist_to_ring = (ring_x - player.p.x).abs();
+            let step = 110.0_f64.min(dist_to_ring);
+            let tx = player.p.x + sgn * step;
+            let r = axis_radius(player.p);
+            let yz_len = if r > 1e-6 { r } else { 1.0 };
+            let ty = player.p.y / yz_len * r.min(6.0);
+            let tz = player.p.z / yz_len * r.min(6.0);
+            (tx, ty, tz)
+        };
+
+        if let Some(def_p) = nearest_def {
+            if nearest_dist < 20.0 {
+                // Immediate pressure: juke perpendicular to the defender's
+                // approach vector (cross-radius dodge).
+                let approach = vnorm(vsub(player.p, *def_p));
+                // Perpendicular in the YZ plane (cross product with X axis).
+                let perp = Vec3::new(0.0, -approach.z, approach.y);
+                let perp_len = vlen(perp);
+                if perp_len > 1e-6 {
+                    let dodge = vscale(perp, 12.0 / perp_len);
+                    target_y += dodge.y;
+                    target_z += dodge.z;
+                }
+            } else if play_base.is_none() {
+                // No immediate pressure and no play target: carry toward
+                // the teammate with the best reception_quality so the pass
+                // lane shortens. (When a play target exists, it already
+                // encodes outlet alignment — skip independent search.)
+                let teammates: Vec<&PlayerSim> = state
+                    .players
+                    .iter()
+                    .filter(|p| p.team == player.team && p.id != player.id)
+                    .collect();
+                let mut best_rq = -1.0_f64;
+                let mut best_mate_p: Option<Vec3> = None;
+                for mate in teammates.iter() {
+                    let rq = efe::reception_quality(
+                        player.p, mate.p, mate.v, &defenders, state.omega, skin_r,
+                    );
+                    if rq > best_rq {
+                        best_rq = rq;
+                        best_mate_p = Some(mate.p);
+                    }
+                }
+                if let Some(mp) = best_mate_p {
+                    // Bias toward best outlet: blend 70% advance, 30% toward outlet.
+                    let dist_to_ring = (ring_x - player.p.x).abs();
+                    let step = 110.0_f64.min(dist_to_ring);
+                    let toward_mate = vsub(mp, player.p);
+                    let tl = vlen(toward_mate);
+                    if tl > 1e-6 {
+                        let pull = vscale(toward_mate, 0.3 * step / tl);
+                        target_x += pull.x;
+                        target_y += pull.y;
+                        target_z += pull.z;
+                    }
+                }
+            }
+        }
+
+        // Clamp radius inside the skin.
+        let out_r = (target_y * target_y + target_z * target_z).sqrt();
+        if out_r > skin_r * 0.85 {
+            let clamp = skin_r * 0.85 / out_r;
+            target_y *= clamp;
+            target_z *= clamp;
+        }
+        return Vec3::new(target_x, target_y, target_z);
     }
 
-    // Man-marking.
+    // Man-marking — proactive lane-denial, doubling, and rotation.
     if assignment.job == Job::Mark {
         if let Some(mark_id) = &assignment.mark_id {
             if let Some(mark) = state.players.iter().find(|p| &p.id == mark_id) {
                 let t_ring = Vec3::new(defend_ring_x(player.team), 0.0, 0.0);
                 let to_ring = vnorm(vsub(t_ring, mark.p));
                 let standoff = 8.0 - assignment.pressure * 5.4;
+
+                // Find the carrier (opponent holding the bell).
+                let carrier = state.bell.held_by.as_ref()
+                    .and_then(|hid| state.players.iter().find(|p| &p.id == hid));
+
+                // CASE 1: Ball is held by an opponent — read the passing lane.
+                if let Some(carrier) = carrier {
+                    if carrier.team != player.team {
+                        // The carrier→mark lane is the threat. Position to
+                        // deny this lane, not just goal-side of the mark.
+                        let lane = vsub(mark.p, carrier.p);
+                        let lane_len = vlen(lane);
+
+                        if lane_len > 5.0 {
+                            let lane_dir = vscale(lane, 1.0 / lane_len);
+
+                            // Station IN the passing lane between carrier and mark,
+                            // biased toward the mark (so we can still recover if
+                            // they cut). Position = mark - standoff along the lane
+                            // direction (between carrier and mark).
+                            let lane_pos = vsub(mark.p, vscale(lane_dir, standoff.max(4.0)));
+
+                            // Blend: high pressure = cheat MORE into the lane;
+                            // low pressure = stay closer to traditional goal-side.
+                            let lane_weight = (assignment.pressure * 1.4).clamp(0.0, 0.85);
+                            let goal_side = vadd(mark.p, vscale(to_ring, standoff));
+                            let base = vadd(
+                                vscale(lane_pos, lane_weight),
+                                vscale(goal_side, 1.0 - lane_weight),
+                            );
+
+                            // DOUBLING: if the carrier is very close to us (< 18m)
+                            // and our mark is far from the ball (> 25m), crash
+                            // toward the carrier to create a double-team. Our mark
+                            // is unlikely to receive soon.
+                            let carrier_dist = vlen(vsub(carrier.p, player.p));
+                            let mark_ball_dist = vlen(vsub(state.bell.p, mark.p));
+                            if carrier_dist < 18.0 && mark_ball_dist > 25.0 && assignment.pressure > 0.5 {
+                                let to_carrier = vnorm(vsub(carrier.p, player.p));
+                                let crash = vadd(base, vscale(to_carrier, 8.0));
+                                return crash;
+                            }
+
+                            return base;
+                        }
+                    }
+                }
+
+                // CASE 2: Ball is loose or in flight — rotate toward the ball.
+                // The mark just threw or the ball is loose. Don't stay locked
+                // on a player who doesn't have the ball — rotate toward where
+                // the ball is going to deny the next reception.
+                let ball_loose = state.bell.held_by.is_none();
+                if ball_loose {
+                    let to_bell = vsub(state.bell.p, mark.p);
+                    let bell_dist = vlen(to_bell);
+
+                    // If the ball is heading toward our mark (they might catch it),
+                    // tighten up and get between ball and mark.
+                    let bell_closing = if bell_dist > 1e-6 {
+                        -vdot(state.bell.v, to_bell) / (vlen(state.bell.v).max(1e-6) * bell_dist)
+                    } else {
+                        0.0
+                    };
+
+                    if bell_closing > 0.3 && bell_dist < 50.0 {
+                        // Ball heading toward our mark — get in the way!
+                        let intercept_pos = vadd(mark.p, vscale(vnorm(vsub(state.bell.p, mark.p)), standoff.min(6.0)));
+                        return intercept_pos;
+                    }
+
+                    // Ball not heading toward mark — sag off toward the ball
+                    // side to provide help defense (zone up).
+                    let sag_toward_ball = vnorm(vsub(state.bell.p, mark.p));
+                    let sag_dist = (standoff + 4.0).min(15.0);
+                    let base = vadd(mark.p, vscale(to_ring, standoff));
+                    return vadd(base, vscale(sag_toward_ball, sag_dist * 0.4));
+                }
+
+                // CASE 3: We have the ball (shouldn't be marking, but safety fallback).
+                // Traditional goal-side positioning.
                 let base = vadd(mark.p, vscale(to_ring, standoff));
                 if assignment.pressure > 0.7 {
                     let to_bell = vsub(state.bell.p, base);
@@ -1410,7 +1606,7 @@ fn wmax_coverage_target(
     // SUPPORT during a loose bell: heavier team-spread (don't clump),
     // lighter raw bell-responsiveness (the recover unit owns the ball),
     // stronger forward flow so the spread is a useful advancing shape.
-    let (w_crowd, w_redun, w_resp, w_fwd) = if support_during_loose {
+    let (w_crowd, w_redun, _w_resp, w_fwd) = if support_during_loose {
         (2.2_f64, 1.6_f64, 0.45_f64, 1.5_f64)
     } else {
         (1.0_f64, 1.0_f64, 1.0_f64, 1.0_f64)
@@ -1454,14 +1650,30 @@ fn wmax_coverage_target(
     let s_ang = style.map(|s| s.angle).unwrap_or(0.5);
     let s_rad = style.map(|s| s.radius).unwrap_or(0.5);
 
+    // Resolve carrier position for reception_quality scoring.
+    let carrier_p: Vec3 = director
+        .carrier_id
+        .as_ref()
+        .and_then(|cid| state.players.iter().find(|p| &p.id == cid))
+        .map(|c| c.p)
+        .unwrap_or(state.bell.p);
+
+    // Gather defender (opponent) positions.
+    let defender_positions: Vec<Vec3> = state
+        .players
+        .iter()
+        .filter(|p| p.team != team)
+        .map(|p| p.p)
+        .collect();
+
     // Candidate FAN: 3 depths along the attack axis × 4 cross angles ×
     // 2 radii — broad regions spanning the tube, not points.
     let depths = [-70.0_f64, 10.0, 90.0];
     let radii = [14.0_f64 + s_rad * 8.0, 30.0 + s_rad * 10.0];
     let mut best: Option<Vec3> = None;
-    let mut best_efe = f64::INFINITY;
+    let mut best_score = f64::NEG_INFINITY;
 
-    for (di, &dd) in depths.iter().enumerate() {
+    for (_di, &dd) in depths.iter().enumerate() {
         let cx = anchor_x + sgn * dd;
         for k in 0..4 {
             // Spread the four angles around the agent's stable style slice.
@@ -1472,41 +1684,31 @@ fn wmax_coverage_target(
                 let cand =
                     Vec3::new(cx, r * ang.cos(), r * ang.sin());
 
-                // PRAGMATIC: responsiveness to the predicted bell band.
-                // Offense wants to be a favorable future interceptor;
-                // defense wants to be able to deny it. Same quantity.
-                let resp = band.expected_response_gap(cand, ep.cov_close_v);
-                // Soften by forward intent so offense still flows up-field.
+                // RECEPTION-BASIN: "how good is cand as a pass target
+                // from the carrier's current position?" [0,1]
+                let rq = efe::reception_quality(
+                    carrier_p, cand, player.v, &defender_positions, omega, skin_r,
+                );
+
+                // Forward progress pull (advance the play).
                 let fwd = forward_progress(team, cand.x);
                 let fwd_pull = if defending {
                     0.0
                 } else {
-                    -(fwd / (crate::tuning::GATE_X.abs()))
+                    (fwd / crate::tuning::GATE_X.abs())
                         * ep.cov_fwd_pull_gain
                         * w_fwd
                 };
-                // PRAGMATIC term, ROLE-CONDITIONED: PRIMARY-style bodies
-                // want raw bell responsiveness (w_resp = 1); a loose-bell
-                // SUPPORT body deliberately DOWN-WEIGHTS it (the recover
-                // unit owns the ball) so its objective is dominated by
-                // coverage + advance, not by racing to the same point.
-                let pragmatic = resp * w_resp + fwd_pull;
 
-                // EPISTEMIC: team volume coverage, ROLE-CONDITIONED. The
-                // crowding/redundancy weights are amplified for loose-bell
-                // support so the team spreads into a coordinated shape.
+                // EPISTEMIC: anti-crowding + axis redundancy (prevent clumping).
+                // These are penalties (higher = worse), so we subtract them.
                 let crowd = vm.crowding_at(cand, &others);
                 let redun = vm.axis_redundancy(fwd, &others_fp);
-                let epistemic = crowd * ep.cov_crowd_w * w_crowd
-                    + redun * ep.cov_redun_w * w_redun;
+                let anti_crowd = crowd * ep.cov_crowd_w * w_crowd;
+                let axis_redun = redun * ep.cov_redun_w * w_redun;
 
-                // ANTI-SWARM STAND-OFF: a deterministic geometric penalty
-                // that fires only while the recover unit owns the loose
-                // ball — a candidate inside the bell's exclusive bubble is
-                // pure gawking and is pushed out. Smooth (quadratic)
-                // falloff so the gradient spreads the cluster rather than
-                // snapping it. Zero in all non-loose / non-support states
-                // ⇒ behaviour-preserving everywhere else.
+                // ANTI-SWARM STAND-OFF (unchanged): penalise gawking near
+                // the loose ball while the recover unit owns it.
                 let swarm_pen = if support_during_loose {
                     let db = (cand.x - bell_p.x)
                         .hypot(cand.y - bell_p.y)
@@ -1521,16 +1723,19 @@ fn wmax_coverage_target(
                     0.0
                 };
 
-                // Weakest-sufficient bias: prefer the central depth/radius
-                // (broader success-set, less committal) by a small bonus
-                // so among near-equal EFE the BROAD region wins.
-                let breadth_bonus =
-                    if di == 1 { ep.cov_breadth_bonus } else { 0.0 };
+                // Composite score (MAXIMIZE):
+                //   0.55 * reception_quality
+                //   0.20 * forward_progress pull
+                //   0.15 * anti-crowding (negated penalty)
+                //   0.10 * axis redundancy (negated penalty)
+                let total = 0.55 * rq
+                    + 0.20 * fwd_pull
+                    - 0.15 * anti_crowd
+                    - 0.10 * axis_redun
+                    - swarm_pen;
 
-                let total =
-                    pragmatic + epistemic + swarm_pen + breadth_bonus;
-                if total < best_efe {
-                    best_efe = total;
+                if total > best_score {
+                    best_score = total;
                     best = Some(cand);
                 }
             }
@@ -1574,6 +1779,26 @@ fn role_target(
         }
     };
 
+    // Prevent teammate stacking when role policies produce overlapping targets.
+    base = repel_from_teammates(base, player, state);
+
+    // Tempo: push targets forward on anticipated transitions.
+    let bell_loose = state.bell.held_by.is_none();
+    let thrown_by_opp = state
+        .bell
+        .thrown_by
+        .as_deref()
+        .and_then(|tid| state.players.iter().find(|p| p.id == tid))
+        .map(|p| p.team != player.team)
+        .unwrap_or(false);
+    let transition_forward = bell_loose && thrown_by_opp;
+
+    if transition_forward {
+        // Anticipate gaining possession — push forward.
+        let sgn = attack_sign(player.team);
+        base.x += sgn * 15.0;
+    }
+
     // OFFENSE REBUILD — the designated gate receiver stages just PAST the
     // next cast gate, near the spin axis (low cross-radius) so the carrier
     // can hit them and the completed pass clears the gate. This is the
@@ -1588,7 +1813,10 @@ fn role_target(
         return Vec3::new(director.gate_stage_x, r * ang.cos(), r * ang.sin());
     }
 
-    // Offensive receiver: override radius & axial depth from the Director slot.
+    // Offensive receiver: active separation-seeking around the Director's
+    // assigned depth slot. Among a small fan of nearby positions, pick the
+    // one that maximizes reception_quality from the carrier — receivers
+    // actively cut into open lanes rather than camping at fixed posts.
     if (assignment.job == Job::Receive || assignment.job == Job::Support)
         && player.role != RiggerRole::Reach
     {
@@ -1596,20 +1824,74 @@ fn role_target(
             .carrier_id
             .as_ref()
             .and_then(|cid| state.players.iter().find(|p| &p.id == cid));
-        let target_ring_x = director.attack_ring_x;
-        let from_x = carrier.map(|c| c.p.x).unwrap_or(state.bell.p.x);
-        let min_lead = director.attack_sign * 14.0;
-        let mut depth_x = from_x + (target_ring_x - from_x) * assignment.depth_slot;
-        if director.attack_sign > 0.0 {
-            depth_x = depth_x.max(from_x + min_lead);
+        let carrier_p = carrier.map(|c| c.p).unwrap_or(state.bell.p);
+
+        // If we have a play target, use it as the center of our search
+        // (instead of the Director's depth_slot/radius_slot center).
+        let play_center = director.active_play.as_ref()
+            .and_then(|p| p.assignments.get(&player.id))
+            .map(|pa| pa.target);
+
+        // Use play_center as the search center if available, else use the
+        // Director slot computation as before.
+        let (center_x, center_y, center_z) = if let Some(pc) = play_center {
+            (pc.x, pc.y, pc.z)
         } else {
-            depth_x = depth_x.min(from_x + min_lead);
+            let target_ring_x = director.attack_ring_x;
+            let from_x = carrier.map(|c| c.p.x).unwrap_or(state.bell.p.x);
+            let min_lead = director.attack_sign * 14.0;
+            let mut cx = from_x + (target_ring_x - from_x) * assignment.depth_slot;
+            if director.attack_sign > 0.0 {
+                cx = cx.max(from_x + min_lead);
+            } else {
+                cx = cx.min(from_x + min_lead);
+            }
+            let r_const = 45.0;
+            let cr = r_const * (0.12 + assignment.radius_slot * 0.7);
+            let c_ang = std::f64::consts::PI
+                * (0.15 + assignment.radius_slot * 0.7 + director.style_noise * 0.12);
+            (cx, cr * c_ang.cos(), cr * c_ang.sin())
+        };
+
+        let skin_r = REG_R;
+        let defender_positions: Vec<Vec3> = state
+            .players
+            .iter()
+            .filter(|p| p.team != player.team)
+            .map(|p| p.p)
+            .collect();
+
+        // Search a small fan around the center: +-15m depth, +-10m radius.
+        let depth_offsets = [-15.0_f64, -7.5, 0.0, 7.5, 15.0];
+        let radial_offsets = [-10.0_f64, -5.0, 0.0, 5.0, 10.0];
+        let mut best_pos = Vec3::new(center_x, center_y, center_z);
+        let mut best_rq = f64::NEG_INFINITY;
+
+        for &dx in depth_offsets.iter() {
+            let cx = center_x + dx;
+            for &dr in radial_offsets.iter() {
+                // Offset the radius — shift in the radial direction from axis.
+                let yz_len = (center_y * center_y + center_z * center_z).sqrt();
+                let (ny, nz) = if yz_len > 1e-6 {
+                    (center_y / yz_len, center_z / yz_len)
+                } else {
+                    (1.0, 0.0)
+                };
+                let new_r = (yz_len + dr).max(3.0).min(skin_r * 0.85);
+                let cy = ny * new_r;
+                let cz = nz * new_r;
+                let cand = Vec3::new(cx, cy, cz);
+
+                let rq = efe::reception_quality(
+                    carrier_p, cand, player.v, &defender_positions, state.omega, skin_r,
+                );
+                if rq > best_rq {
+                    best_rq = rq;
+                    best_pos = cand;
+                }
+            }
         }
-        let r_const = 45.0;
-        let r = r_const * (0.12 + assignment.radius_slot * 0.7);
-        let ang = std::f64::consts::PI
-            * (0.15 + assignment.radius_slot * 0.7 + director.style_noise * 0.12);
-        base = Vec3::new(depth_x, r * ang.cos(), r * ang.sin());
+        base = best_pos;
     }
     base
 }
@@ -1640,6 +1922,8 @@ fn should_pushoff(player: &PlayerSim, target: Vec3) -> bool {
 }
 
 /// settleThrumbler (RiggerAI.ts:742-762). Pure geometry, no rng.
+/// Velocity-aware: gentle nudge far out, firm correction mid-range, hard
+/// brake + settle close in. Covers the 6-18m grapple dead zone.
 fn settle_thrumbler(player: &PlayerSim, target: Vec3) -> Vec3 {
     let to_target = vsub(target, player.p);
     let dist = vlen(to_target);
@@ -1647,24 +1931,107 @@ fn settle_thrumbler(player: &PlayerSim, target: Vec3) -> Vec3 {
         return v3z();
     }
     let approach = vscale(to_target, 1.0 / dist);
-    let approach_mag = MICRO_DV_MAX.min(dist * 0.5);
     let speed = vlen(player.v);
-    let brake = if speed > 1e-6 {
-        vscale(player.v, -MICRO_DV_MAX.min(speed) / speed)
+
+    // How much of our velocity is aligned with the approach direction?
+    let v_along = if speed > 1e-6 {
+        vdot(player.v, approach)
     } else {
-        v3z()
+        0.0
     };
-    let closeness = 1.0 - dist / SETTLE_RADIUS;
-    let dv = vadd(
-        vscale(approach, approach_mag * (1.0 - 0.5 * closeness)),
-        vscale(brake, MICRO_DV_MAX * 0.6 * closeness),
-    );
+    // Perpendicular speed component — this needs braking most
+    let v_perp = (speed * speed - v_along * v_along).max(0.0).sqrt();
+
+    let dv = if dist > 12.0 {
+        // ── 12-18m: gentle correction (keep grapple dominant, just fix drift) ──
+        let approach_mag = MICRO_DV_MAX * 0.3;
+        // Gentle brake on perpendicular component only
+        let brake_strength = MICRO_DV_MAX * 0.2;
+        let brake = if speed > 1e-6 {
+            let v_perp_vec = vsub(player.v, vscale(approach, v_along));
+            let vp_len = vlen(v_perp_vec);
+            if vp_len > 1e-6 {
+                vscale(v_perp_vec, -brake_strength.min(vp_len) / vp_len)
+            } else {
+                v3z()
+            }
+        } else {
+            v3z()
+        };
+        vadd(vscale(approach, approach_mag), brake)
+    } else if dist > 6.0 {
+        // ── 6-12m: firm correction + progressive braking ──
+        let zone_t = 1.0 - (dist - 6.0) / 6.0; // 0 at 12m, 1 at 6m
+        let approach_mag = MICRO_DV_MAX * (0.4 + 0.3 * zone_t);
+        let perp_ratio = if speed > 1e-6 { v_perp / speed } else { 0.0 };
+        let brake_strength = MICRO_DV_MAX * (0.4 + 0.4 * perp_ratio) * (0.5 + 0.5 * zone_t);
+        let brake = if speed > 1e-6 {
+            vscale(player.v, -brake_strength.min(speed) / speed)
+        } else {
+            v3z()
+        };
+        vadd(vscale(approach, approach_mag), brake)
+    } else {
+        // ── < 6m: hard brake + fine settle (original behavior, enhanced) ──
+        let closeness = 1.0 - dist / 6.0; // 0 at 6m, 1 at 0m
+        let approach_mag = MICRO_DV_MAX.min(dist * 0.5);
+        let perp_ratio = if speed > 1e-6 { v_perp / speed } else { 0.0 };
+        let brake_strength = MICRO_DV_MAX * (0.6 + 0.3 * perp_ratio) * (0.5 + 0.5 * closeness);
+        let brake = if speed > 1e-6 {
+            vscale(player.v, -brake_strength.min(speed) / speed)
+        } else {
+            v3z()
+        };
+        vadd(
+            vscale(approach, approach_mag * (1.0 - 0.5 * closeness)),
+            brake,
+        )
+    };
+
     let mm = vlen(dv);
     if mm > MICRO_DV_MAX {
         vscale(dv, MICRO_DV_MAX / mm)
     } else {
         dv
     }
+}
+
+/// Catch-intent velocity matching thrumbler. When approaching the ball to
+/// catch it, brake relative velocity to stay within the absorb window.
+/// Pure geometry, deterministic, no rng.
+fn catch_brake_thrumbler(player: &PlayerSim, state: &SimState) -> Vec3 {
+    let bell_v = state.bell.v;
+    let rel = vsub(player.v, bell_v); // player's excess velocity over the ball
+    let rel_speed = vlen(rel);
+    if rel_speed < 2.0 {
+        return v3z(); // already well-matched
+    }
+    // Brake: oppose the relative velocity (try to match ball speed)
+    // Stronger as we get closer to the ball
+    let to_bell = vsub(state.bell.p, player.p);
+    let gap = vlen(to_bell);
+    let urgency = (1.0 - gap / 30.0).clamp(0.1, 1.0);
+    let brake_mag = (MICRO_DV_MAX * urgency).min(rel_speed);
+    vscale(rel, -brake_mag / rel_speed)
+}
+
+/// Repel a nav target away from nearby teammate positions to prevent
+/// stacking. Pure geometry, deterministic.
+fn repel_from_teammates(target: Vec3, player: &PlayerSim, state: &SimState) -> Vec3 {
+    let mut nudge = v3z();
+    for p in state.players.iter() {
+        if p.team != player.team || p.id == player.id {
+            continue;
+        }
+        let to_mate = vsub(target, p.p);
+        let dist = vlen(to_mate);
+        // Repel when within 16m — keep players spread.
+        if dist < 16.0 && dist > 1e-6 {
+            let strength = (1.0 - dist / 16.0) * 6.0; // up to 6m nudge
+            nudge = vadd(nudge, vscale(to_mate, strength / dist));
+        }
+    }
+    vadd(target, nudge)
 }
 
 /// navigateTo (RiggerAI.ts:769-833). C1 sticky anchor + RRT cache branch
@@ -1679,6 +2046,49 @@ fn navigate_to(
         pos,
         reel: commit.last_anchor_reel,
     });
+
+    // ── GRAPPLE COMMITMENT: if we have an active taut line and our swing
+    // is making progress toward the target, RIDE THE ARC instead of
+    // re-planning every tick. This eliminates micro-jitter from perpetual
+    // re-planning around a moving optimal anchor.
+    if let Some(line) = &player.line {
+        if line.taut {
+            let to_target = vsub(target, player.p);
+            let dist = vlen(to_target);
+            let speed = vlen(player.v);
+            // "Making progress" = closing on target at a reasonable rate.
+            let closing = if dist > 1e-6 && speed > 1e-6 {
+                vdot(player.v, to_target) / (speed * dist)
+            } else {
+                0.0
+            };
+
+            // Ride the arc if: we're closing on target (align > 0.1),
+            // OR we're far and fast (momentum-rich — let it play out),
+            // AND target hasn't jumped dramatically from what we planned for.
+            let target_stable = match commit.last_anchor_pos {
+                Some(ap) => vlen(vsub(target, ap)) < 60.0,
+                None => false,
+            };
+
+            if target_stable && (closing > 0.1 || (speed > 10.0 && dist > 20.0)) {
+                // Keep riding the current swing. Don't replan.
+                let reel = commit.last_anchor_reel;
+                let aim = if dist > 1e-6 {
+                    vnorm(to_target)
+                } else {
+                    Vec3::new(1.0, 0.0, 0.0)
+                };
+                return PartialInput {
+                    aim: Some(aim),
+                    fire_line_at: Some(None), // don't re-fire
+                    reel: Some(reel),
+                    release: Some(false),
+                    pushoff: Some(false),
+                };
+            }
+        }
+    }
 
     let plan: Option<GrapplePlan> = if rrt_active() {
         let age = state.tick - commit.rrt_plan_tick;
@@ -1713,7 +2123,9 @@ fn navigate_to(
         commit.last_anchor_pos = None;
     }
 
-    // SWOOP RELEASE.
+    // SWOOP RELEASE — aggressive: release into swing arcs early and let
+    // Coriolis curve carry us to the target. Don't require near-perfect
+    // alignment before releasing.
     if let Some(line) = &player.line {
         if line.taut {
             if let Some(p) = plan {
@@ -1721,15 +2133,25 @@ fn navigate_to(
                     let sp = vlen(player.v);
                     let to_t = vsub(target, player.p);
                     let dl = vlen(to_t);
-                    if sp > SWOOP_MIN_V
-                        && dl > 1e-6
-                        && vdot(player.v, to_t) / (sp * dl) > SWOOP_ALIGN
-                    {
-                        commit.last_anchor_pos = None;
-                        let soar_aim = vnorm(player.v);
-                        let mut pi = plan_to_input(None, soar_aim);
-                        pi.release = Some(true);
-                        return pi;
+                    if dl > 1e-6 {
+                        let align = vdot(player.v, to_t) / (sp.max(1e-6) * dl);
+
+                        // Release if we have reasonable speed and are heading
+                        // in a broadly correct direction.
+                        let speed_ok = sp > 5.0; // was SWOOP_MIN_V (8.0)
+                        let align_ok = align > 0.35; // was SWOOP_ALIGN (0.6)
+
+                        // Also release if we have HIGH speed even with moderate
+                        // alignment — momentum is king, don't waste a good swing.
+                        let momentum_release = sp > 12.0 && align > 0.15;
+
+                        if (speed_ok && align_ok) || momentum_release {
+                            commit.last_anchor_pos = None;
+                            let soar_aim = vnorm(player.v);
+                            let mut pi = plan_to_input(None, soar_aim);
+                            pi.release = Some(true);
+                            return pi;
+                        }
                     }
                 }
             }
@@ -1839,7 +2261,6 @@ fn decide_throw(
     // non-scoring throw should either clear the current cast gate into a
     // receiver or be a clearly retained advancing pass, not merely a forward
     // endpoint fling.
-    let good_enough = ep.throw_good_enough;
     let current_gate_fp = forward_progress(team, gate_world_x(team, m.cast.gate));
     let eval_candidate = |cand: &ThrowCandidate| -> f64 {
         // Roll far enough to see it cross the ring plane or settle.
@@ -1897,8 +2318,8 @@ fn decide_throw(
         let backward_pen = if gain < -20.0 { 0.4 } else { 0.0 };
 
         0.10
-            + 0.52 * reach
-            + 0.24 * gate_adv
+            + 0.38 * reach
+            + 0.38 * gate_adv
             + 0.18 * gain_norm.max(0.0)
             + cand.tactical_bias
             - skin_pen
@@ -1929,6 +2350,15 @@ fn decide_throw(
 
     // Seed 2: a lead pass to each teammate's predicted position (forward
     // ones first — we want to advance). These are seeds, not the answer.
+    //
+    // If a coordinated play is active, heavily bias toward the primary receiver.
+    let play_primary_id: Option<&str> = director.active_play.as_ref()
+        .and_then(|p| {
+            p.assignments.iter()
+                .find(|(_, a)| a.play_role == PlayRole::PrimaryReceiver)
+                .map(|(id, _)| id.as_str())
+        });
+
     for tm in teammates.iter() {
         // miss_open_chance: SAME draw the frozen spec made per teammate.
         if rng.next() < scaling.miss_open_chance {
@@ -1939,10 +2369,15 @@ fn decide_throw(
         {
             let is_gate_runner =
                 director.gate_receiver_id.as_deref() == Some(tm.id.as_str());
+            let is_play_primary =
+                play_primary_id == Some(tm.id.as_str());
+            let mut bias = 0.0_f64;
+            if is_gate_runner { bias += 0.20; }
+            if is_play_primary { bias += 0.35; }
             candidates.push(ThrowCandidate {
                 v0: lead.v0,
                 target_id: Some(tm.id.clone()),
-                tactical_bias: if is_gate_runner { 0.10 } else { 0.0 },
+                tactical_bias: bias,
             });
         }
     }
@@ -1968,96 +2403,77 @@ fn decide_throw(
         }
     }
 
-    // ── W-MAXING SELECTION: among FIT candidates, pick the WEAKEST =
-    // the one with the LARGEST TOLERANCE BAND (success-set under release
-    // error). We perturb each fit launch by a fixed fan of aim errors and
-    // count how many perturbations still clear good-enough. The throw that
-    // survives the most error is the least committal / most robust. ──────
-    let err_fan: [(f64, f64); 9] = [
-        (0.0, 0.0),
-        (1.0, 0.0),
-        (-1.0, 0.0),
-        (0.0, 1.0),
-        (0.0, -1.0),
-        (0.7, 0.7),
-        (0.7, -0.7),
-        (-0.7, 0.7),
-        (-0.7, -0.7),
-    ];
-    // Perturbation magnitude scaled to the difficulty's own throw variance
-    // band so "robust" means robust to THIS rigger's real error.
-    let err_mag = (3.0 + scaling.throw_variance * ep.throw_err_mag_scale).max(2.0);
+    // ── RECEPTION-PROBABILITY × OUTCOME-VALUE SELECTION: score each
+    // candidate by expected value of the pass (teammate catch likelihood,
+    // defender interception risk, forward progress, gate-clearing bonus).
+    // Pre-filter obviously terrible candidates, then select by EV. ──────
+
+    // Build teammate (position, velocity) pairs for efe::pass_outcome_ev.
+    let tm_with_vel: Vec<(Vec3, Vec3)> = teammates
+        .iter()
+        .map(|tm| (tm.p, tm.v))
+        .collect();
+    // Build defender positions.
+    let defender_positions: Vec<Vec3> = opponents
+        .iter()
+        .map(|op| op.p)
+        .collect();
 
     let mut best_candidate: Option<ThrowCandidate> = None;
-    let mut best_band: f64 = -1.0;
-    let mut best_center_q: f64 = 0.0;
+    let mut best_ev: f64 = f64::NEG_INFINITY;
 
     for cand in candidates.iter() {
         let rel_speed = vlen(vsub(cand.v0, player.v));
         if !(throw_min..=throw_max).contains(&rel_speed) || rel_speed < 1e-3 {
             continue;
         }
+        // Pre-filter: reject clearly bad candidates (backward, into skin)
+        // before the heavier pass_outcome_ev evaluation.
         let center_q = eval_candidate(cand);
-        if center_q < good_enough {
-            continue; // not FIT — its predicted outcome isn't good-enough.
-        }
-        // Tolerance band = fraction of the perturbed fan still good-enough.
-        let sp = vlen(cand.v0);
-        if sp < 1e-3 {
+        if center_q < 0.2 {
             continue;
         }
-        let unit = vscale(cand.v0, 1.0 / sp);
-        // Build two world axes perpendicular to the launch for the error
-        // fan (deterministic basis: cross with x then with y as fallback).
-        let mut a = Vec3::new(0.0, 1.0, 0.0);
-        if unit.y.abs() > 0.9 {
-            a = Vec3::new(1.0, 0.0, 0.0);
-        }
-        let e1 = vnorm(Vec3::new(
-            unit.y * a.z - unit.z * a.y,
-            unit.z * a.x - unit.x * a.z,
-            unit.x * a.y - unit.y * a.x,
-        ));
-        let e2 = vnorm(Vec3::new(
-            unit.y * e1.z - unit.z * e1.y,
-            unit.z * e1.x - unit.x * e1.z,
-            unit.x * e1.y - unit.y * e1.x,
-        ));
-        let mut hits = 0.0_f64;
-        for &(c1, c2) in err_fan.iter() {
-            let mut perturbed_cand = cand.clone();
-            perturbed_cand.v0 = vadd(
-                cand.v0,
-                vadd(vscale(e1, c1 * err_mag), vscale(e2, c2 * err_mag)),
-            );
-            if eval_candidate(&perturbed_cand) >= good_enough {
-                hits += 1.0;
-            }
-        }
-        let band = hits / err_fan.len() as f64;
-        // Weakest sufficient: maximize the tolerance band; break ties by
-        // center quality so among equally-robust throws we take the better.
-        if band > best_band + 1e-9
-            || (band > best_band - 1e-9 && center_q > best_center_q + 1e-9)
-        {
-            best_band = band;
-            best_center_q = center_q;
+        // Score by reception probability × outcome value.
+        let ev = efe::pass_outcome_ev(
+            player.p,
+            cand.v0,
+            &tm_with_vel,
+            &defender_positions,
+            omega,
+            skin_r,
+        );
+        // Incorporate tactical_bias from candidate generation (e.g. gate
+        // receiver bonus) as additive boost.
+        let ev = ev + cand.tactical_bias;
+        if ev > best_ev {
+            best_ev = ev;
             best_candidate = Some(cand.clone());
         }
     }
 
-    // ── Decide WHETHER to throw at all. With a wide good-enough band the
-    // common case is "yes" (that is the point — they should throw often).
-    // Stall pressure only ever LOOSENS this further. ────────────────────
+    // ── Decide WHETHER to throw at all. With EV-based selection we throw
+    // when the best option exceeds a value threshold — an advancing pass
+    // to a somewhat-open teammate is worth it. Under pressure/stall the
+    // threshold drops significantly. ──────────────────────────────────────
     let stall = cache.value.as_ref().unwrap().hold_ticks;
     let pressured = nearest_opponent_dist(player, &opponents) < ep.throw_pressure_dist;
     let force = stall > ep.throw_stall_force_ticks || m.cast.throws_left as f64 <= 1.0;
 
+    // Threshold: normal play requires a meaningful EV; pressure/stall
+    // lowers the bar so the carrier releases rather than getting stripped.
+    let ev_threshold = if force {
+        0.0
+    } else if pressured {
+        0.15
+    } else {
+        0.35
+    };
+
     let chosen = match best_candidate.clone() {
-        Some(v) => v,
-        None => {
-            // No fit candidate. If we're forced (stall/last throw) fling the
-            // most-forward seed anyway — a weak, robust release beats a dead
+        Some(v) if best_ev >= ev_threshold => v,
+        _ => {
+            // No candidate clears the threshold. If forced (stall/last
+            // throw) fling forward anyway — a weak release beats a dead
             // stuck carrier. Otherwise hold and keep carrying.
             if force {
                 ThrowCandidate {
@@ -2074,17 +2490,6 @@ fn decide_throw(
             }
         }
     };
-
-    // Acceptance: throw if we found a fit candidate, or if pressured/forced
-    // (a robust outlet under pressure beats holding into a strip).
-    let have_fit = best_candidate.is_some();
-    if !have_fit && !force && !pressured {
-        let commit = cache.value.as_mut().unwrap();
-        commit.throw_go = false;
-        commit.throw_target_id = None;
-        commit.throw_dir = None;
-        return;
-    }
 
     // Convert world launch → the throw the player imparts (sim adds v).
     let throw_vec = vsub(chosen.v0, player.v);
@@ -2237,6 +2642,7 @@ mod tests {
             style_noise: 0.3,
             gate_stage_x: crate::tuning::GATE_X * 0.25,
             gate_receiver_id: Some("H2".to_string()),
+            active_play: None,
         }
     }
 

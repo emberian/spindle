@@ -98,6 +98,44 @@ impl PlayerAssignment {
     }
 }
 
+/// Play kinds — coordinated multi-player patterns.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PlayKind {
+    GateRun,
+    OutletChain,
+    RecoveryFormation,
+    LooseBallRecovery,
+    PressureRelease,
+    SpreadAdvance,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PlayRole {
+    Carrier,
+    PrimaryReceiver,
+    SecondaryReceiver,
+    Screen,
+    DeepOption,
+}
+
+#[derive(Clone, Debug)]
+pub struct PlayAssignment {
+    pub play_role: PlayRole,
+    /// The concrete nav target for this tick (refreshed each Director window).
+    pub target: Vec3,
+}
+
+/// A coordinated play the Director has selected. Stable until duration
+/// expires or conditions invalidate it.
+#[derive(Clone, Debug)]
+pub struct ActivePlay {
+    pub kind: PlayKind,
+    /// Tick when the play was activated.
+    pub started_tick: f64,
+    /// Resolved player assignments: player_id → their play role + target.
+    pub assignments: HashMap<String, PlayAssignment>,
+}
+
 #[derive(Clone, Debug)]
 pub struct DirectorState {
     pub attacking_free: bool,
@@ -124,6 +162,8 @@ pub struct DirectorState {
     pub gate_stage_x: f64,
     /// The receiver running the gate-clearing route this window.
     pub gate_receiver_id: Option<String>,
+    /// The currently active coordinated play (if any).
+    pub active_play: Option<ActivePlay>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]

@@ -28,6 +28,9 @@ pub mod roles;
 // Port increment 4b decision-layer substrate: the cross-file shared
 // types of Director/RiggerAI/AiSystem (serialization point).
 pub mod decision_types;
+// Coordinated play library: interlocking position targets that produce
+// passing opportunities by construction (Director selects, players nav).
+pub mod plays;
 // Chamber-alive rebuild: active-inference + w-maxing controller substrate
 // (generative model, EFE pragmatic+epistemic terms, volume coverage).
 pub mod efe;

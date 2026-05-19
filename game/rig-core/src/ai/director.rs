@@ -36,7 +36,8 @@
 //! (the TS `import { pFall, pRise, pLoop } from './decide/ScoreEV'`).
 
 use super::decision_types::{
-    CastPosture, DirectorState, Job, PlayerAssignment, DIRECTOR_TICK_INTERVAL,
+    ActivePlay, CastPosture, DirectorState, Job, PlayAssignment, PlayKind, PlayRole,
+    PlayerAssignment, DIRECTOR_TICK_INTERVAL,
 };
 use super::efe;
 use super::orientation::{
@@ -377,6 +378,571 @@ fn assign_receivers(
     }
 }
 
+// ── PLAY SELECTION ─────────────────────────────────────────────────────────────
+// Coordinated multi-player play patterns. This layer runs AFTER role/job
+// assignment and adds interlocking nav targets ON TOP — it does not override
+// the Director's Job assignments.
+
+/// Maximum tube radius for clamped positions (rho < R * 0.85).
+const TUBE_CLAMP: f64 = REG_R * 0.85;
+
+/// Duration (in ticks) a play remains valid before re-evaluation.
+const PLAY_DURATION_TICKS: f64 = 90.0; // ~3 Director windows at 2Hz (30 ticks each)
+
+/// Clamp a Vec3 so its radial component (y,z) stays inside the tube.
+fn clamp_inside_tube(p: Vec3) -> Vec3 {
+    let rho = (p.y * p.y + p.z * p.z).sqrt();
+    if rho <= TUBE_CLAMP {
+        p
+    } else {
+        let scale = TUBE_CLAMP / rho;
+        Vec3::new(p.x, p.y * scale, p.z * scale)
+    }
+}
+
+/// Select a coordinated play pattern based on game state. Pure + deterministic.
+fn select_play(
+    state: &SimState,
+    _m: &MatchState,
+    team_side: TeamSide,
+    _profile: &TeamProfile,
+    director_out: &DirectorState,
+) -> ActivePlay {
+    let a_sign = director_out.attack_sign;
+    let a_ring_x = director_out.attack_ring_x;
+    let d_ring_x = director_out.defend_ring_x;
+    let tick = state.tick;
+
+    // Gather our team's players (excluding P1 human) and opponents.
+    let my_players: Vec<&PlayerSim> = state
+        .players
+        .iter()
+        .filter(|p| p.team == team_side && p.id != "P1")
+        .collect();
+    let opponents: Vec<&PlayerSim> = state
+        .players
+        .iter()
+        .filter(|p| p.team != team_side)
+        .collect();
+
+    // ── Phase determination ────────────────────────────────────────────────
+    let bell_pos = state.bell.p;
+    let _held_by_us = director_out.has_possession && !director_out.bell_loose;
+    let bell_loose = director_out.bell_loose;
+    let opponent_has_ball = !director_out.has_possession && !bell_loose;
+
+    // ── LOOSE BALL ─────────────────────────────────────────────────────────
+    if bell_loose {
+        // Mark the play kind so rigger_ai knows a loose-ball play is active.
+        // Leave concrete assignments minimal — the existing recover/shadow
+        // system handles the actual chasing.
+        return ActivePlay {
+            kind: PlayKind::LooseBallRecovery,
+            started_tick: tick,
+            assignments: HashMap::new(),
+        };
+    }
+
+    // ── DEFENSE (opponent has possession) ──────────────────────────────────
+    if opponent_has_ball {
+        return select_recovery_formation(
+            state, &my_players, bell_pos, d_ring_x, a_sign, tick,
+        );
+    }
+
+    // ── OFFENSE (we hold the bell) ─────────────────────────────────────────
+    // Find the carrier.
+    let carrier: Option<&PlayerSim> = director_out
+        .carrier_id
+        .as_ref()
+        .and_then(|cid| state.players.iter().find(|p| &p.id == cid));
+
+    let carrier = match carrier {
+        Some(c) => c,
+        None => {
+            // Fallback: no identifiable carrier, use SpreadAdvance.
+            return select_spread_advance(
+                &my_players, bell_pos, a_sign, a_ring_x, tick,
+            );
+        }
+    };
+
+    let carrier_pos = carrier.p;
+
+    // Distance from carrier to attack ring.
+    let dist_to_ring = (carrier_pos.x - a_ring_x).abs();
+
+    // Nearest defender distance to carrier.
+    let nearest_def_dist = opponents
+        .iter()
+        .map(|o| dist3(&carrier_pos, &o.p))
+        .fold(f64::INFINITY, f64::min);
+
+    // ── Condition evaluation (priority order) ──────────────────────────────
+    if nearest_def_dist < 14.0 {
+        // Carrier under immediate pressure → PressureRelease.
+        return select_pressure_release(
+            carrier, &my_players, a_sign, tick,
+        );
+    }
+
+    if dist_to_ring < 120.0 {
+        // Near the attack gate with a reasonably clear lane.
+        // "Reasonably clear" = no defender within 10m of the direct axis
+        // path from carrier to ring.
+        let lane_clear = opponents.iter().all(|o| {
+            // Project opponent onto the carrier→ring axis line and check
+            // perpendicular distance.
+            let dx = a_ring_x - carrier_pos.x;
+            if dx.abs() < 1.0 {
+                return true; // already at ring
+            }
+            let t = ((o.p.x - carrier_pos.x) / dx).clamp(0.0, 1.0);
+            let proj = Vec3::new(
+                carrier_pos.x + t * dx,
+                carrier_pos.y,
+                carrier_pos.z,
+            );
+            dist3(&o.p, &proj) > 10.0
+        });
+        if lane_clear {
+            return select_gate_run(
+                carrier, &my_players, &opponents, a_sign, a_ring_x, tick,
+            );
+        }
+    }
+
+    // Default offensive play: OutletChain.
+    select_outlet_chain(carrier, &my_players, &opponents, a_sign, a_ring_x, tick)
+}
+
+/// GateRun: carrier advances to within 50-70m of gate, receivers stage
+/// near and past the gate plane.
+fn select_gate_run(
+    carrier: &PlayerSim,
+    my_players: &[&PlayerSim],
+    opponents: &[&PlayerSim],
+    a_sign: f64,
+    a_ring_x: f64,
+    tick: f64,
+) -> ActivePlay {
+    let mut play_assignments: HashMap<String, PlayAssignment> = HashMap::new();
+
+    // Carrier target: advance to 50-70m from the gate, stay near axis.
+    let carrier_target_x = a_ring_x - a_sign * 60.0; // 60m from ring
+    let carrier_target = clamp_inside_tube(Vec3::new(carrier_target_x, 0.0, 0.0));
+    play_assignments.insert(
+        carrier.id.clone(),
+        PlayAssignment {
+            play_role: PlayRole::Carrier,
+            target: carrier_target,
+        },
+    );
+
+    // Find teammates (non-carrier).
+    let teammates: Vec<&&PlayerSim> = my_players
+        .iter()
+        .filter(|p| p.id != carrier.id)
+        .collect();
+
+    // Primary receiver: best-positioned teammate near the gate (furthest
+    // forward with best separation from defenders).
+    let primary = pick_best_receiver(&teammates, opponents, a_sign);
+    if let Some(prim) = primary {
+        // Just past gate plane, on-axis, offset slightly in Coriolis direction.
+        // Coriolis-favored = positive y (spinward drift in our coordinate frame).
+        let prim_target = clamp_inside_tube(Vec3::new(
+            a_ring_x - a_sign * 15.0, // just before gate
+            5.0,                        // slight Coriolis offset
+            0.0,
+        ));
+        play_assignments.insert(
+            prim.id.clone(),
+            PlayAssignment {
+                play_role: PlayRole::PrimaryReceiver,
+                target: prim_target,
+            },
+        );
+
+        // Secondary: hold 25m ahead of carrier at medium radius — safety valve.
+        let secondary = teammates
+            .iter()
+            .filter(|p| p.id != prim.id)
+            .min_by(|a, b| {
+                dist3(&a.p, &carrier.p)
+                    .partial_cmp(&dist3(&b.p, &carrier.p))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+        if let Some(sec) = secondary {
+            let sec_target = clamp_inside_tube(Vec3::new(
+                carrier.p.x + a_sign * 25.0,
+                0.0,
+                15.0, // medium radius offset
+            ));
+            play_assignments.insert(
+                sec.id.clone(),
+                PlayAssignment {
+                    play_role: PlayRole::SecondaryReceiver,
+                    target: sec_target,
+                },
+            );
+        }
+    }
+
+    // Remaining teammates: Screen or DeepOption.
+    let assigned_ids: Vec<String> = play_assignments.keys().cloned().collect();
+    for tm in &teammates {
+        if assigned_ids.contains(&tm.id) {
+            continue;
+        }
+        let role_target = clamp_inside_tube(Vec3::new(
+            carrier.p.x + a_sign * 10.0,
+            tm.p.y,
+            tm.p.z,
+        ));
+        play_assignments.insert(
+            tm.id.clone(),
+            PlayAssignment {
+                play_role: PlayRole::Screen,
+                target: role_target,
+            },
+        );
+    }
+
+    ActivePlay {
+        kind: PlayKind::GateRun,
+        started_tick: tick,
+        assignments: play_assignments,
+    }
+}
+
+/// OutletChain: carrier advances, receivers spread at 60% and 20m distances.
+fn select_outlet_chain(
+    carrier: &PlayerSim,
+    my_players: &[&PlayerSim],
+    opponents: &[&PlayerSim],
+    a_sign: f64,
+    a_ring_x: f64,
+    tick: f64,
+) -> ActivePlay {
+    let mut play_assignments: HashMap<String, PlayAssignment> = HashMap::new();
+
+    // Carrier: advance at current rate (target slightly ahead).
+    let carrier_target = clamp_inside_tube(Vec3::new(
+        carrier.p.x + a_sign * 20.0,
+        carrier.p.y,
+        carrier.p.z,
+    ));
+    play_assignments.insert(
+        carrier.id.clone(),
+        PlayAssignment {
+            play_role: PlayRole::Carrier,
+            target: carrier_target,
+        },
+    );
+
+    let teammates: Vec<&&PlayerSim> = my_players
+        .iter()
+        .filter(|p| p.id != carrier.id)
+        .collect();
+
+    // Primary: 60% of distance from carrier to attack ring, radius 15-25m.
+    let dist_to_ring = (carrier.p.x - a_ring_x).abs();
+    let primary = pick_best_receiver(&teammates, opponents, a_sign);
+    if let Some(prim) = primary {
+        let prim_x = carrier.p.x + a_sign * dist_to_ring * 0.6;
+        let prim_target = clamp_inside_tube(Vec3::new(prim_x, 0.0, 20.0));
+        play_assignments.insert(
+            prim.id.clone(),
+            PlayAssignment {
+                play_role: PlayRole::PrimaryReceiver,
+                target: prim_target,
+            },
+        );
+
+        // Secondary: 20m ahead of carrier, radius 8-12m (short dump).
+        let secondary = teammates
+            .iter()
+            .filter(|p| p.id != prim.id)
+            .min_by(|a, b| {
+                dist3(&a.p, &carrier.p)
+                    .partial_cmp(&dist3(&b.p, &carrier.p))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+        if let Some(sec) = secondary {
+            let sec_target = clamp_inside_tube(Vec3::new(
+                carrier.p.x + a_sign * 20.0,
+                0.0,
+                10.0,
+            ));
+            play_assignments.insert(
+                sec.id.clone(),
+                PlayAssignment {
+                    play_role: PlayRole::SecondaryReceiver,
+                    target: sec_target,
+                },
+            );
+        }
+    }
+
+    // Remaining teammates: DeepOption.
+    let assigned_ids: Vec<String> = play_assignments.keys().cloned().collect();
+    for tm in &teammates {
+        if assigned_ids.contains(&tm.id) {
+            continue;
+        }
+        let deep_target = clamp_inside_tube(Vec3::new(
+            carrier.p.x + a_sign * 40.0,
+            tm.p.y,
+            tm.p.z,
+        ));
+        play_assignments.insert(
+            tm.id.clone(),
+            PlayAssignment {
+                play_role: PlayRole::DeepOption,
+                target: deep_target,
+            },
+        );
+    }
+
+    ActivePlay {
+        kind: PlayKind::OutletChain,
+        started_tick: tick,
+        assignments: play_assignments,
+    }
+}
+
+/// PressureRelease: carrier holds, nearest cuts toward, rest holds.
+fn select_pressure_release(
+    carrier: &PlayerSim,
+    my_players: &[&PlayerSim],
+    _a_sign: f64,
+    tick: f64,
+) -> ActivePlay {
+    let mut play_assignments: HashMap<String, PlayAssignment> = HashMap::new();
+
+    // Carrier: hold current position.
+    let carrier_target = clamp_inside_tube(carrier.p);
+    play_assignments.insert(
+        carrier.id.clone(),
+        PlayAssignment {
+            play_role: PlayRole::Carrier,
+            target: carrier_target,
+        },
+    );
+
+    let teammates: Vec<&&PlayerSim> = my_players
+        .iter()
+        .filter(|p| p.id != carrier.id)
+        .collect();
+
+    // Primary (nearest teammate): cut TOWARD carrier (halve the gap).
+    let primary = teammates
+        .iter()
+        .min_by(|a, b| {
+            dist3(&a.p, &carrier.p)
+                .partial_cmp(&dist3(&b.p, &carrier.p))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+    if let Some(prim) = primary {
+        // Halve the gap between primary and carrier.
+        let midpoint = Vec3::new(
+            (prim.p.x + carrier.p.x) * 0.5,
+            (prim.p.y + carrier.p.y) * 0.5,
+            (prim.p.z + carrier.p.z) * 0.5,
+        );
+        let prim_target = clamp_inside_tube(midpoint);
+        play_assignments.insert(
+            prim.id.clone(),
+            PlayAssignment {
+                play_role: PlayRole::PrimaryReceiver,
+                target: prim_target,
+            },
+        );
+
+        // Secondary: stay put — the quick dump resolves in one throw.
+        let secondary = teammates
+            .iter()
+            .filter(|p| p.id != prim.id)
+            .min_by(|a, b| {
+                dist3(&a.p, &carrier.p)
+                    .partial_cmp(&dist3(&b.p, &carrier.p))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+        if let Some(sec) = secondary {
+            let sec_target = clamp_inside_tube(sec.p);
+            play_assignments.insert(
+                sec.id.clone(),
+                PlayAssignment {
+                    play_role: PlayRole::SecondaryReceiver,
+                    target: sec_target,
+                },
+            );
+        }
+    }
+
+    // Remaining teammates: Screen (hold position).
+    let assigned_ids: Vec<String> = play_assignments.keys().cloned().collect();
+    for tm in &teammates {
+        if assigned_ids.contains(&tm.id) {
+            continue;
+        }
+        let screen_target = clamp_inside_tube(tm.p);
+        play_assignments.insert(
+            tm.id.clone(),
+            PlayAssignment {
+                play_role: PlayRole::Screen,
+                target: screen_target,
+            },
+        );
+    }
+
+    ActivePlay {
+        kind: PlayKind::PressureRelease,
+        started_tick: tick,
+        assignments: play_assignments,
+    }
+}
+
+/// RecoveryFormation: station players between bell and our ring at staggered
+/// depths.
+fn select_recovery_formation(
+    _state: &SimState,
+    my_players: &[&PlayerSim],
+    bell_pos: Vec3,
+    d_ring_x: f64,
+    a_sign: f64,
+    tick: f64,
+) -> ActivePlay {
+    let mut play_assignments: HashMap<String, PlayAssignment> = HashMap::new();
+
+    // Sort players by distance to the bell (nearest first).
+    let mut sorted: Vec<&PlayerSim> = my_players.to_vec();
+    sorted.sort_by(|a, b| {
+        dist3(&a.p, &bell_pos)
+            .partial_cmp(&dist3(&b.p, &bell_pos))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    // The axis between bell and our ring.
+    let bell_to_ring_x = d_ring_x - bell_pos.x;
+
+    for (i, player) in sorted.iter().enumerate() {
+        let (role, target) = match i {
+            0 => {
+                // Station 1 (nearest to bell): between bell and our ring, 30m back.
+                let t_x = bell_pos.x - a_sign * 30.0;
+                (PlayRole::PrimaryReceiver, clamp_inside_tube(Vec3::new(t_x, 0.0, 0.0)))
+            }
+            1 => {
+                // Station 2 (midfield): halfway between bell and our ring.
+                let t_x = bell_pos.x + bell_to_ring_x * 0.5;
+                (PlayRole::SecondaryReceiver, clamp_inside_tube(Vec3::new(t_x, 0.0, 10.0)))
+            }
+            2 => {
+                // Station 3 (deep): near our ring — last back.
+                let t_x = d_ring_x - a_sign * 40.0; // 40m in front of our ring
+                (PlayRole::DeepOption, clamp_inside_tube(Vec3::new(t_x, 0.0, -10.0)))
+            }
+            _ => {
+                // Extra players: screen at varied positions.
+                let t_x = bell_pos.x + bell_to_ring_x * (0.3 + 0.15 * i as f64);
+                (PlayRole::Screen, clamp_inside_tube(Vec3::new(t_x, player.p.y, player.p.z)))
+            }
+        };
+        play_assignments.insert(
+            player.id.clone(),
+            PlayAssignment {
+                play_role: role,
+                target,
+            },
+        );
+    }
+
+    ActivePlay {
+        kind: PlayKind::RecoveryFormation,
+        started_tick: tick,
+        assignments: play_assignments,
+    }
+}
+
+/// SpreadAdvance fallback: spread players forward.
+fn select_spread_advance(
+    my_players: &[&PlayerSim],
+    bell_pos: Vec3,
+    a_sign: f64,
+    _a_ring_x: f64,
+    tick: f64,
+) -> ActivePlay {
+    let mut play_assignments: HashMap<String, PlayAssignment> = HashMap::new();
+
+    for (i, player) in my_players.iter().enumerate() {
+        let offset = 20.0 + 15.0 * i as f64;
+        let lateral = ((i as f64) * 12.0) - 18.0; // spread across y
+        let target = clamp_inside_tube(Vec3::new(
+            bell_pos.x + a_sign * offset,
+            lateral,
+            0.0,
+        ));
+        let role = match i {
+            0 => PlayRole::Carrier,
+            1 => PlayRole::PrimaryReceiver,
+            2 => PlayRole::SecondaryReceiver,
+            _ => PlayRole::DeepOption,
+        };
+        play_assignments.insert(
+            player.id.clone(),
+            PlayAssignment {
+                play_role: role,
+                target,
+            },
+        );
+    }
+
+    ActivePlay {
+        kind: PlayKind::SpreadAdvance,
+        started_tick: tick,
+        assignments: play_assignments,
+    }
+}
+
+/// Pick the best receiver from teammates: the one with the most forward
+/// progress and best separation from defenders. Deterministic (id tie-break).
+fn pick_best_receiver<'a>(
+    teammates: &[&&'a PlayerSim],
+    opponents: &[&PlayerSim],
+    _a_sign: f64,
+) -> Option<&'a PlayerSim> {
+    let mut best: Option<(f64, &'a PlayerSim)> = None;
+    for tm in teammates {
+        let fwd = forward_progress(tm.team, tm.p.x);
+        // Separation: nearest opponent distance (bounded).
+        let mut nearest_opp = f64::INFINITY;
+        for o in opponents {
+            let d = dist3(&tm.p, &o.p);
+            if d < nearest_opp {
+                nearest_opp = d;
+            }
+        }
+        if !nearest_opp.is_finite() {
+            nearest_opp = 60.0;
+        }
+        // Score: forward progress + bounded separation bonus.
+        let score = fwd + nearest_opp.min(40.0) * 0.5;
+        let take = match &best {
+            None => true,
+            Some((bs, bp)) => {
+                score > *bs + 1e-9
+                    || ((score - *bs).abs() <= 1e-9 && tm.id < bp.id)
+            }
+        };
+        if take {
+            best = Some((score, *tm));
+        }
+    }
+    best.map(|(_, p)| p)
+}
+
 // ── the Director itself (Director.ts:392-556) ────────────────────────────────
 
 /// Run the Director for one team. Call this at ~2 Hz; cache the result.
@@ -418,6 +984,9 @@ pub fn run_director(
     };
 
     // Possession / loose-bell determination.
+    // P1 is always the human-controlled player in live play (the AI system
+    // never emits inputs for it). In full-AI matches (skill_eval) there is
+    // no player named "P1" so this filter is a harmless no-op.
     let my_players: Vec<&PlayerSim> = state
         .players
         .iter()
@@ -742,7 +1311,7 @@ pub fn run_director(
         chosen
     };
 
-    DirectorState {
+    let mut director_out = DirectorState {
         attacking_free,
         attack_sign: a_sign,
         attack_ring_x: a_ring_x,
@@ -761,7 +1330,17 @@ pub fn run_director(
         style_noise,
         gate_stage_x,
         gate_receiver_id,
-    }
+        active_play: None,
+    };
+
+    // ── PLAY SELECTION ─────────────────────────────────────────────────
+    // After role/job assignment, select a coordinated play pattern that
+    // gives the assigned players interlocking targets. This layer does NOT
+    // override Job assignments — it adds coordinated nav targets ON TOP.
+    let active_play = select_play(state, m, team_side, profile, &director_out);
+    director_out.active_play = Some(active_play);
+
+    director_out
 }
 
 // ── RL-observation Director hints (a DERIVED READ for the policy obs) ───────
