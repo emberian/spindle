@@ -1,0 +1,69 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Spindle MAPPO Training Dashboard</title>
+  <link rel="stylesheet" href="dashboard.css">
+</head>
+<body>
+  <header>
+    <h1>Spindle <span class="cyan">MAPPO</span> Training</h1>
+    <div id="live-indicator">
+      <span class="dot"></span>
+      <span id="live-gen">Gen --</span>
+      <span id="live-throughput">-- trans/s</span>
+      <span id="live-eta">ETA --</span>
+    </div>
+  </header>
+
+  <main>
+    <section id="charts-panel">
+      <h2>Training Curves</h2>
+      <div class="chart-grid">
+        <div class="chart-container">
+          <h3>Reward</h3>
+          <canvas id="chart-reward" width="480" height="200"></canvas>
+        </div>
+        <div class="chart-container">
+          <h3>Win Rate</h3>
+          <canvas id="chart-winrate" width="480" height="200"></canvas>
+        </div>
+        <div class="chart-container">
+          <h3>Entropy</h3>
+          <canvas id="chart-entropy" width="480" height="200"></canvas>
+        </div>
+        <div class="chart-container">
+          <h3>Value Loss</h3>
+          <canvas id="chart-vloss" width="480" height="200"></canvas>
+        </div>
+      </div>
+    </section>
+
+    <section id="matches-panel">
+      <h2>Match Grid <span id="match-count" class="dim">(0 matches)</span></h2>
+      <div id="match-grid"></div>
+    </section>
+  </main>
+
+  <!-- Expanded match overlay -->
+  <div id="match-overlay" class="hidden">
+    <div id="match-overlay-content">
+      <button id="match-overlay-close">&times;</button>
+      <div id="match-detail-header"></div>
+      <div id="match-replay-container">
+        <svg id="match-replay-svg" viewBox="-120 -120 240 240"></svg>
+      </div>
+      <div id="match-replay-controls">
+        <button id="replay-play">Play</button>
+        <button id="replay-pause">Pause</button>
+        <input id="replay-scrub" type="range" min="0" max="100" value="0">
+        <span id="replay-tick">0 / 0</span>
+      </div>
+      <pre id="match-detail-json"></pre>
+    </div>
+  </div>
+
+  <script src="dashboard.js"></script>
+</body>
+</html>

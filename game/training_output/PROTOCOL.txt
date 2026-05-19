@@ -1,0 +1,144 @@
+Spindle MAPPO Training Dashboard — File Protocol
+=================================================
+
+The trainer writes files; the dashboard reads them. No IPC/HTTP between them.
+
+Directory layout:
+  training_output/
+    metrics.jsonl              <- append one JSON line per generation
+    matches/
+      index.json               <- array of all match metadata (rebuilt each gen)
+      {gen}_{seed}.json        <- per-match full data (metadata + replay frames)
+
+
+1. METRICS (metrics.jsonl)
+--------------------------
+One JSON object per line, appended after each generation completes.
+
+Schema (all fields optional except gen):
+{
+  "gen": <int>,                   // generation number (0-indexed)
+  "reward": <float>,              // best reward this generation
+  "win_rate": <float>,            // [0,1] win rate vs population
+  "entropy": <float>,             // policy entropy (or diversity count)
+  "value_loss": <float>,          // critic loss (or mean_fitness as proxy)
+  "best_fitness": <float>,        // ES best fitness
+  "mean_fitness": <float>,        // ES mean fitness
+  "vs_population_win_rate": <float>, // self-play win rate
+  "diversity": <int>,             // distinct opponents faced
+  "population_size": <int>,       // current population size
+  "transitions_per_sec": <float>, // throughput metric
+  "timestamp": <float>,           // unix epoch seconds (for ETA calc)
+  "total_generations": <int>      // planned total (for progress bar)
+}
+
+
+2. MATCH INDEX (matches/index.json)
+-----------------------------------
+A JSON array of match metadata objects. Rewritten (not appended) each time
+a new match completes, so the dashboard can poll a single file.
+
+Each entry:
+{
+  "id": "<gen>_<seed>",           // unique match identifier (also the filename)
+  "gen": <int>,                   // generation the match was played in
+  "home_policy": <string>,        // description of home policy (e.g. "trained_gen4")
+  "away_policy": <string>,        // description of away policy
+  "score_home": <int>,            // final home score
+  "score_away": <int>,            // final away score
+  "winner": "home" | "away" | null, // null = draw/truncated
+  "ticks": <int>,                 // match duration in sim ticks
+  "seed": <int>,                  // sim seed (deterministic replay key)
+  "snapshot_positions": [...]     // OPTIONAL: sparse position snapshots for
+                                  //   the grid thumbnail (see below)
+}
+
+
+3. MATCH DATA (matches/{id}.json)
+---------------------------------
+Full match file for expanded replay view. Same fields as the index entry
+PLUS a "frames" array with per-tick (or per-N-ticks) position data.
+
+{
+  ...same fields as index entry...,
+  "frames": [
+    {
+      "home": [[x,z], [x,z], [x,z], [x,z]],  // 4 home player positions (2D top-down)
+      "away": [[x,z], [x,z], [x,z], [x,z]],  // 4 away player positions
+      "bell": [x, z]                           // bell position
+    },
+    ...
+  ]
+}
+
+Coordinate system:
+  - Top-down view of the cylinder cross-section
+  - x, z in range approx [-100, 100] (normalized to cylinder radius)
+  - Origin = cylinder center
+  - Home team = cyan dots, Away team = orange dots, Bell = white diamond
+
+The trainer can write frames at any interval (every tick for short matches,
+every 10-50 ticks for long ones). The dashboard animates through them at
+4-8x speed for mini-replays, with a scrub bar for the expanded view.
+
+
+4. SNAPSHOT POSITIONS (for grid thumbnails)
+-------------------------------------------
+The "snapshot_positions" field in the index entry is a sparse array (2-5 frames)
+showing key moments. If omitted, the grid cell shows an empty circle.
+
+Format: same as "frames" entries above.
+
+
+5. INTEGRATION WITH TRAINER
+----------------------------
+The trainer binary needs two simple functions:
+
+  fn write_metrics(report: &GenReport, path: &Path) {
+      // Serialize report to JSON, append line to metrics.jsonl
+      use std::io::Write;
+      let mut f = std::fs::OpenOptions::new()
+          .create(true).append(true).open(path.join("metrics.jsonl")).unwrap();
+      writeln!(f, "{}", serde_json::to_string(report).unwrap()).unwrap();
+  }
+
+  fn write_match(match_data: &MatchData, dir: &Path) {
+      // Write the full match file
+      let path = dir.join("matches").join(format!("{}.json", match_data.id));
+      std::fs::write(&path, serde_json::to_string(match_data).unwrap()).unwrap();
+
+      // Rebuild the index (read all match files, collect metadata, write index.json)
+      rebuild_match_index(dir);
+  }
+
+  fn rebuild_match_index(dir: &Path) {
+      let matches_dir = dir.join("matches");
+      let mut index: Vec<serde_json::Value> = Vec::new();
+      for entry in std::fs::read_dir(&matches_dir).unwrap() {
+          let entry = entry.unwrap();
+          let name = entry.file_name().to_string_lossy().to_string();
+          if name == "index.json" || !name.ends_with(".json") { continue; }
+          if let Ok(data) = std::fs::read_to_string(entry.path()) {
+              if let Ok(mut val) = serde_json::from_str::<serde_json::Value>(&data) {
+                  // Strip frames from index entry (keep it small)
+                  val.as_object_mut().map(|o| o.remove("frames"));
+                  index.push(val);
+              }
+          }
+      }
+      // Sort by gen then seed for stable ordering
+      index.sort_by_key(|v| {
+          let gen = v["gen"].as_i64().unwrap_or(0);
+          let seed = v["seed"].as_i64().unwrap_or(0);
+          (gen, seed)
+      });
+      std::fs::write(
+          matches_dir.join("index.json"),
+          serde_json::to_string_pretty(&index).unwrap()
+      ).unwrap();
+  }
+
+The dashboard poll targets are:
+  - training_output/metrics.jsonl (GET, parse as JSONL)
+  - training_output/matches/index.json (GET, parse as JSON array)
+  - training_output/matches/{id}.json (GET on click, parse as JSON)
