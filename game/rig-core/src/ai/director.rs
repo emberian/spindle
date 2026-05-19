@@ -38,7 +38,10 @@
 use super::decision_types::{
     CastPosture, DirectorState, Job, PlayerAssignment, DIRECTOR_TICK_INTERVAL,
 };
-use super::orientation::{attack_ring_x, attack_sign, defend_ring_x, gate_world_x};
+use super::efe;
+use super::orientation::{
+    attack_ring_x, attack_sign, defend_ring_x, forward_progress, gate_world_x,
+};
 use super::profile::TeamProfile;
 use super::rng::AiRng;
 use super::score_ev::{p_fall, p_loop, p_rise};
@@ -464,44 +467,138 @@ pub fn run_director(
     let mut recover_id: Option<String> = None;
 
     if bell_loose {
-        // CHASE PACK: send the K nearest of OUR team converging on the bell.
-        // Deterministic: sort by distance, id tie-break, no rng.
-        let bell_p = state.bell.p;
-        let mut ordered: Vec<&PlayerSim> = my_players.clone();
-        ordered.sort_by(|a, b| {
-            let da = dist3(&a.p, &bell_p);
-            let db = dist3(&b.p, &bell_p);
-            if (da - db).abs() > 1e-6 {
-                da.partial_cmp(&db).unwrap()
-            } else if a.id < b.id {
-                std::cmp::Ordering::Less
+        // ── LOOSE-BELL COORDINATION (was: 3 nearest → all Recover = the
+        // gawk swarm). Now a co-designed unit assigned by predicted
+        // TIME-TO-INTERCEPT of the canon bell band, with distinct roles:
+        //
+        //   PRIMARY  (1)            min t_intercept → Job::Recover,
+        //                           recover_id = this id. The sole
+        //                           committed diver (is_dive_committer
+        //                           keeps it exactly one).
+        //   SHADOW   (1, if ≥3)     next-best t_intercept → Job::Recover
+        //                           but flagged SHADOW: it does NOT dive
+        //                           the live bell — it stations at the
+        //                           predicted REBOUND LOCUS (efe::
+        //                           rebound_locus) so a primary bobble
+        //                           drops the ball onto it. It can become
+        //                           the committer next window iff a
+        //                           deflection genuinely wins it the race
+        //                           (recover_id recompute) — never a
+        //                           second simultaneous diver.
+        //   OUTLET   (1, if ≥4)     best down-field free body in OPEN
+        //                           space → Job::Receive, staged so a
+        //                           clean catch has an immediate pass
+        //                           target (catch → outlet → advance).
+        //   REST                    unchanged: assign_receivers (if we
+        //                           will possess) / assign_marks (deny
+        //                           the opponent's best counter).
+        //
+        // Pure geometry + predicted t_intercept + id tie-breaks. No rng.
+        let band = efe::BellBand::predict(
+            state.bell.p, state.bell.v, state.omega, REG_R,
+        );
+
+        // (t_intercept, &player) for every available teammate, sorted by
+        // race-winner first, id tie-break (HashMap/iteration-order-free).
+        let mut raced: Vec<(f64, &PlayerSim)> = my_players
+            .iter()
+            .map(|p| (band.time_to_intercept(p.p, p.v), *p))
+            .collect();
+        raced.sort_by(|a, b| {
+            if (a.0 - b.0).abs() > 1e-9 {
+                a.0.partial_cmp(&b.0).unwrap()
             } else {
-                std::cmp::Ordering::Greater
+                a.1.id.cmp(&b.1.id)
             }
         });
-        let pack = ordered.len().min(3);
-        let pack_ids: std::collections::HashSet<String> =
-            ordered.iter().take(pack).map(|p| p.id.clone()).collect();
-        recover_id = if !ordered.is_empty() {
-            Some(ordered[0].id.clone())
+        let avail = raced.len();
+
+        // PRIMARY: the race winner.
+        let primary_id: Option<String> =
+            raced.first().map(|(_, p)| p.id.clone());
+        recover_id = primary_id.clone();
+        // SHADOW: the runner-up, but only if we can spare a 3rd body for
+        // the REST (a 2-body team must not strip its whole field).
+        let shadow_id: Option<String> = if avail >= 3 {
+            raced.get(1).map(|(_, p)| p.id.clone())
         } else {
             None
         };
-        for id in &pack_ids {
-            assignments.insert(
-                id.clone(),
-                PlayerAssignment {
-                    job: Job::Recover,
-                    mark_id: None,
-                    depth_slot: 0.0,
-                    radius_slot: 0.0,
-                    pressure: 0.0,
-                },
-            );
+
+        // The recover unit (primary + maybe shadow) — assigned FIRST so
+        // the REST passes below operate on the remaining bodies, then
+        // RE-ASSERTED last so receiver/mark passes never clobber a role.
+        let mut role_ids: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        if let Some(pid) = &primary_id {
+            role_ids.insert(pid.clone());
+            assignments
+                .insert(pid.clone(), PlayerAssignment::recover_primary());
         }
+        if let Some(sid) = &shadow_id {
+            role_ids.insert(sid.clone());
+            assignments
+                .insert(sid.clone(), PlayerAssignment::recover_shadow());
+        }
+
+        // OUTLET: only if we have a 4th free body (primary + shadow + at
+        // least one REST defender/receiver still leaves a spare). Pick the
+        // teammate furthest DOWN-FIELD (max forward_progress toward our
+        // attack ring) among the non-role bodies that is also in the most
+        // OPEN space (fewest nearby opponents) so a clean catch has a
+        // real, uncontested pass target. Deterministic score, id
+        // tie-break.
+        let outlet_id: Option<String> = if avail >= 4 {
+            let mut best: Option<(f64, &PlayerSim)> = None;
+            for p in my_players.iter() {
+                if role_ids.contains(&p.id) {
+                    continue;
+                }
+                let fwd = forward_progress(team_side, p.p.x);
+                // Openness: nearest opponent distance (bounded), bigger =
+                // more open. Pure geometry over the stable opponents Vec.
+                let mut nearest_opp = f64::INFINITY;
+                for o in opponents.iter() {
+                    let d = dist3(&p.p, &o.p);
+                    if d < nearest_opp {
+                        nearest_opp = d;
+                    }
+                }
+                if !nearest_opp.is_finite() {
+                    nearest_opp = 60.0;
+                }
+                // Down-field, in open space: forward progress plus a
+                // bounded openness credit (a far opponent ⇒ safe outlet).
+                let score = fwd + nearest_opp.min(30.0);
+                let take = match &best {
+                    None => true,
+                    Some((bs, bp)) => {
+                        score > *bs + 1e-9
+                            || ((score - *bs).abs() <= 1e-9
+                                && p.id < bp.id)
+                    }
+                };
+                if take {
+                    best = Some((score, *p));
+                }
+            }
+            best.map(|(_, p)| p.id.clone())
+        } else {
+            None
+        };
+        if let Some(oid) = &outlet_id {
+            role_ids.insert(oid.clone());
+            // Job::Receive so wants_catch + the receiver/gate-route slot
+            // machinery already light this body up as a pass target.
+            assignments
+                .insert(oid.clone(), PlayerAssignment::recover_outlet());
+        }
+
+        // REST: unchanged behavior — receivers if we'll possess, else
+        // man-mark to deny the opponent's best counter-intercept.
         let rest: Vec<PlayerSim> = my_players
             .iter()
-            .filter(|p| !pack_ids.contains(&p.id))
+            .filter(|p| !role_ids.contains(&p.id))
             .map(|p| (*p).clone())
             .collect();
         if has_possession || thrown_by_us {
@@ -515,18 +612,20 @@ pub fn run_director(
                 profile.aggression,
             );
         }
-        // Re-assert the pack last so receiver/mark passes never overwrite it.
-        for id in &pack_ids {
-            assignments.insert(
-                id.clone(),
-                PlayerAssignment {
-                    job: Job::Recover,
-                    mark_id: None,
-                    depth_slot: 0.0,
-                    radius_slot: 0.0,
-                    pressure: 0.0,
-                },
-            );
+
+        // Re-assert the coordinated roles LAST so the receiver/mark passes
+        // never overwrite primary/shadow/outlet.
+        if let Some(pid) = &primary_id {
+            assignments
+                .insert(pid.clone(), PlayerAssignment::recover_primary());
+        }
+        if let Some(sid) = &shadow_id {
+            assignments
+                .insert(sid.clone(), PlayerAssignment::recover_shadow());
+        }
+        if let Some(oid) = &outlet_id {
+            assignments
+                .insert(oid.clone(), PlayerAssignment::recover_outlet());
         }
     } else if held_by_us {
         // OFFENSE: the holder is the carrier; the rest are receivers.
@@ -796,10 +895,15 @@ mod tests {
         for k in d.assignments.keys() {
             assert!(team_ids.contains(&k.as_str()), "stray assignment {k}");
         }
-        // Slots in [0,1]; pressure in [0,1].
+        // Slots in [0,1]; pressure in [0,1]. EXCEPTION: the documented
+        // loose-bell SHADOW role is encoded by the reserved out-of-range
+        // sentinel `SHADOW_DEPTH_FLAG` on a `Job::Recover` assignment
+        // (role via existing job + reserved slot, no new Job variant) —
+        // that is a deliberate distinct encoding, not slot corruption,
+        // so the invariant explicitly recognizes it.
         for (id, a) in &d.assignments {
             assert!(
-                (0.0..=1.0).contains(&a.depth_slot),
+                a.is_shadow() || (0.0..=1.0).contains(&a.depth_slot),
                 "{id} depth_slot {} out of [0,1]",
                 a.depth_slot
             );

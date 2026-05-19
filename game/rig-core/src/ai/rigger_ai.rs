@@ -189,13 +189,24 @@ fn dive_intercept_gap(from: Vec3, from_v: Vec3, state: &SimState) -> f64 {
     band.expected_response_gap(from, close_v)
 }
 
-/// Is THIS rigger the one (or the designated backup) that should decisively
-/// hard-dive the loose bell? True iff: the bell is loose, ours-to-take
-/// (`wants_catch`), AND either (a) the Director named us the recover lead
-/// (`recover_id`) — the closest — OR (b) among the recover pack we win a
-/// deterministic best-predicted-intercept comparison (id tie-break) as the
-/// single backup. NOT all 8: only the lead + one backup commit; the rest
-/// keep their coverage / mark / receive roles. Deterministic.
+/// Is THIS rigger the SINGLE committed diver of the loose bell?
+///
+/// The loose-bell unit is now ROLE-DIFFERENTIATED by the Director: the
+/// PRIMARY (`recover_id`, min predicted t_intercept) is the SOLE committed
+/// diver. The SHADOW is also a `Job::Recover` member but is FLAGGED
+/// (`depth_slot == SHADOW_DEPTH_FLAG`) and must NEVER dive simultaneously
+/// — it stations on the rebound locus and only becomes the diver if the
+/// NEXT Director window recomputes `recover_id` onto it (a real deflection
+/// won it the race). So there is exactly ONE diver at any instant.
+///
+/// True iff the bell is loose, ours-to-take (`wants_catch`), AND either
+/// (a) the Director named us the primary (`recover_id`), OR (b) the
+/// FALLBACK: `recover_id` is somehow invalid (absent, not on our team, or
+/// the named primary can't take this bell) and, among the recover unit
+/// members that genuinely CAN take it AND are NOT the shadow, we win a
+/// deterministic best-predicted-intercept compare (id tie-break). The
+/// fallback keeps the team from freezing if the Director's pick is stale;
+/// it still yields exactly one diver. Deterministic, no rng.
 fn is_dive_committer(
     player: &PlayerSim,
     state: &SimState,
@@ -208,27 +219,54 @@ fn is_dive_committer(
     if !wants_catch(player, state, assignment) {
         return false;
     }
-    // The Director's nearest recover lead always commits.
-    if director.recover_id.as_deref() == Some(player.id.as_str()) {
+    // The SHADOW never dives via this path — it holds the rebound locus.
+    let i_am_shadow = assignment.is_shadow();
+    // The Director's named PRIMARY always commits (never the shadow).
+    if director.recover_id.as_deref() == Some(player.id.as_str())
+        && !i_am_shadow
+    {
         return true;
     }
-    // Otherwise: at most ONE backup, chosen as the recover-pack member
-    // (other than the lead) with the smallest predicted-intercept gap.
-    // Deterministic: gap compare, id tie-break, recover-job filter.
-    if assignment.job != Job::Recover {
+    // FALLBACK only when the named primary is invalid: not present on our
+    // team, or present but cannot actually take this bell right now. If
+    // the named primary is valid we defer to it (exactly one diver) and
+    // everyone else — including the shadow — holds their role.
+    let primary_valid = director
+        .recover_id
+        .as_deref()
+        .and_then(|rid| state.players.iter().find(|p| p.id == rid))
+        .map(|pp| {
+            pp.team == player.team
+                && director
+                    .assignments
+                    .get(&pp.id)
+                    .map(|a| wants_catch(pp, state, a))
+                    .unwrap_or(false)
+        })
+        .unwrap_or(false);
+    if primary_valid {
         return false;
     }
+    if i_am_shadow || assignment.job != Job::Recover {
+        return false;
+    }
+    // Recover-unit members that genuinely can take the bell and are not
+    // the shadow — deterministic best-intercept compare, id tie-break.
     let mut pack: Vec<&PlayerSim> = state
         .players
         .iter()
         .filter(|p| {
-            p.team == player.team
-                && director
-                    .assignments
-                    .get(&p.id)
-                    .map(|a| a.job == Job::Recover)
-                    .unwrap_or(false)
-                && director.recover_id.as_deref() != Some(p.id.as_str())
+            if p.team != player.team {
+                return false;
+            }
+            match director.assignments.get(&p.id) {
+                Some(a) => {
+                    a.job == Job::Recover
+                        && !a.is_shadow()
+                        && wants_catch(p, state, a)
+                }
+                None => false,
+            }
         })
         .collect();
     if pack.is_empty() {
@@ -902,6 +940,38 @@ fn decide_nav_target(
         let band = efe::BellBand::predict(
             state.bell.p, state.bell.v, state.omega, REG_R,
         );
+        // SHADOW / SAFETY: a flagged recover member does NOT chase the
+        // live bell — it stations at the predicted REBOUND LOCUS so a
+        // primary bobble drops the ball straight onto it. The rebound is
+        // rolled from the PRIMARY's predicted touch (recover_id's
+        // t_intercept against the same canon band) through the bobble
+        // damp + a short spill — distinct from, and never converging on,
+        // the primary's intercept point. If recover_id is unresolvable we
+        // fall back to a defensive station behind the band mid (still
+        // off the dive line). Pure geometry, deterministic, no rng.
+        if assignment.is_shadow() {
+            let t_primary = director
+                .recover_id
+                .as_deref()
+                .and_then(|rid| {
+                    state.players.iter().find(|p| p.id == rid)
+                })
+                .map(|pp| band.time_to_intercept(pp.p, pp.v))
+                // No resolvable primary: use the band mid horizon as a
+                // sane deterministic touch time.
+                .unwrap_or_else(|| {
+                    band.samples[band.samples.len() / 2].0
+                });
+            return efe::rebound_locus(
+                state.bell.p,
+                state.bell.v,
+                state.omega,
+                REG_R,
+                t_primary,
+            );
+        }
+        // PRIMARY recover: go boldly for the band sample this rigger is
+        // MOST favorable to intercept (the broad reachable region).
         // close_v = a confident reel/swoop closing speed; high so the
         // chosen sample is one we can actually get IN FRONT of.
         let ip = band.best_intercept_for(player.p, 24.0);
@@ -1012,7 +1082,7 @@ fn decide_nav_target(
 fn wmax_coverage_target(
     player: &PlayerSim,
     state: &SimState,
-    _director: &DirectorState,
+    director: &DirectorState,
     assignment: &PlayerAssignment,
     style: Option<RoleStyle>,
 ) -> Vec3 {
@@ -1021,7 +1091,9 @@ fn wmax_coverage_target(
     let omega = state.omega;
     let sgn = attack_sign(team);
     // EFE controller params (thread-local; production default is the
-    // verbatim former constants ⇒ behavior-preserving).
+    // verbatim former constants ⇒ behavior-preserving). The genome
+    // scaffold is UNCHANGED — role-conditioning below SCALES these
+    // existing params per role, it does not add genes.
     let ep = super::efe_params::efe_params();
 
     let band =
@@ -1033,11 +1105,65 @@ fn wmax_coverage_target(
         .collect();
     let vm = efe::VolumeModel::new(team, crate::tuning::GATE_X, skin_r);
 
+    // ── EFE ROLE-CONDITIONING (the conceptual core) ──────────────────────
+    // The free energy this controller minimizes is now CONDITIONED on the
+    // loose-bell coordination role, instead of every off-ball body sharing
+    // one objective and clumping. We do NOT add learner genes (the GA
+    // scaffold stays 14 wide, EfeParams::default() byte-verbatim): we
+    // scale the EXISTING term weights/anchor per role. Deterministic.
+    //
+    //   * bell loose & this is an off-ball SUPPORT body (the gawkers):
+    //     the EPISTEMIC team-spread term is AMPLIFIED and the candidate
+    //     fan is pushed OFF the bell point — the primary dives and the
+    //     shadow holds the spill, so a third body crowding the ball is
+    //     pure noise. This is the anti-swarm win: support spreads into
+    //     coverage of the chamber volume rather than gawking in a clump.
+    //   * a flagged SHADOW that somehow reaches here (it normally returns
+    //     from the recover nav): center coverage on the rebound region.
+    //   * ZONE / possession states: unchanged objective (default scale).
+    let bell_loose = state.bell.held_by.is_none();
+    let is_shadow = assignment.is_shadow();
+    let support_during_loose =
+        bell_loose && assignment.job == Job::Support;
+    // Role weight multipliers on the EXISTING params (1.0 = unchanged).
+    // SUPPORT during a loose bell: heavier team-spread (don't clump),
+    // lighter raw bell-responsiveness (the recover unit owns the ball),
+    // stronger forward flow so the spread is a useful advancing shape.
+    let (w_crowd, w_redun, w_resp, w_fwd) = if support_during_loose {
+        (2.2_f64, 1.6_f64, 0.45_f64, 1.5_f64)
+    } else {
+        (1.0_f64, 1.0_f64, 1.0_f64, 1.0_f64)
+    };
+    // Anti-swarm bell stand-off: a deterministic geometric penalty that
+    // grows as a candidate nears the live bell point while the recover
+    // unit owns it — the explicit "stop gawking on the ball" term. Pure
+    // geometry over the bell position; no rng, order-free.
+    let bell_p = state.bell.p;
+    const SWARM_STANDOFF_R: f64 = 26.0; // m — recover unit's exclusive bubble
+    const SWARM_STANDOFF_W: f64 = 4.0; // EFE weight of intruding it
+
     // Defense (Zone) anchors nearer our own ring; offense (Support / role)
-    // anchors around the bell and ahead toward the attack gate.
+    // anchors around the bell and ahead toward the attack gate. A SHADOW
+    // that falls through here anchors on the predicted rebound locus.
     let defending = assignment.job == Job::Zone;
-    let anchor_x = if defending {
+    let anchor_x = if is_shadow {
+        let t_primary = director
+            .recover_id
+            .as_deref()
+            .and_then(|rid| state.players.iter().find(|p| p.id == rid))
+            .map(|pp| band.time_to_intercept(pp.p, pp.v))
+            .unwrap_or_else(|| band.samples[band.samples.len() / 2].0);
+        efe::rebound_locus(
+            state.bell.p, state.bell.v, omega, skin_r, t_primary,
+        )
+        .x
+    } else if defending {
         defend_ring_x(team) + sgn * ep.cov_defense_anchor_ahead
+    } else if support_during_loose {
+        // Push the coverage fan AHEAD of the bell, down our advance axis,
+        // so support pre-positions for the catch→outlet→advance payoff
+        // instead of converging on the loose ball.
+        state.bell.p.x + sgn * (ep.cov_offense_anchor_ahead + 36.0)
     } else {
         state.bell.p.x + sgn * ep.cov_offense_anchor_ahead
     };
@@ -1074,22 +1200,54 @@ fn wmax_coverage_target(
                 let fwd_pull = if defending {
                     0.0
                 } else {
-                    -(fwd / (crate::tuning::GATE_X.abs())) * ep.cov_fwd_pull_gain
+                    -(fwd / (crate::tuning::GATE_X.abs()))
+                        * ep.cov_fwd_pull_gain
+                        * w_fwd
                 };
-                let pragmatic = resp + fwd_pull;
+                // PRAGMATIC term, ROLE-CONDITIONED: PRIMARY-style bodies
+                // want raw bell responsiveness (w_resp = 1); a loose-bell
+                // SUPPORT body deliberately DOWN-WEIGHTS it (the recover
+                // unit owns the ball) so its objective is dominated by
+                // coverage + advance, not by racing to the same point.
+                let pragmatic = resp * w_resp + fwd_pull;
 
-                // EPISTEMIC: team volume coverage. Don't collapse on
-                // teammates; don't stack at one depth.
+                // EPISTEMIC: team volume coverage, ROLE-CONDITIONED. The
+                // crowding/redundancy weights are amplified for loose-bell
+                // support so the team spreads into a coordinated shape.
                 let crowd = vm.crowding_at(cand, &others);
                 let redun = vm.axis_redundancy(fwd, &others_fp);
-                let epistemic = crowd * ep.cov_crowd_w + redun * ep.cov_redun_w;
+                let epistemic = crowd * ep.cov_crowd_w * w_crowd
+                    + redun * ep.cov_redun_w * w_redun;
+
+                // ANTI-SWARM STAND-OFF: a deterministic geometric penalty
+                // that fires only while the recover unit owns the loose
+                // ball — a candidate inside the bell's exclusive bubble is
+                // pure gawking and is pushed out. Smooth (quadratic)
+                // falloff so the gradient spreads the cluster rather than
+                // snapping it. Zero in all non-loose / non-support states
+                // ⇒ behaviour-preserving everywhere else.
+                let swarm_pen = if support_during_loose {
+                    let db = (cand.x - bell_p.x)
+                        .hypot(cand.y - bell_p.y)
+                        .hypot(cand.z - bell_p.z);
+                    if db < SWARM_STANDOFF_R {
+                        let t = 1.0 - db / SWARM_STANDOFF_R;
+                        SWARM_STANDOFF_W * t * t
+                    } else {
+                        0.0
+                    }
+                } else {
+                    0.0
+                };
 
                 // Weakest-sufficient bias: prefer the central depth/radius
                 // (broader success-set, less committal) by a small bonus
                 // so among near-equal EFE the BROAD region wins.
-                let breadth_bonus = if di == 1 { ep.cov_breadth_bonus } else { 0.0 };
+                let breadth_bonus =
+                    if di == 1 { ep.cov_breadth_bonus } else { 0.0 };
 
-                let total = pragmatic + epistemic + breadth_bonus;
+                let total =
+                    pragmatic + epistemic + swarm_pen + breadth_bonus;
                 if total < best_efe {
                     best_efe = total;
                     best = Some(cand);
