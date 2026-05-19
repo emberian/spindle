@@ -9,7 +9,7 @@
 // not-yet-consumed surface; tightened when the facade lands.
 #![allow(dead_code, unused_imports)]
 
-mod math;
+pub mod math;
 mod rng;
 mod trajectory;
 mod tuning;
@@ -39,7 +39,7 @@ mod match_sm;
 // root for the src/ai/** port — shared frozen types, bit-exact ai_rng,
 // Orientation, TeamProfile). decide/* + roles/* + RiggerAI/Director/
 // AiSystem land on this in subsequent sub-increments.
-mod ai;
+pub mod ai;
 // Increment 5: the wasm-bindgen RigAi boundary — exposes the ported
 // AiSystem to TS so the browser runs the Rust AI (TS AI deleted).
 mod ai_wasm;
@@ -80,7 +80,7 @@ mod wasm;
 // not(wasm32) cfg) and has no place in the browser cdylib. Determinism
 // is preserved by construction — see gym.rs for the argument.
 #[cfg(not(target_arch = "wasm32"))]
-mod gym;
+pub mod gym;
 // THE RL AGENT: a shared-parameter deterministic MLP policy + a seeded
 // gradient-free CEM trainer driving the gym (fitness = the gym's PURE
 // intrinsic Reward, NO shaping), plus an OFFLINE strategy judge.
@@ -94,7 +94,7 @@ mod gym;
 // `cfg(not(target_arch = "wasm32"))` INSIDE rl/mod.rs exactly like
 // gym/coord_learner/skill_eval/ga, so the wasm build still pulls
 // neither rayon nor rand.
-mod rl;
+pub mod rl;
 
 // The browser seam to the TRAINED policy: `RigPolicy` (wasm-bindgen),
 // mirroring `RigAi`'s JSON contract. Ungated — it compiles into the
