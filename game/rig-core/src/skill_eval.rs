@@ -74,30 +74,21 @@ const CAP: Caps = Caps {
     shot_conv: 0.4,
     chain: 4.0,
 };
-// WT (Σ = 1.00). `prog` is PARKED at weight 0: Fix A proved its ~0 is
-// NOT a measurement artifact — the gate-progression mechanic is
-// structurally never exercised in headless AI play (scoring is
-// by-design gate-decoupled; the re-arm resets cast every score/
-// turnover; the AI never pursues gate-climb as strategy). At its old
-// 0.18 it was the LARGEST weight on a signal that is 0 for all 9
-// competent planners and only positive for the worst one (RRT, via
-// thrash-chaos) — i.e. 18% dead/anti-signal. The other 8 weights are
-// the original values renormalised ×1/0.82 (mutual proportions
-// unchanged ⇒ competent-planner ranking and the Coordination
-// production default are provably unaffected; only the dilution and
-// RRT's undeserved bonus are removed). `prog`/`gateClears` are still
-// computed + printed for diagnostics; restore a real `prog` weight
-// when task #36 makes the AI actually pursue gate progression.
+// WT (Σ = 1.00). This is a skill model, not a planner-comfort model:
+// gate progression, retained passes and scoring are the core sport signals.
+// Possession/calm/field remain useful diagnostics, but they are deliberately
+// low-weight because they are easy to Goodhart via holding, low-event play or
+// conservative anti-thrash behavior.
 const WT: [(&str, f64); 9] = [
-    ("prog", 0.0),
-    ("pass", 0.15 / 0.82),
-    ("intc", 0.08 / 0.82),
-    ("score", 0.16 / 0.82),
-    ("poss", 0.07 / 0.82),
-    ("calm", 0.12 / 0.82),
-    ("field", 0.06 / 0.82),
-    ("shotConv", 0.10 / 0.82),
-    ("chain", 0.08 / 0.82),
+    ("prog", 0.22),
+    ("pass", 0.14),
+    ("intc", 0.08),
+    ("score", 0.18),
+    ("poss", 0.04),
+    ("calm", 0.08),
+    ("field", 0.04),
+    ("shotConv", 0.12),
+    ("chain", 0.10),
 ];
 
 fn score_pts(k: scoring::ScoreKind) -> f64 {

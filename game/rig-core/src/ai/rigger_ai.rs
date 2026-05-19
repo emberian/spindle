@@ -1825,14 +1825,25 @@ fn decide_throw(
         })
         .collect();
 
-    // ── Outcome quality of a world launch v0 (the PRAGMATIC evaluator). ──
-    // Roll the bell with the canon model from the release; return a scalar
-    // in roughly [0,1+] where >= GOOD_ENOUGH means "this is a good throw".
-    // Higher = better. No RNG.
+    #[derive(Clone, Debug)]
+    struct ThrowCandidate {
+        v0: Vec3,
+        target_id: Option<String>,
+        tactical_bias: f64,
+    }
+
+    // ── Outcome quality of a candidate world launch (the PRAGMATIC evaluator).
+    // Roll the bell with the canon model from the release; return a scalar in
+    // roughly [0,1+] where >= GOOD_ENOUGH means "this is a good throw".
+    // Higher = better. No RNG. This is aligned to the match layer: a useful
+    // non-scoring throw should either clear the current cast gate into a
+    // receiver or be a clearly retained advancing pass, not merely a forward
+    // endpoint fling.
     let good_enough = ep.throw_good_enough;
-    let eval_launch = |v0: Vec3| -> f64 {
+    let current_gate_fp = forward_progress(team, gate_world_x(team, m.cast.gate));
+    let eval_candidate = |cand: &ThrowCandidate| -> f64 {
         // Roll far enough to see it cross the ring plane or settle.
-        let st = efe::roll_forward(player.p, v0, omega, ep.throw_eval_horizon, skin_r);
+        let st = efe::roll_forward(player.p, cand.v0, omega, ep.throw_eval_horizon, skin_r);
         let end_fp = forward_progress(team, st.p.x);
         let end_rho = st.p.y.hypot(st.p.z);
 
@@ -1847,29 +1858,55 @@ fn decide_throw(
         }
 
         // (b) ADVANCE + CATCHABLE: bell ends meaningfully forward of us and
-        // near a teammate's predicted spot (a completable pass / coverage).
+        // near the intended receiver's predicted spot (or a teammate if this
+        // is an untargeted emergency release).
         let gain = forward_progress(team, st.p.x) - my_fp;
         let mut nearest_tm = f64::INFINITY;
-        for (_i, tp) in tm_future.iter() {
+        let mut target_tm = f64::INFINITY;
+        for (i, tp) in tm_future.iter() {
             let d = (st.p.x - tp.x).hypot(st.p.y - tp.y).hypot(st.p.z - tp.z);
             if d < nearest_tm {
                 nearest_tm = d;
             }
+            if cand
+                .target_id
+                .as_deref()
+                .map(|tid| teammates[*i].id == tid)
+                .unwrap_or(false)
+            {
+                target_tm = d;
+            }
         }
         // Reachable if a teammate is within a generous catch envelope of the
         // bell's settle point (wide on purpose — weakest-sufficient).
-        let reach = (1.0 - (nearest_tm / ep.throw_reach_radius)).clamp(0.0, 1.0);
+        let catch_dist = if cand.target_id.is_some() && target_tm.is_finite() {
+            target_tm
+        } else {
+            nearest_tm
+        };
+        let reach = (1.0 - (catch_dist / ep.throw_reach_radius)).clamp(0.0, 1.0);
         let gain_norm = (gain / 120.0).clamp(-0.5, 1.0);
+        let gate_adv = if end_fp >= current_gate_fp - 2.0 {
+            1.0
+        } else {
+            0.0
+        };
 
         // Don't reward flinging it into the skin or behind us.
         let skin_pen = if end_rho > skin_r * 0.96 { 0.25 } else { 0.0 };
         let backward_pen = if gain < -20.0 { 0.4 } else { 0.0 };
 
-        0.30 + 0.45 * reach + 0.35 * gain_norm - skin_pen - backward_pen
+        0.10
+            + 0.52 * reach
+            + 0.24 * gate_adv
+            + 0.18 * gain_norm.max(0.0)
+            + cand.tactical_bias
+            - skin_pen
+            - backward_pen
     };
 
     // ── Build the ACTION REPERTOIRE of world launches. ──────────────────
-    let mut candidates: Vec<Vec3> = Vec::new();
+    let mut candidates: Vec<ThrowCandidate> = Vec::new();
 
     // Seed 1: the gate closed-form (still a fine candidate — just no longer
     // the ONLY acceptable throw, and no longer required to be near-exact).
@@ -1882,7 +1919,11 @@ fn decide_throw(
             profile.loop_propensity,
             player.v,
         ) {
-            candidates.push(g.v0);
+            candidates.push(ThrowCandidate {
+                v0: g.v0,
+                target_id: None,
+                tactical_bias: 0.0,
+            });
         }
     }
 
@@ -1896,7 +1937,13 @@ fn decide_throw(
         if let Some(lead) =
             solve_lead_velocity(player.p, throw_speed, tm.p, tm.v, omega)
         {
-            candidates.push(lead.v0);
+            let is_gate_runner =
+                director.gate_receiver_id.as_deref() == Some(tm.id.as_str());
+            candidates.push(ThrowCandidate {
+                v0: lead.v0,
+                target_id: Some(tm.id.clone()),
+                tactical_bias: if is_gate_runner { 0.10 } else { 0.0 },
+            });
         }
     }
 
@@ -1912,7 +1959,11 @@ fn decide_throw(
         for &(dy, dz) in yz.iter() {
             let dir = vnorm(Vec3::new(base.x, base.y + dy, base.z + dz));
             for &sp in speeds.iter() {
-                candidates.push(vscale(dir, sp));
+                candidates.push(ThrowCandidate {
+                    v0: vscale(dir, sp),
+                    target_id: None,
+                    tactical_bias: 0.0,
+                });
             }
         }
     }
@@ -1937,21 +1988,25 @@ fn decide_throw(
     // band so "robust" means robust to THIS rigger's real error.
     let err_mag = (3.0 + scaling.throw_variance * ep.throw_err_mag_scale).max(2.0);
 
-    let mut best_v0: Option<Vec3> = None;
+    let mut best_candidate: Option<ThrowCandidate> = None;
     let mut best_band: f64 = -1.0;
     let mut best_center_q: f64 = 0.0;
 
-    for &v0 in candidates.iter() {
-        let sp = vlen(v0);
-        if !(throw_min..=throw_max + 8.0).contains(&sp) || sp < 1e-3 {
+    for cand in candidates.iter() {
+        let rel_speed = vlen(vsub(cand.v0, player.v));
+        if !(throw_min..=throw_max).contains(&rel_speed) || rel_speed < 1e-3 {
             continue;
         }
-        let center_q = eval_launch(v0);
+        let center_q = eval_candidate(cand);
         if center_q < good_enough {
             continue; // not FIT — its predicted outcome isn't good-enough.
         }
         // Tolerance band = fraction of the perturbed fan still good-enough.
-        let unit = vscale(v0, 1.0 / sp);
+        let sp = vlen(cand.v0);
+        if sp < 1e-3 {
+            continue;
+        }
+        let unit = vscale(cand.v0, 1.0 / sp);
         // Build two world axes perpendicular to the launch for the error
         // fan (deterministic basis: cross with x then with y as fallback).
         let mut a = Vec3::new(0.0, 1.0, 0.0);
@@ -1970,11 +2025,12 @@ fn decide_throw(
         ));
         let mut hits = 0.0_f64;
         for &(c1, c2) in err_fan.iter() {
-            let perturbed = vadd(
-                v0,
+            let mut perturbed_cand = cand.clone();
+            perturbed_cand.v0 = vadd(
+                cand.v0,
                 vadd(vscale(e1, c1 * err_mag), vscale(e2, c2 * err_mag)),
             );
-            if eval_launch(perturbed) >= good_enough {
+            if eval_candidate(&perturbed_cand) >= good_enough {
                 hits += 1.0;
             }
         }
@@ -1986,7 +2042,7 @@ fn decide_throw(
         {
             best_band = band;
             best_center_q = center_q;
-            best_v0 = Some(v0);
+            best_candidate = Some(cand.clone());
         }
     }
 
@@ -1997,14 +2053,18 @@ fn decide_throw(
     let pressured = nearest_opponent_dist(player, &opponents) < ep.throw_pressure_dist;
     let force = stall > ep.throw_stall_force_ticks || m.cast.throws_left as f64 <= 1.0;
 
-    let chosen = match best_v0 {
+    let chosen = match best_candidate.clone() {
         Some(v) => v,
         None => {
             // No fit candidate. If we're forced (stall/last throw) fling the
             // most-forward seed anyway — a weak, robust release beats a dead
             // stuck carrier. Otherwise hold and keep carrying.
             if force {
-                vscale(Vec3::new(sgn, 0.0, 0.0), throw_speed)
+                ThrowCandidate {
+                    v0: vscale(Vec3::new(sgn, 0.0, 0.0), throw_speed),
+                    target_id: None,
+                    tactical_bias: 0.0,
+                }
             } else {
                 let commit = cache.value.as_mut().unwrap();
                 commit.throw_go = false;
@@ -2017,7 +2077,7 @@ fn decide_throw(
 
     // Acceptance: throw if we found a fit candidate, or if pressured/forced
     // (a robust outlet under pressure beats holding into a strip).
-    let have_fit = best_v0.is_some();
+    let have_fit = best_candidate.is_some();
     if !have_fit && !force && !pressured {
         let commit = cache.value.as_mut().unwrap();
         commit.throw_go = false;
@@ -2027,7 +2087,7 @@ fn decide_throw(
     }
 
     // Convert world launch → the throw the player imparts (sim adds v).
-    let throw_vec = vsub(chosen, player.v);
+    let throw_vec = vsub(chosen.v0, player.v);
     let rel_speed = vlen(throw_vec).clamp(throw_min, throw_max);
     let aim_dir = if vlen(throw_vec) > 1e-6 {
         vnorm(throw_vec)
@@ -2048,30 +2108,9 @@ fn decide_throw(
         + (rng.next() - 0.5) * 0.04 * scaling.throw_variance;
     let charge = charge.clamp(0.0, 1.0);
 
-    // If a teammate is the natural target of this launch, name them so the
-    // sim widens their catch envelope (committed-catch / gate-clear path).
-    let mut tgt_id: Option<String> = None;
-    {
-        let st = efe::roll_forward(player.p, chosen, omega, 1.6, skin_r);
-        let mut best_d = 34.0_f64;
-        for tm in teammates.iter() {
-            let (i, _) = tm_future
-                .iter()
-                .find(|(i, _)| *i < teammates.len() && teammates[*i].id == tm.id)
-                .copied()
-                .unwrap_or((usize::MAX, Vec3::new(0.0, 0.0, 0.0)));
-            let tp = if i != usize::MAX { tm_future[i].1 } else { tm.p };
-            let d = (st.p.x - tp.x).hypot(st.p.y - tp.y).hypot(st.p.z - tp.z);
-            if d < best_d {
-                best_d = d;
-                tgt_id = Some(tm.id.clone());
-            }
-        }
-    }
-
     let commit = cache.value.as_mut().unwrap();
     commit.throw_go = true;
-    commit.throw_target_id = tgt_id;
+    commit.throw_target_id = chosen.target_id.clone();
     commit.throw_dir = Some(noisy_dir);
     commit.throw_spin = throw_spin.clamp(-1.0, 1.0);
     commit.throw_charge = charge;
@@ -2263,6 +2302,34 @@ mod tests {
                     && o.thrumbler.z.is_finite()
             );
         }
+    }
+
+    #[test]
+    fn friendly_pass_commits_only_the_intended_receiver() {
+        let players = vec![
+            mk_player("H1", TeamSide::Home, RiggerRole::Spinner, Vec3::new(-20.0, 4.0, 1.0)),
+            mk_player("H2", TeamSide::Home, RiggerRole::Faithwing, Vec3::new(10.0, 5.0, 1.0)),
+            mk_player("H3", TeamSide::Home, RiggerRole::Anchor, Vec3::new(0.0, 6.0, 1.0)),
+        ];
+        let mut state = mk_state(players, None);
+        state.bell.thrown_by = Some("H1".to_string());
+        state.bell.p = Vec3::new(11.0, 5.5, 1.0);
+        state.bell.v = Vec3::new(9.0, 0.0, 0.0);
+        let recv = PlayerAssignment {
+            job: Job::Receive,
+            mark_id: None,
+            depth_slot: 0.6,
+            radius_slot: 0.3,
+            pressure: 0.0,
+        };
+        assert!(
+            wants_catch(&state.players[1], &state, &recv, Some("H2")),
+            "the named receiver should commit to the friendly pass"
+        );
+        assert!(
+            !wants_catch(&state.players[2], &state, &recv, Some("H2")),
+            "a non-target teammate should hold spacing instead of swarming"
+        );
     }
 
     #[test]
