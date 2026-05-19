@@ -121,49 +121,13 @@ pub enum TeamSide {
 }
 
 // ── Observation ─────────────────────────────────────────────────────────────
-
-/// One controlled-or-not rigger's observable state (ordered like the
-/// underlying `Snapshot::players`).
-#[derive(Clone, Debug)]
-pub struct ObsPlayer {
-    pub id: String,
-    /// Home / Away (0/1) and the role discriminant (0..=4), both as the
-    /// stable integer codes so the learner needn't import the enums.
-    pub team: u8,
-    pub role: u8,
-    pub p: Vec3,
-    pub v: Vec3,
-    /// Line anchor world-pos + rest length if a rig line is out, else
-    /// `None` (so a policy can see tether state).
-    pub line_anchor: Option<Vec3>,
-    pub line_rest_len: Option<f64>,
-}
-
-/// The documented observation. A flat, derived view of the SimWorld
-/// snapshot + match state — everything a policy needs, nothing it
-/// shouldn't (no internal ramps/contact-springs).
-#[derive(Clone, Debug)]
-pub struct Observation {
-    pub tick: u64,
-    pub bell_p: Vec3,
-    pub bell_v: Vec3,
-    pub bell_held_by: Option<String>,
-    /// True while the bell is in a hand (possession is live).
-    pub possessed: bool,
-    /// Possession team code (0 Home / 1 Away) per the match SM.
-    pub possession: u8,
-    /// Gate code: 0 First / 1 Deep / 2 Mouth.
-    pub gate: u8,
-    pub score_home: i64,
-    pub score_away: i64,
-    /// Match phase code: 0 Set 1 Live 2 Contest 3 Dead 4 InningBreak
-    /// 5 Spine 6 Final.
-    pub phase: u8,
-    pub players: Vec<ObsPlayer>,
-    /// The ids the external agent drives, in action order (echoed from
-    /// the scenario so a stateless policy can map actions positionally).
-    pub controlled_ids: Vec<String>,
-}
+//
+// `Observation`/`ObsPlayer` are the WASM-SAFE policy input view; they were
+// moved into `rl::policy` (which compiles into the wasm cdylib) so policy
+// inference no longer depends on this native-only module. The gym's public
+// API is byte-unchanged: it re-exports them here, so every call site
+// (`env.reset(..) -> Observation`, `gym::ObsPlayer`, etc.) is identical.
+pub use crate::rl::policy::{Observation, ObsPlayer};
 
 // ── Action / Reward / Step ──────────────────────────────────────────────────
 

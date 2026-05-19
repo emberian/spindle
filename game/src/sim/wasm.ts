@@ -5,7 +5,7 @@
 // The Rust core is the source of truth; the TS sim/ modules remain the
 // parity oracle (cargo known-answer test holds RNG bit-identical).
 
-import init, { RigSim, RigAi } from '../../rig-core/pkg/rig_core.js';
+import init, { RigSim, RigAi, RigPolicy } from '../../rig-core/pkg/rig_core.js';
 import type {
   SimState,
   InputFrame,
@@ -44,6 +44,38 @@ export function aiTick(
 /** Clear the AI's director + commitment caches (new inning). */
 export function aiReset(): void {
   aiInst?.reset();
+}
+
+// ── Trained RL policy boundary (RigPolicy) ────────────────────────────────────
+// The browser's seam to the learned shared-parameter MLP. One `RigPolicy`
+// per policy-driven team (it owns the internal baseline `AiSystem` that
+// fills riggers NOT in the policy's controlled set). Same JSON contract as
+// `RigAi` plus a controlled-ids array. Pure f64 forward ⇒ deterministic;
+// the recorded `InputFrame`s capture its emitted inputs ⇒ replay-stable.
+export class PolicyAi {
+  private pol: RigPolicy;
+  constructor(weightsJson: string) {
+    this.pol = new RigPolicy(weightsJson);
+  }
+  /** One policy tick. The riggers in `controlledIds` get the learned
+   *  policy; every other rigger falls to the internal baseline AI. */
+  tick(
+    simJson: string,
+    matchJson: string,
+    controlledIdsJson: string,
+    seed: number,
+  ): string {
+    return this.pol.tick(simJson, matchJson, controlledIdsJson, seed >>> 0);
+  }
+  reset(): void {
+    this.pol.reset();
+  }
+}
+
+/** Construct a `PolicyAi` from a trained-weights artifact JSON blob. */
+export async function createPolicyAi(weightsJson: string): Promise<PolicyAi> {
+  await wasmReady();
+  return new PolicyAi(weightsJson);
 }
 
 // snapshot_flat layout (see rig-core/src/wasm.rs header).

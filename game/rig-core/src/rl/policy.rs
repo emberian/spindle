@@ -14,15 +14,68 @@
 //! `(distance_bits, id)` key — never hash order). Same weights + same obs
 //! ⇒ bit-identical `PlayerInput`.
 //!
-//! NATIVE-ONLY: this module is gated `cfg(not(target_arch = "wasm32"))`
-//! in lib.rs exactly like gym/coord_learner/skill_eval/ga. It does NOT
-//! wire a policy into the shipped browser game (that is a deliberate
-//! phase 2).
+//! WASM-SAFE: `featurize`/`forward`/`decode`/`act` and the
+//! `Observation`/`ObsPlayer` view + flat weight (de)serialization are
+//! pure f64 with NO rand/rayon/clock, so this module compiles into BOTH
+//! the native lib AND the wasm cdylib. The browser drives a team via
+//! `policy_wasm::RigPolicy` (which reuses this verbatim). Only the CEM
+//! trainer (`rl::train`, rand_chacha/rayon + gym::RigEnv) stays
+//! native-only — it lives behind the lib.rs cfg gate.
 
 use crate::ai::types as ai;
-use crate::gym::Observation;
 use crate::math::Vec3;
 use crate::tuning;
+
+// ── Observation view (wasm-safe; the gym re-exports these) ──────────────────
+//
+// These were the gym's `Observation`/`ObsPlayer`. They are pure data
+// (only `Vec3`, which is wasm-safe — `RigAi` already uses it). They live
+// here so `featurize` has its input type WITHOUT depending on the
+// native-only `gym` module; `gym.rs` `pub use`s them so its public API
+// and every existing call site are byte-unchanged.
+
+/// One controlled-or-not rigger's observable state (ordered like the
+/// underlying `Snapshot::players`).
+#[derive(Clone, Debug)]
+pub struct ObsPlayer {
+    pub id: String,
+    /// Home / Away (0/1) and the role discriminant (0..=4), both as the
+    /// stable integer codes so the learner needn't import the enums.
+    pub team: u8,
+    pub role: u8,
+    pub p: Vec3,
+    pub v: Vec3,
+    /// Line anchor world-pos + rest length if a rig line is out, else
+    /// `None` (so a policy can see tether state).
+    pub line_anchor: Option<Vec3>,
+    pub line_rest_len: Option<f64>,
+}
+
+/// The documented observation. A flat, derived view of the SimWorld
+/// snapshot + match state — everything a policy needs, nothing it
+/// shouldn't (no internal ramps/contact-springs).
+#[derive(Clone, Debug)]
+pub struct Observation {
+    pub tick: u64,
+    pub bell_p: Vec3,
+    pub bell_v: Vec3,
+    pub bell_held_by: Option<String>,
+    /// True while the bell is in a hand (possession is live).
+    pub possessed: bool,
+    /// Possession team code (0 Home / 1 Away) per the match SM.
+    pub possession: u8,
+    /// Gate code: 0 First / 1 Deep / 2 Mouth.
+    pub gate: u8,
+    pub score_home: i64,
+    pub score_away: i64,
+    /// Match phase code: 0 Set 1 Live 2 Contest 3 Dead 4 InningBreak
+    /// 5 Spine 6 Final.
+    pub phase: u8,
+    pub players: Vec<ObsPlayer>,
+    /// The ids the external agent drives, in action order (echoed from
+    /// the scenario so a stateless policy can map actions positionally).
+    pub controlled_ids: Vec<String>,
+}
 
 // ── Canon normalization scales (from tuning.rs) ─────────────────────────────
 // Positions are normalized by the ring length `L`; velocities by the
@@ -172,8 +225,8 @@ pub fn featurize(obs: &Observation, self_id: &str) -> [f64; FEAT_W] {
 
     // K nearest teammates / opponents — built from the ORDERED players
     // vec, sorted by an explicit total key (distance bits, then id).
-    let mut mates: Vec<(u64, &str, &crate::gym::ObsPlayer)> = Vec::new();
-    let mut opps: Vec<(u64, &str, &crate::gym::ObsPlayer)> = Vec::new();
+    let mut mates: Vec<(u64, &str, &ObsPlayer)> = Vec::new();
+    let mut opps: Vec<(u64, &str, &ObsPlayer)> = Vec::new();
     for p in obs.players.iter() {
         if p.id == self_id {
             continue;
@@ -186,14 +239,14 @@ pub fn featurize(obs: &Observation, self_id: &str) -> [f64; FEAT_W] {
         }
     }
     let sort_key =
-        |a: &(u64, &str, &crate::gym::ObsPlayer),
-         b: &(u64, &str, &crate::gym::ObsPlayer)| {
+        |a: &(u64, &str, &ObsPlayer),
+         b: &(u64, &str, &ObsPlayer)| {
             a.0.cmp(&b.0).then(a.1.cmp(b.1))
         };
     mates.sort_by(sort_key);
     opps.sort_by(sort_key);
 
-    let mut put = |base: usize, list: &[(u64, &str, &crate::gym::ObsPlayer)]| {
+    let mut put = |base: usize, list: &[(u64, &str, &ObsPlayer)]| {
         for k in 0..K {
             let o = base + k * OTHER_W;
             if let Some((_, _, p)) = list.get(k) {
@@ -347,5 +400,77 @@ impl RlPolicy {
         let feat = featurize(obs, self_id);
         let out = self.forward(&feat);
         self.decode(&out, self_id, self_p)
+    }
+}
+
+// ── Deterministic flat-weight (de)serialization ─────────────────────────────
+//
+// The weights artifact is a JSON object so it crosses the same JSON seam
+// idiom the rest of the wasm boundary uses (hand-rolled, no serde). Format:
+//   {"seed":N,"config":"...","dims":{"feat":F,"out":O,"hid":H,"param":P},
+//    "baseline":B,"fitness":G,"weights":[w0,w1,...]}
+// Only `weights` is load-bearing for inference; the rest is provenance so
+// the asset can be reproduced from its recorded seed/config and cannot
+// silently drift (a native test re-runs the recorded config and asserts
+// the committed vector matches bit-for-bit).
+
+/// Emit a deterministic f64 — shortest round-tripping repr (`{:?}`),
+/// matching `ai_wasm::json_num` exactly so the seam stays one dialect.
+fn jnum(x: f64) -> String {
+    if x.is_finite() {
+        format!("{:?}", x)
+    } else {
+        "0.0".to_string()
+    }
+}
+
+/// Serialize a weight vector to the artifact JSON (provenance fields are
+/// caller-supplied; `weights` is the only field inference reads back).
+pub fn weights_to_json(
+    weights: &[f64],
+    seed: u64,
+    config: &str,
+    baseline: f64,
+    fitness: f64,
+) -> String {
+    let ws: Vec<String> = weights.iter().map(|w| jnum(*w)).collect();
+    format!(
+        "{{\"seed\":{},\"config\":{:?},\"dims\":{{\"feat\":{},\"out\":{},\"hid\":{},\"param\":{}}},\"baseline\":{},\"fitness\":{},\"weights\":[{}]}}",
+        seed,
+        config,
+        FEAT_W,
+        OUT_W,
+        HID,
+        PARAM_W,
+        jnum(baseline),
+        jnum(fitness),
+        ws.join(",")
+    )
+}
+
+/// Parse the flat `weights` array out of an artifact JSON blob. Tolerant
+/// of field order (anchors on `"weights":[`); returns `None` unless the
+/// array length is exactly `PARAM_W` (a wrong-dim asset must not silently
+/// drive the sim with garbage). No serde — the same substring-scan idiom
+/// as `ai_wasm`/`wasm`.
+pub fn weights_from_json(src: &str) -> Option<Vec<f64>> {
+    let needle = "\"weights\":";
+    let start = src.find(needle)? + needle.len();
+    let rest = src[start..].trim_start();
+    let rest = rest.strip_prefix('[')?;
+    let end = rest.find(']')?;
+    let inner = &rest[..end];
+    let mut out = Vec::with_capacity(PARAM_W);
+    for tok in inner.split(',') {
+        let t = tok.trim();
+        if t.is_empty() {
+            continue;
+        }
+        out.push(t.parse::<f64>().ok()?);
+    }
+    if out.len() == PARAM_W {
+        Some(out)
+    } else {
+        None
     }
 }
