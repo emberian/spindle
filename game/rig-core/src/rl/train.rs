@@ -761,6 +761,51 @@ mod tests {
     /// On-demand REAL learn-proof + offline-judge report (NOT a CI gate —
     /// long). Run:
     ///   cargo test -p rig-core rl::train::tests::learn_real -- --ignored --nocapture
+    /// A FEASIBLE real ES learn-proof (real episode length, 20 antithetic
+    /// pairs, 12 gens, shaping ON) that completes in a sandbox window —
+    /// pastes before/after fitness + the offline judge trained-vs-
+    /// baseline. On-demand only:
+    ///   cargo test -p rig-core rl::train::tests::learn_proof_feasible -- --ignored --nocapture
+    #[test]
+    #[ignore = "real ES learn-proof; --ignored --nocapture"]
+    fn learn_proof_feasible() {
+        let cfg = TrainConfig {
+            pop_size: 40,
+            generations: 12,
+            episode_ticks: 1500,
+            episodes: 1,
+            seed: 2025,
+            ..TrainConfig::default()
+        };
+        let base_fit = evaluate(&RlPolicy::zeros(), &cfg);
+        println!("BASELINE (zero policy, shaped) fitness = {base_fit:.4}");
+        let mut tr = RlTrainer::new(cfg.clone());
+        let trained = tr.train();
+        for r in &trained.best_history {
+            println!(
+                "gen {:>2}  best={:>10.4}  mean={:>10.4}",
+                r.gen, r.best_fitness, r.mean_fitness
+            );
+        }
+        let first = trained.best_history.first().unwrap().best_fitness;
+        let last = trained.best_history.last().unwrap().best_fitness;
+        println!(
+            "LEARN-PROOF: first={first:.4} last={last:.4} delta={:+.4} \
+             (vs zero-policy {base_fit:.4}); training reward is SHAPED \
+             (policy-invariant) — components below are pure intrinsic",
+            last - first
+        );
+        let pol = RlPolicy::from_weights(trained.weights.clone());
+        // OFFLINE JUDGE — strictly post-hoc, reads only Observation/
+        // StepInfo, NEVER reward (gatePursuit/passChainDepth/denial/
+        // spatialControl). Clearly: offline-judge, NOT the reward.
+        let jt = judge(Some(&pol), cfg.eval_seed, cfg.episode_ticks);
+        let jb = judge(None, cfg.eval_seed, cfg.episode_ticks);
+        println!("OFFLINE-JUDGE (NOT reward) baseline: {jb:?}");
+        println!("OFFLINE-JUDGE (NOT reward) trained:  {jt:?}");
+        assert!(last >= first, "best_history must be monotone");
+    }
+
     #[test]
     #[ignore = "long real RL training run; --ignored --nocapture"]
     fn learn_real() {
