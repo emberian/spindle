@@ -8,6 +8,12 @@ description = "RIG deterministic physics core (Rust → WASM)."
 [lib]
 crate-type = ["cdylib", "rlib"]
 
+[[bin]]
+name = "train_mappo"
+path = "src/bin/train_mappo.rs"
+# Native-only binary (not built for wasm32).
+required-features = []
+
 [dependencies]
 wasm-bindgen = "0.2"
 

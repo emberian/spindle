@@ -40,6 +40,9 @@ pub mod train;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod self_play;
 
+#[cfg(not(target_arch = "wasm32"))]
+pub mod mappo;
+
 pub use policy::{
     Observation, ObsPlayer, RlPolicy, FEAT_W, K, OUT_W, PARAM_W,
 };
@@ -56,3 +59,6 @@ pub use self_play::{
 
 #[cfg(not(target_arch = "wasm32"))]
 pub use value::{CentralizedValue, VALUE_PARAM_W, VALUE_FEAT_W, compute_gae};
+
+#[cfg(not(target_arch = "wasm32"))]
+pub use mappo::{train_mappo, MappoConfig, MappoResult, MappoGenReport, mappo_weights_to_json};
