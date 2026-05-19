@@ -22,8 +22,8 @@ function makeSkinTexture(): THREE.CanvasTexture {
   c.width = W; c.height = H;
   const g = c.getContext('2d')!;
 
-  // Base: mid-dark teal-grey (not black — the skin is LIT land)
-  g.fillStyle = '#1b2030';
+  // Base: visible teal-grey (the skin is LIT land, not deep space)
+  g.fillStyle = '#2a3648';
   g.fillRect(0, 0, W, H);
 
   // Six longitudinal biomes: 4 "land" (warm/neutral) + 2 "window strip" (blue-glow)
@@ -46,8 +46,8 @@ function makeSkinTexture(): THREE.CanvasTexture {
       g.fillStyle = 'rgba(200,240,255,0.08)';
       g.fillRect(x0 + w * 0.35, 0, w * 0.3, H);
     } else {
-      // Land panel — warm grey-green terrain
-      g.fillStyle = i % 2 ? '#232a35' : '#1e2530';
+      // Land panel — visible terrain variation
+      g.fillStyle = i % 2 ? '#334455' : '#2d3d4a';
       g.fillRect(x0, 0, w, H);
 
       // Warm glow at the "bottom" of each land panel (rim-ward inhabited land beyond)
@@ -536,11 +536,10 @@ export class Calm {
       new THREE.MeshStandardMaterial({
         map: this.skinTex,
         side: THREE.BackSide,
-        roughness: 0.88,
-        metalness: 0.0,
-        emissive: 0x0d1520,
-        emissiveIntensity: 1,
-        // tint the skin a notch warmer at the rim — baked into the texture
+        roughness: 0.65,
+        metalness: 0.3,
+        emissive: 0x1a2840,
+        emissiveIntensity: 2.2,
       }),
     );
     skin.rotation.z = Math.PI / 2;
@@ -667,7 +666,7 @@ export class Calm {
     // Ambient: was 0x1a2535 @ 1.1 — near-black, so unlit riggers were
     // silhouettes (the top bug). Substantially raised + warmed to a soft
     // skylight so every figure has a legible base luminance everywhere.
-    scene.add(new THREE.AmbientLight(0x4a5872, 2.4));
+    scene.add(new THREE.AmbientLight(0x5a6880, 3.2));
 
     // Faith-end point light (cyan) — makes that side glow distinctly
     const faithLight = new THREE.PointLight(C_CYAN, 60, REG.L * 0.55, 1.4);

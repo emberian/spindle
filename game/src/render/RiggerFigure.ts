@@ -310,7 +310,7 @@ export class RiggerFigure {
       depthWrite: false,
       depthTest: false,
     }));
-    this.aura.scale.set(3.0, 3.0, 1);
+    this.aura.scale.set(5.0, 5.0, 1);
     this.aura.position.y = HIP_Y + TORSO_LEN * 0.55;
     this.aura.renderOrder = 9990; // above scene, below the P1 halo/beacon
     this.root.add(this.aura);
@@ -564,7 +564,7 @@ export class RiggerFigure {
       auraMat.opacity = 0;
     } else {
       auraMat.color.setHex(emissiveHex);
-      auraMat.opacity = Math.max(0.42, Math.min(0.6, emissiveInt * 0.6));
+      auraMat.opacity = Math.max(0.55, Math.min(0.8, emissiveInt * 0.65));
     }
   }
 

@@ -63,12 +63,9 @@ function teamBase(team: string): number {
 
 function bodyColor(team: string, grounded: boolean): number {
   const base = teamBase(team);
-  // Lift the in-play body toward paper so each figure reads as a bright,
-  // distinct body against the calm (legibility WINS over darkness) while
-  // keeping the team hue. Grounded stays dimmed (out of play).
   return grounded
     ? lerpHex(base, PAL.dim, 0.65)
-    : lerpHex(base, PAL.paper, 0.30);
+    : lerpHex(base, PAL.paper, 0.55);
 }
 
 /** Frame-rate-independent exponential smoothing toward `target`. */
@@ -314,10 +311,7 @@ class RiggerInstance {
     const bodyCol = bodyColor(ps.team, ps.grounded);
     const accent = isP1 ? PAL.paper : (ROLE_TINT[ps.role] ?? lerpHex(base, PAL.paper, 0.4));
     const emissiveHex = isP1 ? base : (ps.grounded ? 0x000000 : base);
-    // Raised non-P1 in-play emissive 0.28 → 0.55 so each of the 8 riggers
-    // self-lights into a clearly legible body even on its shadow side, without
-    // blowing past bloom threshold (kept well under the P1 0.9).
-    const emissiveInt = isP1 ? (ps.grounded ? 0.4 : 0.9) : (ps.grounded ? 0.0 : 0.55);
+    const emissiveInt = isP1 ? (ps.grounded ? 0.6 : 1.4) : (ps.grounded ? 0.0 : 1.0);
     this.figure.setColors(bodyCol, accent, emissiveHex, emissiveInt);
 
     // ── Drive the pose ──────────────────────────────────────────────────────
