@@ -146,6 +146,107 @@ impl BellBand {
         }
         best
     }
+
+    /// Predicted TIME-TO-INTERCEPT (seconds) for an agent at `from` moving
+    /// at `from_v`, closing on the loose bell with a confident powered-hook
+    /// model `REEL_PULL_SPEED + min(inbound,14)` (the existing decisive-dive
+    /// close-speed precedent). We walk the band near→far and return the
+    /// earliest horizon `t` at which the agent could already be at that
+    /// predicted bell point (reach/close_v ≤ t); if it can never quite catch
+    /// up within the band we return the *last* sample's pure travel time
+    /// (still a monotone, comparable scalar). Pure geometry, deterministic,
+    /// no rng — this is the role-assignment race metric.
+    pub fn time_to_intercept(&self, from: Vec3, from_v: Vec3) -> f64 {
+        // Inbound-velocity credit toward the bell's CURRENT position (the
+        // near sample) so a rigger already driving at the ball is correctly
+        // judged the faster racer — mirrors `dive_intercept_gap`.
+        let near = self.samples[0].1.p;
+        let to_b = Vec3::new(near.x - from.x, near.y - from.y, near.z - from.z);
+        let bl = (to_b.x * to_b.x + to_b.y * to_b.y + to_b.z * to_b.z).sqrt();
+        let inbound = if bl > 1e-6 {
+            ((from_v.x * to_b.x + from_v.y * to_b.y + from_v.z * to_b.z) / bl)
+                .max(0.0)
+        } else {
+            0.0
+        };
+        let close_v = (crate::tuning::REEL_PULL_SPEED + inbound.min(14.0)).max(1e-3);
+        let mut fallback = f64::INFINITY;
+        for (t, st) in self.samples.iter() {
+            let reach = (from.x - st.p.x)
+                .hypot(from.y - st.p.y)
+                .hypot(from.z - st.p.z);
+            let need_t = reach / close_v;
+            fallback = need_t; // last assignment = far-sample travel time
+            if need_t <= *t {
+                return *t;
+            }
+        }
+        fallback
+    }
+}
+
+/// Predicted REBOUND LOCUS — where the loose bell ends up if the PRIMARY
+/// diver BOBBLES/DEFLECTS it instead of cleanly catching. Deterministic
+/// model, faithful to `collision::apply_bobble`:
+///   * roll the live bell forward to the primary's predicted touch (the
+///     bell state at the moment the dive arrives);
+///   * apply the EXACT bobble linear-velocity transform: with a roughly
+///     stationary diver at the contact (`player_vel ≈ 0`) the sim sets
+///     `bell.v = player_vel + (bell.v − player_vel) * 0.25` ⇒ a clean
+///     0.25 damp of the pre-touch linear velocity. (The sim's bobble
+///     `clatter((0,4,3))` is an ANGULAR-only impulse — it perturbs the
+///     bell's spin `w`, NOT its linear `v`, so it does not enter the
+///     point-mass roll-forward; we deliberately do not add a phantom
+///     linear kick. The spin perturbation's effect on the path is
+///     second-order via Coriolis and is intentionally not modelled here
+///     — a stationed shadow only needs the dominant spill direction.)
+///   * roll THAT damped bell forward a short spill horizon so the shadow
+///     has a distinct, reachable place to wait that is NOT the primary's
+///     intercept point.
+/// No rng, deterministic.
+pub fn rebound_locus(
+    bell_p: Vec3,
+    bell_v: Vec3,
+    omega: f64,
+    skin_r: f64,
+    t_primary: f64,
+) -> Vec3 {
+    // 1. Bell state at the primary's predicted touch.
+    let touch = roll_forward(bell_p, bell_v, omega, t_primary.max(0.0), skin_r);
+    // 2. apply_bobble linear transform with a ~stationary diver: a clean
+    //    0.25 damp of the pre-touch linear velocity (the off-axis clatter
+    //    is angular-only in the sim and does not move the point mass).
+    let bob_v = Vec3::new(touch.v.x * 0.25, touch.v.y * 0.25, touch.v.z * 0.25);
+    // 3. Roll the deflected bell forward a short spill horizon — far enough
+    //    that the shadow has somewhere distinct to wait, near enough that
+    //    the Coriolis prediction is still trustworthy.
+    const SPILL_T: f64 = 0.9;
+    let spill = roll_forward(touch.p, bob_v, omega, SPILL_T, skin_r).p;
+    // Guard against a barely-moving deflection collapsing the shadow onto
+    // the primary's exact touch (they MUST hold distinct stations): if the
+    // spill is essentially the touch point, nudge along the post-bobble
+    // heading by a fixed stand-off so the shadow waits OFF the dive line.
+    let dx = spill.x - touch.p.x;
+    let dy = spill.y - touch.p.y;
+    let dz = spill.z - touch.p.z;
+    let sep = (dx * dx + dy * dy + dz * dz).sqrt();
+    const MIN_SHADOW_STANDOFF: f64 = 6.0;
+    if sep >= MIN_SHADOW_STANDOFF {
+        return spill;
+    }
+    // Deterministic fallback heading: the damped velocity if non-trivial,
+    // else straight "up" the tube cross-section (fixed, no rng).
+    let bvl = (bob_v.x * bob_v.x + bob_v.y * bob_v.y + bob_v.z * bob_v.z).sqrt();
+    let (hx, hy, hz) = if bvl > 1e-6 {
+        (bob_v.x / bvl, bob_v.y / bvl, bob_v.z / bvl)
+    } else {
+        (0.0, 1.0, 0.0)
+    };
+    Vec3::new(
+        touch.p.x + hx * MIN_SHADOW_STANDOFF,
+        touch.p.y + hy * MIN_SHADOW_STANDOFF,
+        touch.p.z + hz * MIN_SHADOW_STANDOFF,
+    )
 }
 
 /// TEAM volume coverage — operationalized. The chamber is a tube of radius

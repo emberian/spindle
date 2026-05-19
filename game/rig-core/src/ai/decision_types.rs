@@ -29,6 +29,19 @@ pub enum Job {
     Zone,
 }
 
+/// LOOSE-BELL COORDINATION sentinel. A `Job::Recover` assignment whose
+/// `depth_slot` is exactly this value is the SHADOW / SAFETY role: it is
+/// NOT the committed primary diver — it stations at the predicted rebound
+/// locus (where the bell spills if the primary bobbles) and only pounces
+/// (becomes the committer) if a deflection actually wins it the race at
+/// the next Director window. Encoding the role through an EXISTING job +
+/// a reserved slot value (rather than a new `Job` variant) keeps every
+/// exhaustive `match Job` and the wasm `job_str` serialization untouched
+/// while still being a fully distinct, deterministic role. The value is
+/// out of the normal `depth_slot` range (a fraction/offset, never -3) so
+/// it can never collide with a real slot. Pure data; no rng.
+pub const SHADOW_DEPTH_FLAG: f64 = -3.0;
+
 /// A committed per-player assignment, stable until the next Director tick.
 #[derive(Clone, Debug, PartialEq)]
 pub struct PlayerAssignment {
@@ -37,6 +50,52 @@ pub struct PlayerAssignment {
     pub depth_slot: f64,
     pub radius_slot: f64,
     pub pressure: f64,
+}
+
+impl PlayerAssignment {
+    /// The committed PRIMARY diver of the loose bell (`recover_id`).
+    pub fn recover_primary() -> Self {
+        PlayerAssignment {
+            job: Job::Recover,
+            mark_id: None,
+            depth_slot: 0.0,
+            radius_slot: 0.0,
+            pressure: 0.0,
+        }
+    }
+
+    /// The SHADOW / SAFETY role — a `Job::Recover` member flagged (via the
+    /// reserved `SHADOW_DEPTH_FLAG`) to hold the rebound locus, never to
+    /// dive simultaneously with the primary.
+    pub fn recover_shadow() -> Self {
+        PlayerAssignment {
+            job: Job::Recover,
+            mark_id: None,
+            depth_slot: SHADOW_DEPTH_FLAG,
+            radius_slot: 0.0,
+            pressure: 0.0,
+        }
+    }
+
+    /// The down-field OUTLET — a `Job::Receive` body staged deep on the
+    /// advance axis so a clean catch has an immediate pass target.
+    pub fn recover_outlet() -> Self {
+        PlayerAssignment {
+            job: Job::Receive,
+            mark_id: None,
+            depth_slot: 0.85,
+            radius_slot: 0.3,
+            pressure: 0.0,
+        }
+    }
+
+    /// Is this the flagged loose-bell SHADOW (the single semantic test,
+    /// shared by the Director, the dive-committer guard and the recover
+    /// nav so the encoding is defined in exactly one place)?
+    pub fn is_shadow(&self) -> bool {
+        self.job == Job::Recover
+            && (self.depth_slot - SHADOW_DEPTH_FLAG).abs() < 1e-9
+    }
 }
 
 #[derive(Clone, Debug)]
