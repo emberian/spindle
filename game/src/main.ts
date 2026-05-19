@@ -270,7 +270,7 @@ async function runMatch(
   );
   trail.clear();
   gcam.reset();
-  riggers.setViewScale(2); // close chase-cam → near-human figure scale
+  riggers.setViewScale(1.5);
   input.setFaithRingX?.(GATE_X); // player (home) attacks the +x Faith ring
   if (!shownOnboarding) {
     shownOnboarding = true;
@@ -601,7 +601,7 @@ async function runWatch(
   );
   trail.clear();
   gcam.reset();
-  riggers.setViewScale(5); // far cinematic cam → larger-than-life figures
+  riggers.setViewScale(2);
   ai.reset();
   pol?.reset();
   let ended = false;
@@ -987,7 +987,7 @@ async function runReplay(
   match.consume([{ type: 'foul_garrote', by: '__start__' }], sim.snapshot());
   trail.clear();
   gcam.reset();
-  riggers.setViewScale(5); // far cinematic cam → larger-than-life figures
+  riggers.setViewScale(2);
   let fi = 0;
   let ended = false;
   let prevLoop = false;
