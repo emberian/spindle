@@ -8,6 +8,13 @@
 //!             no rand/rayon/clock — compiled into BOTH the native lib
 //!             and the wasm cdylib so the browser can drive a team with
 //!             a trained policy (see `policy_wasm::RigPolicy`).
+//! `attention` — the ENTITY-ATTENTION transformer policy (MAPPO actor):
+//!             multi-head self-attention over entities (self, teammates,
+//!             opponents, bell). **WASM-SAFE**: pure f64 matmuls + stable
+//!             softmax. Same `act(&obs, id) → PlayerInput` interface.
+//! `value`   — the CENTRALIZED VALUE FUNCTION (MAPPO critic): sees the
+//!             full global state during training for credit assignment.
+//!             **NATIVE-ONLY** (training aid, not deployed to wasm).
 //! `train`   — the seeded gradient-free CEM trainer (mirrors
 //!             `coord_learner`'s determinism/parallel template exactly;
 //!             fitness = the gym's PURE intrinsic `Reward`), plus the
@@ -16,11 +23,16 @@
 //!             gym::RigEnv): gated `cfg(not(target_arch = "wasm32"))`
 //!             in lib.rs exactly like gym/coord_learner/skill_eval/ga.
 //!
-//! The split lets `rl::policy` inference compile into the wasm cdylib
-//! WITHOUT pulling rayon/rand (those are only `use`d inside `train`,
-//! which the cfg gate keeps out of the wasm build entirely).
+//! The split lets `rl::policy` and `rl::attention` inference compile into
+//! the wasm cdylib WITHOUT pulling rayon/rand (those are only `use`d
+//! inside `train` and `value`, which the cfg gate keeps out of the wasm
+//! build entirely).
 
 pub mod policy;
+pub mod attention;
+
+#[cfg(not(target_arch = "wasm32"))]
+pub mod value;
 
 #[cfg(not(target_arch = "wasm32"))]
 pub mod train;
@@ -29,5 +41,10 @@ pub use policy::{
     Observation, ObsPlayer, RlPolicy, FEAT_W, K, OUT_W, PARAM_W,
 };
 
+pub use attention::{AttentionPolicy, ATTN_PARAM_W, N_ENTITIES, D_MODEL};
+
 #[cfg(not(target_arch = "wasm32"))]
 pub use train::{judge, train_policy, JudgeSignals, TrainConfig, Trained};
+
+#[cfg(not(target_arch = "wasm32"))]
+pub use value::{CentralizedValue, VALUE_PARAM_W, VALUE_FEAT_W, compute_gae};

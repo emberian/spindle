@@ -30,6 +30,7 @@ use crate::ai_wasm::{
     emit_input_frame, parse_match_state, parse_sim_state, parse_str_array,
 };
 use crate::rl::policy::{Observation, ObsPlayer, RlPolicy};
+use crate::rl::attention::AttentionPolicy;
 
 // ── SimState/MatchState → wasm-safe Observation ─────────────────────────────
 //
@@ -144,11 +145,30 @@ fn build_observation(
     }
 }
 
+// ── Unified policy enum (MLP or Attention) ──────────────────────────────────
+
+/// Either the MLP policy or the entity-attention policy. Both implement the
+/// same `act(&obs, id) → PlayerInput` interface, so the wasm tick path is
+/// unified.
+enum PolicyKind {
+    Mlp(RlPolicy),
+    Attention(AttentionPolicy),
+}
+
+impl PolicyKind {
+    fn act(&self, obs: &Observation, self_id: &str) -> PlayerInput {
+        match self {
+            PolicyKind::Mlp(p) => p.act(obs, self_id),
+            PolicyKind::Attention(p) => p.act(obs, self_id),
+        }
+    }
+}
+
 // ── RigPolicy (wasm-bindgen public surface) ─────────────────────────────────
 
 #[wasm_bindgen]
 pub struct RigPolicy {
-    policy: RlPolicy,
+    policy: PolicyKind,
     /// The baseline AI fills every rigger NOT driven by the policy
     /// (its `controlled` skip-set is reset to the policy ids each tick).
     ai: AiSystem,
@@ -166,13 +186,29 @@ impl RigPolicy {
     /// wasm `new` constructor just maps the message into a `JsValue`. A
     /// wrong-dim / missing array is rejected (must NOT silently drive the
     /// sim with garbage), matching the rest of the JSON seam's rigor.
+    ///
+    /// Detects the policy type from the artifact: if `"type":"attention"`
+    /// is present, loads as `AttentionPolicy` (ATTN_PARAM_W weights);
+    /// otherwise loads as the MLP `RlPolicy` (PARAM_W weights).
     pub fn try_new(weights_json: &str) -> Result<RigPolicy, String> {
-        let w = crate::rl::policy::weights_from_json(weights_json).ok_or_else(|| {
-            "RigPolicy: weights artifact missing/!= PARAM_W f64 in \"weights\":[...]"
-                .to_string()
-        })?;
+        let is_attention = weights_json.contains("\"type\":\"attention\"");
+        let policy = if is_attention {
+            let w = crate::rl::attention::attn_weights_from_json(weights_json)
+                .ok_or_else(|| {
+                    "RigPolicy: attention weights artifact missing/!= ATTN_PARAM_W f64"
+                        .to_string()
+                })?;
+            PolicyKind::Attention(AttentionPolicy::from_weights(w))
+        } else {
+            let w = crate::rl::policy::weights_from_json(weights_json)
+                .ok_or_else(|| {
+                    "RigPolicy: weights artifact missing/!= PARAM_W f64 in \"weights\":[...]"
+                        .to_string()
+                })?;
+            PolicyKind::Mlp(RlPolicy::from_weights(w))
+        };
         Ok(RigPolicy {
-            policy: RlPolicy::from_weights(w),
+            policy,
             ai: AiSystem::new(),
             rl_debug: Vec::new(),
         })
@@ -182,10 +218,11 @@ impl RigPolicy {
 #[wasm_bindgen]
 impl RigPolicy {
     /// Build from a trained-weights artifact JSON blob (the committed
-    /// `policy-v*.json`: `{"seed","config","dims","weights":[...]}`). The
-    /// flat `weights` array must be exactly `PARAM_W` long or this throws
-    /// (a wrong-dim asset must NOT silently drive the sim) — matching the
-    /// rigor of the rest of the JSON seam.
+    /// `policy-v*.json`: `{"seed","config","dims","weights":[...]}`).
+    /// Detects the policy type: if `"type":"attention"` is present, loads
+    /// as `AttentionPolicy` (ATTN_PARAM_W weights); otherwise loads as
+    /// the MLP `RlPolicy` (PARAM_W weights). A wrong-dim asset throws
+    /// — matching the rigor of the rest of the JSON seam.
     #[wasm_bindgen(constructor)]
     pub fn new(weights_json: &str) -> Result<RigPolicy, JsValue> {
         Self::try_new(weights_json).map_err(|e| JsValue::from_str(&e))
@@ -399,5 +436,21 @@ mod tests {
             .tick(&sim_json(), &match_json(), r#"[]"#, 1);
         assert!(out.contains("\"id\":\"H1\""));
         assert!(out.contains("\"players\""));
+    }
+
+    #[test]
+    fn attention_policy_loads_and_ticks() {
+        use crate::rl::attention::{attn_weights_to_json, ATTN_PARAM_W};
+        let w: Vec<f64> = (0..ATTN_PARAM_W)
+            .map(|i| ((i % 23) as f64 - 11.0) * 0.007)
+            .collect();
+        let json = attn_weights_to_json(&w, 42, "attn-test", 0.0, 1.0);
+        // Must detect as attention type and load successfully.
+        let mut p = RigPolicy::try_new(&json).expect("attention artifact must load");
+        let out = p.tick(&sim_json(), &match_json(), r#"["H1","H2"]"#, 99);
+        assert!(out.starts_with("{\"tick\":"));
+        assert!(out.contains("\"id\":\"H1\""));
+        assert!(out.contains("\"id\":\"A1\""));
+        assert!(!out.contains("NaN") && !out.contains("inf"));
     }
 }
