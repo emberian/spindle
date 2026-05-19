@@ -25,6 +25,11 @@ const CONF_LABELS: Record<string, string> = {
 
 type TeamRowElement = HTMLElement & { __franchise: Franchise };
 
+/** Which engine drives a team's per-tick inputs while spectating.
+ *  `baseline` = the production ported Rust `AiSystem` (default, unchanged);
+ *  `rl` = the trained shared-parameter RL policy (`RigPolicy`). */
+export type ControlSource = 'baseline' | 'rl';
+
 // ── CSS injection (one-time, idempotent) ───────────────────────────────────────
 
 const STYLE_ID = '__rig_spectate_css';
@@ -354,14 +359,25 @@ export class SpectateScreen {
   private selectedHome: Franchise | null = null;
   private selectedAway: Franchise | null = null;
 
+  // Per-team control source. Default `baseline` ⇒ production behavior is
+  // byte-unchanged unless the user explicitly opts a team into `rl`.
+  private homeSrc: ControlSource = 'baseline';
+  private awaySrc: ControlSource = 'baseline';
+  private homeSrcBtn!: HTMLButtonElement;
+  private awaySrcBtn!: HTMLButtonElement;
+
   // per-show row element maps (rebuilt each show)
   private homeRows: Map<string, TeamRowElement> = new Map();
   private awayRows: Map<string, TeamRowElement> = new Map();
 
   // per-show handlers (captured then nulled on hide)
   private handlers: {
-    onWatch: (home: Franchise, away: Franchise) => void;
-    onWatchBracket: () => void;
+    onWatch: (
+      home: Franchise,
+      away: Franchise,
+      sources: { home: ControlSource; away: ControlSource },
+    ) => void;
+    onWatchBracket: (sources: { home: ControlSource; away: ControlSource }) => void;
     onBack: () => void;
   } | null = null;
 
@@ -432,6 +448,23 @@ export class SpectateScreen {
     this.backBtn.textContent = 'BACK';
     this.backBtn.addEventListener('click', () => this._back());
 
+    // ── Per-team control-source toggles ────────────────────────────────────
+    // Default `baseline` (production AI). Clicking flips that team to the
+    // trained RL policy (`RigPolicy`); the renderer/HUD/replay are
+    // untouched — they visualize whatever drives the sim.
+    this.homeSrcBtn = document.createElement('button');
+    this.homeSrcBtn.className = 'rig-spec-btn ghost';
+    this.homeSrcBtn.addEventListener('click', () => {
+      this.homeSrc = this.homeSrc === 'baseline' ? 'rl' : 'baseline';
+      this._refreshSrcBtns();
+    });
+    this.awaySrcBtn = document.createElement('button');
+    this.awaySrcBtn.className = 'rig-spec-btn ghost';
+    this.awaySrcBtn.addEventListener('click', () => {
+      this.awaySrc = this.awaySrc === 'baseline' ? 'rl' : 'baseline';
+      this._refreshSrcBtns();
+    });
+
     this.jumpBtn = document.createElement('button');
     this.jumpBtn.className = 'rig-spec-btn secondary';
     this.jumpBtn.textContent = 'WATCH THE JUMP';
@@ -443,7 +476,13 @@ export class SpectateScreen {
     this.watchBtn.disabled = true;
     this.watchBtn.addEventListener('click', () => this._watch());
 
-    footer.append(this.backBtn, this.jumpBtn, this.watchBtn);
+    footer.append(
+      this.backBtn,
+      this.homeSrcBtn,
+      this.awaySrcBtn,
+      this.jumpBtn,
+      this.watchBtn,
+    );
 
     // ── Keyboard handler ───────────────────────────────────────────────────
     this.overlay.addEventListener('keydown', (e) => this._onKey(e));
@@ -459,14 +498,23 @@ export class SpectateScreen {
   show(
     franchises: Franchise[],
     handlers: {
-      onWatch: (home: Franchise, away: Franchise) => void;
-      onWatchBracket: () => void;
+      onWatch: (
+        home: Franchise,
+        away: Franchise,
+        sources: { home: ControlSource; away: ControlSource },
+      ) => void;
+      onWatchBracket: (sources: { home: ControlSource; away: ControlSource }) => void;
       onBack: () => void;
     },
   ): void {
     this.handlers = handlers;
     this.selectedHome = null;
     this.selectedAway = null;
+    // Default both teams to the production baseline AI on every show
+    // (opt-in only — production spectate is byte-unchanged by default).
+    this.homeSrc = 'baseline';
+    this.awaySrc = 'baseline';
+    this._refreshSrcBtns();
     this.homeRows.clear();
     this.awayRows.clear();
 
@@ -662,6 +710,15 @@ export class SpectateScreen {
     this.watchBtn.classList.toggle('ready', ready);
   }
 
+  private _refreshSrcBtns(): void {
+    const lbl = (s: ControlSource): string =>
+      s === 'rl' ? 'Learned (RL)' : 'Baseline AI';
+    this.homeSrcBtn.textContent = `HOME: ${lbl(this.homeSrc)}`;
+    this.awaySrcBtn.textContent = `AWAY: ${lbl(this.awaySrc)}`;
+    this.homeSrcBtn.classList.toggle('ready', this.homeSrc === 'rl');
+    this.awaySrcBtn.classList.toggle('ready', this.awaySrc === 'rl');
+  }
+
   // ── Action callbacks (capture-before-hide pattern) ────────────────────────
 
   private _watch(): void {
@@ -669,15 +726,17 @@ export class SpectateScreen {
     const home = this.selectedHome;
     const away = this.selectedAway;
     const cb = this.handlers.onWatch; // capture before hide() nulls handlers
+    const src = { home: this.homeSrc, away: this.awaySrc };
     this.hide();
-    cb(home, away);
+    cb(home, away, src);
   }
 
   private _watchBracket(): void {
     if (!this.handlers) return;
     const cb = this.handlers.onWatchBracket; // capture before hide()
+    const src = { home: this.homeSrc, away: this.awaySrc };
     this.hide();
-    cb();
+    cb(src);
   }
 
   private _back(): void {

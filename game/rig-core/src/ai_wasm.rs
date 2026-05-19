@@ -147,7 +147,7 @@ fn parse_quat(src: &str, key: &str) -> Quat {
 
 /// Parse `"key": ["a","b",...]` → Vec<String> (string elements only).
 /// Missing / null / non-array → empty vec.
-fn parse_str_array(src: &str, key: &str) -> Vec<String> {
+pub(crate) fn parse_str_array(src: &str, key: &str) -> Vec<String> {
     let start = match find_value_start(src, key) {
         Some(s) => s,
         None => return vec![],
@@ -349,7 +349,7 @@ fn parse_bell(src: &str) -> BellState {
     }
 }
 
-fn parse_sim_state(src: &str) -> SimState {
+pub(crate) fn parse_sim_state(src: &str) -> SimState {
     let players = split_objects(src, "players")
         .iter()
         .filter_map(|o| parse_player_sim(o))
@@ -382,7 +382,7 @@ fn parse_contest(src: &str) -> Option<MatchContest> {
     })
 }
 
-fn parse_match_state(src: &str) -> MatchState {
+pub(crate) fn parse_match_state(src: &str) -> MatchState {
     MatchState {
         inning: parse_num(src, "inning").unwrap_or(1.0),
         spine: parse_bool(src, "spine").unwrap_or(false),
@@ -476,7 +476,7 @@ fn json_opt_vec3(v: &Option<Vec3>) -> String {
     }
 }
 
-fn emit_input_frame(frame: &InputFrame) -> String {
+pub(crate) fn emit_input_frame(frame: &InputFrame) -> String {
     let players: Vec<String> = frame
         .players
         .iter()

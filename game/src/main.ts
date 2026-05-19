@@ -20,7 +20,7 @@ import { Onboarding } from './ui/Onboarding';
 import { LandingScreen } from './ui/LandingScreen';
 import { TitleScreen } from './ui/TitleScreen';
 import { BracketScreen } from './ui/BracketScreen';
-import { SpectateScreen } from './ui/SpectateScreen';
+import { SpectateScreen, type ControlSource } from './ui/SpectateScreen';
 import { SpectateControls } from './ui/SpectateControls';
 import { ReplayScreen } from './ui/ReplayScreen';
 import { ReplayRecorder, ReplayStore, type ReplayData } from './league/Replay';
@@ -29,7 +29,12 @@ import { predictPath } from './sim/trajectory';
 import { InputManager } from './input/InputManager';
 import { AiSystem, type TeamConfig } from './ai/index';
 import { MatchStateMachine } from './match/MatchStateMachine';
-import { createWasmSim, type WasmSim } from './sim/wasm';
+import { createWasmSim, createPolicyAi, type WasmSim, type PolicyAi } from './sim/wasm';
+// The committed trained-weights artifact (deterministic CEM run; see
+// rig-core/src/rl/train.rs `artifact_config`). resolveJsonModule bundles
+// it; stringified once and handed to `RigPolicy` to drive a team the
+// user opts into via the spectate control-source toggle.
+import policyV1 from './rl/policy-v1.json';
 import { REG, GATE_X } from './sim/RegConstants';
 import { styleToProfile, TEAMS, type Franchise } from './league/teams';
 import { Bracket } from './league/Bracket';
@@ -144,6 +149,18 @@ const replayScreen = new ReplayScreen(app);
 const input = new InputManager(renderer.domElement, camera);
 const ai = new AiSystem();
 let shownOnboarding = false;
+
+// ── Trained RL policy (opt-in, spectate only) ────────────────────────────────
+// One lazily-created `PolicyAi` (wraps the wasm `RigPolicy`, weights from
+// the committed artifact). It is built ONCE on first opt-in; the renderer/
+// HUD/replay are untouched. Default spectate uses the baseline AI only, so
+// production behavior is byte-unchanged unless a team is toggled to RL.
+const POLICY_WEIGHTS_JSON = JSON.stringify(policyV1);
+let policyAi: PolicyAi | null = null;
+async function getPolicyAi(): Promise<PolicyAi> {
+  if (!policyAi) policyAi = await createPolicyAi(POLICY_WEIGHTS_JSON);
+  return policyAi;
+}
 
 const bellMesh = new THREE.Mesh(
   new THREE.SphereGeometry(0.95, 24, 16),
@@ -496,7 +513,23 @@ async function runWatch(
   awayFr: Franchise,
   gameSeed: number,
   onEnd: (winner: TeamSide, scoreHome: number, scoreAway: number) => void,
+  sources: { home: ControlSource; away: ControlSource } = {
+    home: 'baseline',
+    away: 'baseline',
+  },
 ): Promise<void> {
+  // Which roster ids the trained RL policy drives this match (opt-in via
+  // the spectate toggle). Empty ⇒ pure baseline AI for everyone (the
+  // byte-unchanged production path). The other team's riggers fall to the
+  // policy's internal baseline `AiSystem` — exactly the gym's split.
+  const rlIds: string[] = WATCH_ROSTER.filter(
+    (r) =>
+      (r.team === 'home' && sources.home === 'rl') ||
+      (r.team === 'away' && sources.away === 'rl'),
+  ).map((r) => r.id);
+  const useRl = rlIds.length > 0;
+  const pol: PolicyAi | null = useRl ? await getPolicyAi() : null;
+  const rlIdsJson = JSON.stringify(rlIds);
   const sim: WasmSim = await createWasmSim(gameSeed);
   for (const r of WATCH_ROSTER) {
     const k = WATCH_ROSTER.indexOf(r);
@@ -523,6 +556,7 @@ async function runWatch(
   gcam.reset();
   riggers.setViewScale(5); // far cinematic cam → larger-than-life figures
   ai.reset();
+  pol?.reset();
   let ended = false;
   let prevLoop = false;
   // AI diagnostics: last sim snapshot + last AI input frame (for __rigai).
@@ -563,7 +597,22 @@ async function runWatch(
   const stepOnce = (): void => {
     if (match.state.winner !== null) return;
     const snap = sim.snapshot();
-    const aiFrame = ai.tick(snap, match.state as never, cfgs, gameSeed);
+    // Route the team(s) the user opted into through the trained RL policy
+    // (`RigPolicy`); every other rigger falls to the baseline AiSystem
+    // INSIDE the policy (the gym's split). When no team is on RL this is
+    // the verbatim baseline path. The frame is recorded the same way ⇒
+    // replay is unaffected; the renderer/HUD visualize whatever drives it.
+    const aiFrame: InputFrame =
+      pol !== null
+        ? (JSON.parse(
+            pol.tick(
+              JSON.stringify(snap),
+              JSON.stringify(match.state),
+              rlIdsJson,
+              gameSeed,
+            ),
+          ) as InputFrame)
+        : ai.tick(snap, match.state as never, cfgs, gameSeed);
     // Rich AI telemetry bookkeeping — pure debug, feeds only window.__rigai.
     // Gated behind the single debugViz flag so it is genuinely zero-cost
     // (no snapshot capture, no per-player scans) in normal spectate play.
@@ -729,8 +778,8 @@ async function runWatch(
 
 function openSpectate(): void {
   spectate.show(TEAMS, {
-    onWatch: (h, a) => startWatch(h, a),
-    onWatchBracket: () => startWatchBracket(),
+    onWatch: (h, a, src) => startWatch(h, a, src),
+    onWatchBracket: (src) => startWatchBracket(src),
     onBack: () => landing.show(() => title.show(enterJump), openSpectate, openReplay),
   });
 }
@@ -753,19 +802,31 @@ function bindWatchControls(): void {
   });
 }
 
-function startWatch(home: Franchise, away: Franchise): void {
+function startWatch(
+  home: Franchise,
+  away: Franchise,
+  sources: { home: ControlSource; away: ControlSource },
+): void {
   bindWatchControls();
   const seed = (Math.random() * 0xffffffff) >>> 0;
-  void runWatch(home, away, seed, () => {
-    if (!watching && spectateControls) {
-      // single-match: surface the result briefly, then back to the menu
-      spectateControls.hide();
-      openSpectate();
-    }
-  });
+  void runWatch(
+    home,
+    away,
+    seed,
+    () => {
+      if (!watching && spectateControls) {
+        // single-match: surface the result briefly, then back to the menu
+        spectateControls.hide();
+        openSpectate();
+      }
+    },
+    sources,
+  );
 }
 
-function startWatchBracket(): void {
+function startWatchBracket(
+  sources: { home: ControlSource; away: ControlSource },
+): void {
   const wb = new Bracket((Math.random() * 0xffffffff) >>> 0);
   let aborted = false;
   spectateControls.show({
@@ -790,15 +851,21 @@ function startWatchBracket(): void {
     }
     const home = g.home;
     const away = g.away;
-    void runWatch(home, away, g.gameSeed, (w, sh, sa) => {
-      const result: MatchResult = {
-        home, away, scoreHome: sh, scoreAway: sa, winner: w,
-        box: { home: ZBOX(), away: ZBOX() }, events: [],
-      };
-      wb.playNext(result);
-      // chain into the next game unless the user bailed out
-      if (!aborted) playNextGame();
-    });
+    void runWatch(
+      home,
+      away,
+      g.gameSeed,
+      (w, sh, sa) => {
+        const result: MatchResult = {
+          home, away, scoreHome: sh, scoreAway: sa, winner: w,
+          box: { home: ZBOX(), away: ZBOX() }, events: [],
+        };
+        wb.playNext(result);
+        // chain into the next game unless the user bailed out
+        if (!aborted) playNextGame();
+      },
+      sources,
+    );
   };
   playNextGame();
 }

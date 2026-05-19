@@ -81,15 +81,25 @@ mod wasm;
 // is preserved by construction — see gym.rs for the argument.
 #[cfg(not(target_arch = "wasm32"))]
 mod gym;
-// THE RL AGENT (drop 1): a shared-parameter deterministic MLP policy + a
-// seeded gradient-free CEM trainer driving the gym (fitness = the gym's
-// PURE intrinsic Reward, NO shaping), plus an OFFLINE strategy judge for
-// post-hoc validation (never reward/fitness). NATIVE-ONLY, gated out of
-// the wasm cdylib EXACTLY like gym / coord_learner / skill_eval / ga (it
-// reuses gym::RigEnv + rand/rand_chacha/rayon, no new deps). It does NOT
-// wire a policy into the browser cdylib — that is a deliberate phase 2.
-#[cfg(not(target_arch = "wasm32"))]
+// THE RL AGENT: a shared-parameter deterministic MLP policy + a seeded
+// gradient-free CEM trainer driving the gym (fitness = the gym's PURE
+// intrinsic Reward, NO shaping), plus an OFFLINE strategy judge.
+//
+// SPLIT for the browser: `rl::policy` (featurize + forward + decode +
+// the wasm-safe Observation view + flat weight (de)serialization) is
+// pure f64 — NO rand/rayon/clock — so the whole `rl` module is now
+// declared in BOTH builds and `rl::policy` compiles into the wasm
+// cdylib (the browser drives a team via `policy_wasm::RigPolicy`).
+// `rl::train` (CEM/rayon/rand_chacha + gym::RigEnv) is gated
+// `cfg(not(target_arch = "wasm32"))` INSIDE rl/mod.rs exactly like
+// gym/coord_learner/skill_eval/ga, so the wasm build still pulls
+// neither rayon nor rand.
 mod rl;
+
+// The browser seam to the TRAINED policy: `RigPolicy` (wasm-bindgen),
+// mirroring `RigAi`'s JSON contract. Ungated — it compiles into the
+// cdylib and only uses `rl::policy` (pure f64) + the existing AiSystem.
+mod policy_wasm;
 
 use wasm_bindgen::prelude::*;
 
