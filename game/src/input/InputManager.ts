@@ -28,12 +28,31 @@
 //   W / S                             → reel in/out
 //   SHIFT                             → pushoff (when in contact)
 //   SPACE                             → thrumbler nudge in aim direction
+//   F                                 → force catch-commit (override; the
+//                                       committed two-hand snare also arms
+//                                       IMPLICITLY when a loose bell is
+//                                       closing on you and you reel toward
+//                                       it — mirrors the AI's wants_catch so
+//                                       human play "just works", no new key
+//                                       to learn for the common case)
+//
+// CATCH PARITY (Gap 2): the sim grants a committed catch envelope (7 m /
+// 38 m/s) when catchIntent is set, vs the 1.8 m / 16 m/s reflex otherwise.
+// The AI gets it via rigger_ai::wants_catch; the human now gets the same:
+// catchIntent is true when (a) F is held (deliberate force-commit) OR
+// (b) the implicit context trigger fires — bell is loose (unheld, not
+// thrown by us), within a sensible range ahead, genuinely closing, and the
+// player is reeling toward it. This matches wants_catch's spirit (read-only
+// reference) so the human is no longer stuck on reflex — a real parity fix.
+// catchIntent is part of the recorded PlayerInput (replay schema carries
+// it); it is set deterministically from observed sim state, never faked.
 
 import * as THREE from 'three';
 import { AimModel } from './AimModel';
 import type { AnchorResult, ReticleState } from './AimModel';
 import { predictPath } from '../sim/trajectory';
-import { REG, GATE_X } from '../sim/RegConstants';
+import { REG, FEEL, GATE_X } from '../sim/RegConstants';
+import { SIM_H } from '../core/FixedStepDriver';
 import type { PlayerInput } from '../sim/types';
 import type { Vec3 } from '../sim/vec';
 
@@ -88,6 +107,15 @@ export interface InputView {
   ghostArc:     Vec3[];
   /** True if pointer-lock is currently active. */
   pointerLocked: boolean;
+  /** Gap 3 — grapple-latency legibility cues. */
+  /** A fired claw is in flight (line exists, not yet attached): can't
+   *  re-fire, the line is committed. */
+  clawInFlight: boolean;
+  /** Re-fire cooldown remaining, normalised [0,1] (1 = just started). 0 =
+   *  free to fire. Mirrors the sim's REFIRE_COOLDOWN_TICKS lockout. */
+  refireCooldown: number;
+  /** Catch-commit is armed this tick (widened envelope — Gap 2). */
+  catchArmed: boolean;
 }
 
 // ── InputManager ──────────────────────────────────────────────────────────────
@@ -123,6 +151,25 @@ export class InputManager {
   private holdingBell = false;
   private playerPos:  Vec3 = { x: 0, y: 0, z: 0 };
   private playerVel:  Vec3 = { x: 0, y: 0, z: 0 };
+
+  // ── Bell state (set by orchestrator each frame) — for catch-commit ────────
+  // The loose bell's world kinematics + whether it is grabbable. Read-only
+  // observation used to mirror the AI's wants_catch so the human gets the
+  // committed catch envelope. Never written back to the sim.
+  private bellPos:    Vec3 = { x: 0, y: 0, z: 0 };
+  private bellVel:    Vec3 = { x: 0, y: 0, z: 0 };
+  private bellLoose   = false; // true ⇒ unheld AND not thrown by P1
+
+  // ── Grapple-line state (set by orchestrator) — for the latency cue ────────
+  // hasLine: P1 currently has a fired line at all. attached: the claw has
+  // bitten (constraint live). Render-only legibility; never written back.
+  private hasLine     = false;
+  private lineAttached = false;
+  // Render-only re-fire cooldown clock. The sim enforces a
+  // REFIRE_COOLDOWN_TICKS lockout after a release/miss; we can't read its
+  // tick counter, so we MIRROR it: start a countdown the instant P1's line
+  // disappears. Cosmetic legibility only — never feeds the sim.
+  private _refireCdSec = 0;
   /** Faith ring X-position (attacking direction). Default = +GATE_X. */
   private faithRingX: number = GATE_X;
 
@@ -139,6 +186,9 @@ export class InputManager {
   // ── Computed per-tick ────────────────────────────────────────────────────
   private _reticle:   AnchorResult | null = null;
   private _ghostArc:  Vec3[] = [];
+  /** Catch-commit armed this tick (implicit trigger or F override). Exposed
+   *  via InputView so the HUD/reticle can show the widened-envelope cue. */
+  private _catchArmed = false;
 
   // ── Event cleanup refs ────────────────────────────────────────────────────
   private _offFns: Array<() => void> = [];
@@ -161,6 +211,35 @@ export class InputManager {
     this.spars = spars;
   }
 
+  /**
+   * Loose-bell observation for the implicit catch-commit trigger. `loose`
+   * must be true only when the bell is grabbable by us (not held by anyone
+   * and not thrown by P1) — mirrors wants_catch's early-outs. Read-only;
+   * additive to the contract. Safe to leave unwired (catch then needs the
+   * explicit F override, never auto-arms).
+   */
+  setBellState(pos: Vec3, vel: Vec3, loose: boolean): void {
+    this.bellPos  = pos;
+    this.bellVel  = vel;
+    this.bellLoose = loose;
+  }
+
+  /**
+   * P1's grapple-line state for the latency/cooldown cue (Gap 3).
+   * `hasLine` = a fired line exists; `attached` = the claw has bitten.
+   * When the line vanishes (release/miss) we start a render-only mirror of
+   * the sim's REFIRE_COOLDOWN_TICKS lockout so RMB-does-nothing is legible.
+   * Read-only; additive; safe to leave unwired.
+   */
+  setLineState(hasLine: boolean, attached: boolean): void {
+    if (this.hasLine && !hasLine) {
+      // Line just went away → sim is now in its re-fire lockout. Mirror it.
+      this._refireCdSec = FEEL.REFIRE_COOLDOWN_TICKS * SIM_H;
+    }
+    this.hasLine      = hasLine;
+    this.lineAttached = attached;
+  }
+
   /** Optionally update which ring is the Faith (attacking) end. */
   setFaithRingX(x: number): void {
     this.faithRingX = x;
@@ -173,6 +252,11 @@ export class InputManager {
    * dtSec = seconds elapsed this step.
    */
   get(dtSec: number): PlayerInput {
+    // 0. Tick down the render-only re-fire cooldown mirror (Gap 3 cue).
+    if (this._refireCdSec > 0) {
+      this._refireCdSec = Math.max(0, this._refireCdSec - dtSec);
+    }
+
     // 1. Integrate pointer-lock mouse movement (dt-aware smoothing).
     this.aim.update(this.mouseDX, this.mouseDY, dtSec);
     this.mouseDX = 0;
@@ -249,6 +333,43 @@ export class InputManager {
       ? { x: aimDir.x * NUDGE, y: aimDir.y * NUDGE, z: aimDir.z * NUDGE }
       : { x: 0, y: 0, z: 0 };
 
+    // 9b. Catch-commit (Gap 2 — parity with the AI's committed envelope).
+    //     Explicit override: F held = force-commit (a deliberate snare).
+    //     Implicit trigger mirrors rigger_ai::wants_catch's non-directed
+    //     branch (read-only reference): the bell must be LOOSE (the setter
+    //     already enforces unheld + not-thrown-by-us), within a sensible
+    //     range AHEAD of us, and genuinely CLOSING — and, so it stays a
+    //     read of intent, the player must be reeling toward it (winching
+    //     in). Holding the bell can't catch, so it's gated off there too.
+    const forceCatch = this.keys.has('KeyF');
+    let implicitCatch = false;
+    if (this.bellLoose && !this.holdingBell) {
+      const tbx = this.bellPos.x - this.playerPos.x;
+      const tby = this.bellPos.y - this.playerPos.y;
+      const tbz = this.bellPos.z - this.playerPos.z;
+      const gap = Math.hypot(tbx, tby, tbz);
+      const bs  = Math.hypot(this.bellVel.x, this.bellVel.y, this.bellVel.z);
+      // wants_catch hard range cap is 70 m; the non-directed commit needs
+      // gap < 45 m AND closing > 0.2 (or, for a near-stationary bell,
+      // gap < 12 m). Same numbers, verbatim.
+      if (gap < 70) {
+        if (bs < 1e-3) {
+          implicitCatch = gap < 12;
+        } else {
+          const closing = -(this.bellVel.x * tbx
+                          + this.bellVel.y * tby
+                          + this.bellVel.z * tbz)
+                          / (bs * Math.max(gap, 1e-6));
+          implicitCatch = closing > 0.2 && gap < 45;
+        }
+      }
+      // Read-of-intent gate: only auto-arm while the player is actively
+      // winching toward the ball (reel in). A deliberate F always wins.
+      implicitCatch = implicitCatch && reel === -1;
+    }
+    const catchIntent = forceCatch || implicitCatch;
+    this._catchArmed = catchIntent;
+
     // 10. Ghost arc: predict Coriolis path from current throw state.
     //     Show whenever bell is held (even before charge starts) so the
     //     player can see where their *minimum* throw will go.
@@ -286,7 +407,7 @@ export class InputManager {
       throwReleased,
       throwSpin,
       thrumbler,
-      catchIntent: false, // human catch is reflex-only (no commit key bound)
+      catchIntent, // Gap 2: implicit (mirrors wants_catch) or F-forced
     };
   }
 
@@ -315,6 +436,10 @@ export class InputManager {
       chargeLevel:   this._charge,
       ghostArc:      this._ghostArc,
       pointerLocked: this.pointerLocked,
+      clawInFlight:  this.hasLine && !this.lineAttached,
+      refireCooldown:
+        this._refireCdSec / Math.max(FEEL.REFIRE_COOLDOWN_TICKS * SIM_H, 1e-6),
+      catchArmed:    this._catchArmed,
     };
   }
 
@@ -485,7 +610,7 @@ export class InputManager {
     // ── Keyboard ─────────────────────────────────────────────────────────
     // Only call preventDefault for game keys — don't swallow browser shortcuts.
     const GAME_KEYS = new Set([
-      'KeyW','KeyA','KeyS','KeyD','KeyG','KeyC',
+      'KeyW','KeyA','KeyS','KeyD','KeyG','KeyC','KeyF',
       'ArrowUp','ArrowDown','ArrowLeft','ArrowRight',
       'ShiftLeft','ShiftRight','Space',
     ]);

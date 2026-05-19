@@ -250,6 +250,13 @@ async function runMatch(
     const snap = sim.snapshot();
     const p1 = snap.players.find((p) => p.id === 'P1');
     if (p1) input.setPlayerState(p1.p, p1.v, snap.bell.heldBy === 'P1');
+    // Catch-commit parity (Gap 2): the bell is grabbable by us only if it's
+    // unheld AND we didn't throw it (mirrors wants_catch's early-outs).
+    const bellLoose = snap.bell.heldBy === null && snap.bell.thrownBy !== 'P1';
+    input.setBellState(snap.bell.p, snap.bell.v, bellLoose);
+    // Grapple-latency cue (Gap 3): expose P1's line presence/attached so the
+    // reticle can show flight + the re-fire lockout. Render-only.
+    input.setLineState(p1?.line != null, p1?.line?.attached === true);
     const p1in = input.get(SIM_H);
     // ── Assisted solved-shot ───────────────────────────────────────────────
     // While YOU hold the bell, the game computes the EXACT Coriolis launch

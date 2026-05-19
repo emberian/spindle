@@ -20,6 +20,14 @@
 //   - the bell + BellTrail stay the brightest, most saturated thing — the
 //     tethers are deliberately recessive against it.
 //
+// GRAPPLE LATENCY: a fired line is NOT instantly a cable. While the sim
+// reports `line.attached === false` the claw is still in flight, so this
+// renderer draws a small travelling BITE (octahedron) with a thin pay-out
+// thread behind it — NOT the taut/slack hauling cable. It switches to the
+// cable rendering only once `attached` flips true. Flight progress is
+// render-only (CLAW_SPEED · elapsed along hand→anchor) and never re-enters
+// the sim.
+//
 // The line originates from the rigger's ANIMATED grapple hand (published by
 // Rigger.ts). Render-only; ~8 short tubes rebuilt per frame is trivial off
 // the 240 Hz sim path.
@@ -27,6 +35,7 @@
 import * as THREE from 'three';
 import type { PlayerSim, GrappleState } from '../sim/types';
 import { PAL } from '../ui/palette';
+import { FEEL } from '../sim/RegConstants';
 import { grappleHand } from './RigGrapple';
 
 const SAG_SEGMENTS = 24;
@@ -51,6 +60,17 @@ const LEN_FADE_FAR  = 260;  // ≥ this: faded to the long-haul floor
 const ANCHOR_SIZE = 0.22;
 const HAND_SIZE = 0.13;
 
+// GRAPPLE LATENCY (Gap 1): a fired-but-not-yet-attached claw is a TRAVELLING
+// PROJECTILE, not a hauling cable. While `!ls.attached` the sim is paying out
+// flight — there is no constraint force yet — so we draw a small claw head
+// flying hand→anchor with a thin pay-out line trailing it. Progress along the
+// flight is RENDER-ONLY: derived from CLAW_SPEED + the hand→anchor distance +
+// render time since the unattached line first appeared. It never re-enters
+// sim.step (the established hard rule); it only has to LOOK like the same
+// latency the sim is enforcing (ceil(dist / CLAW_SPEED / h) ticks).
+const CLAW_HEAD_SIZE = 0.16; // m — the flying bite (slightly bigger than HAND)
+const FLIGHT_RADIUS = 0.03;  // m — pay-out thread: thinner even than SLACK
+
 // Fallback hand offset (figure-local) if Rigger hasn't published a hand yet.
 const HAND_FALLBACK_LOCAL = new THREE.Vector3(0.42, 1.55, 0.55);
 
@@ -61,6 +81,7 @@ const _mid = new THREE.Vector3();
 const _radial = new THREE.Vector3();
 const _quat = new THREE.Quaternion();
 const _off = new THREE.Vector3();
+const _claw = new THREE.Vector3();
 const _pts: THREE.Vector3[] = [];
 for (let i = 0; i <= SAG_SEGMENTS; i++) _pts.push(new THREE.Vector3());
 
@@ -100,6 +121,19 @@ function fillCatenary(a: THREE.Vector3, b: THREE.Vector3, sag: number): void {
   }
 }
 
+/** Fill _pts[0..SAG_SEGMENTS] with a straight a→b run (the taut pay-out
+ *  thread behind a flying claw — no sag; it's a line being dragged out). */
+function fillStraight(a: THREE.Vector3, b: THREE.Vector3): void {
+  for (let i = 0; i <= SAG_SEGMENTS; i++) {
+    const t = i / SAG_SEGMENTS;
+    _pts[i].set(
+      a.x + (b.x - a.x) * t,
+      a.y + (b.y - a.y) * t,
+      a.z + (b.z - a.z) * t,
+    );
+  }
+}
+
 // ── Per-player line ──────────────────────────────────────────────────────────
 
 class LineInstance {
@@ -111,6 +145,7 @@ class LineInstance {
   private ring: THREE.Mesh;        // cube anchor (the goal ring)
   private hand: THREE.Mesh;        // node where the line leaves the rigger
   private endNode: THREE.Mesh;     // node at the FAR end for player↔player
+  private clawHead: THREE.Mesh;    // the in-flight bite (GRAPPLE LATENCY)
   private curGeo: THREE.TubeGeometry | null = null;
 
   private active = false;
@@ -118,6 +153,12 @@ class LineInstance {
   private prevChord = 0;
   private wasTaut = false;
   private snapKick = 0;
+
+  // Render-only flight clock: seconds the line has existed UNATTACHED. Reset
+  // whenever the line is gone or has attached, so a fresh shot always flies
+  // from the hand. Pure cosmetic; never feeds the sim.
+  private flightT = 0;
+  private wasAttached = true;
 
   constructor() {
     // Tether: one thin tube. NOT additive — a normal translucent stroke so
@@ -164,7 +205,18 @@ class LineInstance {
     this.endNode = new THREE.Mesh(new THREE.SphereGeometry(HAND_SIZE * 1.25, 8, 6), anchorMat());
     this.endNode.renderOrder = 2;
 
-    this.group.add(this.rope, this.spar, this.skin, this.ring, this.hand, this.endNode);
+    // The flying claw head: an octahedron (a structural BITE, same shape
+    // language as a spar anchor) — small, crisp, additive, only lit while
+    // the line is unattached. It reads as "thrown, not yet bitten".
+    this.clawHead = new THREE.Mesh(
+      new THREE.OctahedronGeometry(CLAW_HEAD_SIZE, 0), anchorMat(),
+    );
+    this.clawHead.renderOrder = 2;
+
+    this.group.add(
+      this.rope, this.spar, this.skin, this.ring, this.hand, this.endNode,
+      this.clawHead,
+    );
     this.group.visible = false;
   }
 
@@ -209,6 +261,9 @@ class LineInstance {
       this.group.visible = false;
       this.active = false;
       this.fire = 0;
+      this.flightT = 0;
+      this.wasAttached = true;
+      this.clawHead.visible = false;
       return;
     }
     this.group.visible = true;
@@ -223,6 +278,65 @@ class LineInstance {
     else _to.set(ls.anchorPos.x, ls.anchorPos.y, ls.anchorPos.z);
     const chord = _from.distanceTo(_to);
     const taut = ls.taut;
+
+    // ── GRAPPLE LATENCY: claw in flight (Gap 1) ─────────────────────────────
+    // The sim has fired but not yet attached: there is NO hauling cable yet,
+    // only a claw travelling toward anchorPos. Draw it as a projectile and
+    // bail before any of the taut/slack cable machinery runs. Progress is
+    // render-only — CLAW_SPEED·elapsed along hand→anchor, clamped — so it
+    // visually tracks the sim's ceil(dist / CLAW_SPEED / h)-tick latency
+    // WITHOUT ever feeding sim.step.
+    if (!ls.attached) {
+      // Fresh shot (or just-fired) → restart the cosmetic flight clock so the
+      // claw always launches from the hand, never mid-air.
+      if (this.wasAttached || !this.active) this.flightT = 0;
+      this.active = true;
+      this.wasAttached = false;
+      this.wasTaut = false;
+      this.flightT += dt;
+
+      // Param along hand→anchor from the render clock. A real shot lands in
+      // chord / CLAW_SPEED s; clamp <1 so the head never visually "arrives"
+      // before the sim flips attached (the cable then takes over).
+      const flightDur = Math.max(chord / FEEL.CLAW_SPEED, 1e-3);
+      const u = Math.min(0.985, this.flightT / flightDur);
+      _claw.lerpVectors(_from, _to, u);
+
+      // Thin pay-out thread: hand → claw head only (the line is being
+      // dragged out behind the bite; nothing past the head exists yet).
+      fillStraight(_from, _claw);
+      this.rebuild(FLIGHT_RADIUS + (isP1 ? P1_RADIUS_BOOST * 0.4 : 0));
+
+      const teamColF = ps.team === 'home' ? PAL.cyan : PAL.orange;
+      const rmF = this.rope.material as THREE.MeshBasicMaterial;
+      rmF.color.setHex(teamColF);
+      rmF.opacity = 0.22; // a faint flying thread — recessive, but trackable
+
+      // The head: crisp, additive, paper-tinted so the BITE reads against the
+      // dim thread; a gentle spin + slight scale pulse sells "in flight".
+      const tF = now * 0.001;
+      const cm = this.clawHead.material as THREE.MeshBasicMaterial;
+      cm.color.setHex(blendHex(teamColF, PAL.paper, 0.55));
+      cm.opacity = 0.7;
+      this.clawHead.position.copy(_claw);
+      this.clawHead.rotation.set(tF * 5.0, tF * 6.5, 0);
+      this.clawHead.scale.setScalar(1 + 0.12 * Math.sin(tF * 22));
+      this.clawHead.visible = true;
+
+      // No cable, no anchor node, no hand node while flying — JUST the
+      // thread + the travelling bite, so the throw reads cleanly.
+      this.spar.visible = false;
+      this.skin.visible = false;
+      this.ring.visible = false;
+      this.endNode.visible = false;
+      this.hand.visible = false;
+      this.prevChord = chord;
+      return;
+    }
+    // Attached: the claw has bitten — hand off to the cable renderer below.
+    this.clawHead.visible = false;
+    this.hand.visible = true;
+    this.wasAttached = true;
 
     if (!this.active) { this.fire = 0; this.prevChord = chord; }
     this.active = true;
@@ -316,6 +430,9 @@ class LineInstance {
     this.group.visible = false;
     this.active = false;
     this.fire = 0;
+    this.flightT = 0;
+    this.wasAttached = true;
+    this.clawHead.visible = false;
   }
 }
 

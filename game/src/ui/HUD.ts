@@ -663,6 +663,48 @@ export class HUD {
           `rgba(212,96,42,${pulse})`, 1.5);
       }
     }
+
+    // ── Grapple-latency cues (Gap 3) ────────────────────────────────────────
+    // Non-instant claw + locked line + re-fire lockout means RMB can do
+    // NOTHING for a beat. Make that legible without clutter — three small,
+    // recessive marks around the existing reticle, all in the canon palette.
+    const cdR = CHARGE_R + 7; // just outside the charge ring; they never
+                              // co-occur (charge needs the bell in hand,
+                              // these only matter when grappling).
+
+    // (a) Claw in flight: the line is COMMITTED, can't re-fire. A slow dim
+    //     sweep around the reticle = "wait, it's travelling".
+    if (input.clawInFlight) {
+      const sweep = (Date.now() * 0.004) % (Math.PI * 2);
+      arc(ctx, cx, cy, cdR, sweep, sweep + Math.PI * 0.55,
+        PAL.dimCss + 'cc', 2);
+    }
+    // (b) Re-fire cooldown remaining: a depleting dim arc (full → empty).
+    //     Only when no claw is mid-flight (after release/miss).
+    else if (input.refireCooldown > 0.001) {
+      const a0 = -Math.PI / 2;
+      const a1 = a0 + Math.PI * 2 * input.refireCooldown;
+      arc(ctx, cx, cy, cdR, a0, a1, PAL.dimCss + '99', 2);
+    }
+
+    // (c) Catch-commit armed (widened envelope — Gap 2): a small cyan
+    //     diamond at the reticle so the player SEES the snare is live.
+    if (input.catchArmed) {
+      const d = RETICLE_R + 2;
+      const pulse = 0.55 + 0.25 * Math.sin(Date.now() * 0.009);
+      ctx.save();
+      ctx.strokeStyle = PAL.cyanCss;
+      ctx.globalAlpha  = pulse;
+      ctx.lineWidth    = 1.5;
+      ctx.beginPath();
+      ctx.moveTo(cx, cy - d);
+      ctx.lineTo(cx + d, cy);
+      ctx.lineTo(cx, cy + d);
+      ctx.lineTo(cx - d, cy);
+      ctx.closePath();
+      ctx.stroke();
+      ctx.restore();
+    }
   }
 
   // ── Internals ──────────────────────────────────────────────────────────

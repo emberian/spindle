@@ -230,6 +230,7 @@ export class Onboarding {
       ['G (hold)',  'Auto-fly straight toward the ring'],
       ['SHIFT',     'Push off a surface'],
       ['SPACE',     'Thrumbler nudge'],
+      ['F',         'Force the committed catch (also auto-arms when a loose bell closes on you)'],
     ];
     for (const [key, desc] of bindings) {
       const keyEl = document.createElement('span');
