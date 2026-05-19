@@ -246,17 +246,65 @@ fn is_dive_committer(
     pack[0].id == player.id
 }
 
-/// THE DECISIVE POWERED-HOOK DIVE. Fire an anchor positioned BEYOND the
-/// predicted bell intercept along the rigger→intercept axis, then `reel=-1`
-/// so winching in physically drives the rigger THROUGH the ball (a hard
-/// committed dive, not an orbit). Returns the `PartialInput` directly so it
-/// fully DOMINATES the generic nav / coverage / w-max path. Pure geometry +
-/// the canon predictor; deterministic, no rng.
-fn decisive_dive_input(player: &PlayerSim, state: &SimState) -> (PartialInput, Vec3) {
-    let ip = bell_intercept(player, state);
+/// Predicted catch point AND the bell's velocity THERE. Same canon RK4 +
+/// skin-bounce predictor (`efe::roll_forward`) the recover/intercept path
+/// uses; the lead horizon is chosen deterministically so the rigger and the
+/// bell would meet at roughly the same instant (a true rendezvous, not a
+/// stale point). Returns `(catch_point, bell_velocity_at_catch_point)`.
+/// Pure geometry, deterministic, no rng.
+fn bell_rendezvous(player: &PlayerSim, state: &SimState) -> (Vec3, Vec3) {
+    let b = &state.bell;
+    // The committed powered hook really does close fast (winch cruise ≈
+    // REEL_PULL_SPEED 26 m/s plus the rigger's inbound speed). Use a
+    // confident closing speed to size the lead so the predicted point is
+    // where we can actually BE when the bell is there.
+    let to_b = vsub(b.p, player.p);
+    let gap = vlen(to_b);
+    let inbound = if gap > 1e-6 {
+        (vdot(player.v, to_b) / gap).max(0.0)
+    } else {
+        0.0
+    };
+    let close_v = (crate::tuning::REEL_PULL_SPEED + inbound.min(14.0)).max(8.0);
+    // Fixed-point: re-evaluate the lead time at the predicted point a few
+    // times so t_lead ≈ |predicted − rigger| / close_v converges (the bell
+    // curves under Coriolis; one shot would lead the wrong amount). Fixed
+    // iteration count ⇒ deterministic.
+    let mut t_lead = (gap / close_v).max(0.05).min(2.6);
+    let mut st = PointState { p: b.p, v: b.v };
+    for _ in 0..4 {
+        st = efe::roll_forward(b.p, b.v, state.omega, t_lead, REG_R);
+        let d = vlen(vsub(st.p, player.p));
+        t_lead = (d / close_v).max(0.05).min(2.6);
+    }
+    (st.p, st.v)
+}
+
+/// THE DECISIVE POWERED-HOOK DIVE — now a VELOCITY-MATCHED RENDEZVOUS.
+///
+/// The old dive fired the anchor 14 m beyond the lead point along the
+/// rigger→point line and held `reel = -1` all the way in, so the rigger
+/// arrived winching at ≈ REEL_PULL_SPEED along ITS OWN heading — a
+/// direction unrelated to the bell's. `|bell_v − player_v|` was therefore
+/// huge (a high-speed crossing flyby) and `try_catch_ex` only ever
+/// bobbled.
+///
+/// Now: predict the catch point AND the bell's velocity there (canon
+/// predictor), and fire the anchor DOWNRANGE ALONG THE BELL'S VELOCITY —
+/// i.e. ahead of the catch point on the bell's own future path. Winching
+/// toward that anchor pulls the rigger onto a track that runs roughly
+/// PARALLEL to the bell's trajectory (a pursuit/rendezvous), so the
+/// terminal winch velocity is ≈ co-linear with `bell_v`; the rel-speed
+/// collapses from "two unrelated headings" to ≈ `|REEL_PULL_SPEED −
+/// |bell_v||`, which the terminal ease then bleeds the rest of the way
+/// into the 38 m/s absorb window. Returns `(PartialInput, aim_dir,
+/// catch_point)` so the caller can run the terminal-ease phase. Pure
+/// geometry + the canon predictor; deterministic, no rng.
+fn decisive_dive_input(player: &PlayerSim, state: &SimState) -> (PartialInput, Vec3, Vec3) {
+    let (ip, bv) = bell_rendezvous(player, state);
     let to_ip = vsub(ip, player.p);
     let d = vlen(to_ip);
-    let dir = if d > 1e-6 {
+    let app_dir = if d > 1e-6 {
         vscale(to_ip, 1.0 / d)
     } else {
         // Degenerate (already on it): drive straight at the live bell.
@@ -268,12 +316,36 @@ fn decisive_dive_input(player: &PlayerSim, state: &SimState) -> (PartialInput, V
             Vec3::new(attack_sign(player.team), 0.0, 0.0)
         }
     };
-    // Anchor BEYOND the intercept so reeling pulls us onto/through it. Keep
-    // the anchor inside the chamber (clamp cross-radius below the skin) so
-    // the powered hook has real purchase — the planner's own anchors stay
-    // legal; this is the AI-side committed override.
+    // Rendezvous anchor: DOWNRANGE on the bell's OWN future path, not the
+    // straight rigger→point line. The terminal winch then drags the rigger
+    // parallel to the bell's velocity (≈ co-linear), so at the catch point
+    // |bell_v − player_v| ≈ ||bell_v| − REEL_PULL_SPEED|, small enough for
+    // the terminal ease to bleed into the committed absorb window.
+    let bspeed = vlen(bv);
+    let bvdir = if bspeed > 1e-3 {
+        vscale(bv, 1.0 / bspeed)
+    } else {
+        // Bell barely moving: a plain straight dive is already a rendezvous
+        // (rel-speed ≈ our own speed, which the terminal ease kills).
+        app_dir
+    };
+    // Far out we still need to actually CLOSE the gap to the bell's path;
+    // near in we want to be running parallel to it. Blend the two with a
+    // smooth, distance-only (deterministic) weight: mostly approach when
+    // far, mostly bell-parallel once within ~3 terminal radii.
+    let term_r = crate::tuning::DIVE_TERMINAL_RADIUS;
+    let w_par = (1.0 - (d / (3.0 * term_r)).min(1.0)).clamp(0.0, 1.0);
+    let blended = vnorm(vadd(
+        vscale(app_dir, 1.0 - w_par),
+        vscale(bvdir, w_par),
+    ));
+    let dir = if vlen(blended) > 1e-6 { blended } else { app_dir };
+    // Anchor ahead of the catch point along the bell's path so reeling
+    // converges onto — and then runs with — the bell's trajectory.
     let beyond = 14.0_f64;
-    let mut anchor = vadd(ip, vscale(dir, beyond));
+    let mut anchor = vadd(ip, vscale(bvdir, beyond));
+    // Keep the anchor inside the chamber (clamp cross-radius below the
+    // skin) so the powered hook has real purchase.
     let arho = (anchor.y * anchor.y + anchor.z * anchor.z).sqrt();
     let max_r = REG_R - 1.0;
     if arho > max_r && arho > 1e-6 {
@@ -288,7 +360,7 @@ fn decisive_dive_input(player: &PlayerSim, state: &SimState) -> (PartialInput, V
         release: Some(false),
         pushoff: Some(false),
     };
-    (pi, dir)
+    (pi, dir, ip)
 }
 
 /// estimateOpenness (RiggerAI.ts:192-219).
@@ -632,7 +704,7 @@ pub fn compute_player_input(
         }
 
         if commit_dive {
-            let (partial, dir) = decisive_dive_input(player, state);
+            let (partial, dir, catch_pt) = decisive_dive_input(player, state);
             let aim_dither = cache
                 .value
                 .as_ref()
@@ -674,11 +746,32 @@ pub fn compute_player_input(
                 (None, false)
             };
 
+            // ── TERMINAL WINCH-EASE (the catch fix) ──────────────────────
+            // The rendezvous anchor has pulled us onto a track roughly
+            // PARALLEL to the bell's velocity. Once we are within
+            // DIVE_TERMINAL_RADIUS of the predicted catch point, STOP
+            // hard-winching: emit reel = 0 so the winch adds no more Δv and
+            // our speed bleeds toward the bell's, dropping
+            // |bell_v − player_v| into the committed absorb window
+            // (COMMIT_CATCH_SPEED = 38) with closing ≥ closing_floor, so
+            // collision::try_catch_ex returns Caught. We do NOT release the
+            // line — grapple latency makes a re-acquire costly — and we keep
+            // catch_intent = true so `committed` stays set. Geometry only
+            // (a radius test on the deterministic predicted point): no rng,
+            // no wall clock, fully tick-reproducible.
+            let near_catch =
+                vlen(vsub(catch_pt, player.p)) <= crate::tuning::DIVE_TERMINAL_RADIUS;
+            let reel_cmd: i32 = if near_catch {
+                0
+            } else {
+                partial.reel.unwrap_or(-1)
+            };
+
             return PlayerInput {
                 id: player.id.clone(),
                 aim: nav_aim,
                 fire_line_at: fire,
-                reel: partial.reel.unwrap_or(-1),
+                reel: reel_cmd,
                 release: do_release || partial.release.unwrap_or(false),
                 pushoff: partial.pushoff.unwrap_or(false) || pushoff,
                 throw_charge: 0.0,
@@ -1787,7 +1880,23 @@ mod tests {
             out.fire_line_at.is_some(),
             "committer must FIRE an anchor (decisive dive), got hover/no-anchor"
         );
-        assert_eq!(out.reel, -1, "committer must WINCH IN (reel=-1) the dive");
+        // Re-baselined for the velocity-matched-rendezvous catch fix: the
+        // dive now hard-winches (reel = -1) ONLY while still closing; once
+        // within DIVE_TERMINAL_RADIUS of the predicted catch point it eases
+        // the winch (reel = 0) so rel-speed bleeds into the committed
+        // absorb window (try_catch_ex Caught). Here the bell is near & slow
+        // so the predicted catch point is already inside the terminal
+        // radius ⇒ the CORRECT decisive input is the terminal ease, not a
+        // through-winch. The committal property the test guards is still
+        // proven by fire_line_at (it FIRED a dive anchor, not a hover) +
+        // catch_intent + the latch; the winch sign is a phase detail.
+        assert!(
+            out.reel == -1 || out.reel == 0,
+            "committer must drive the dive: hard-winch (-1) while closing \
+             or terminal-ease (0) once within the catch-point radius, \
+             got {}",
+            out.reel
+        );
         assert!(out.catch_intent, "committer must signal catch_intent");
         // Hysteresis latched.
         assert!(

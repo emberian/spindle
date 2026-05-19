@@ -62,6 +62,26 @@ pub const CLAW_SPEED: f64 = 80.0; // m/s — claw travel speed from player to ta
 /// spamming a fresh prediction every tick, short enough not to feel sticky.
 pub const REFIRE_COOLDOWN_TICKS: u64 = 48;
 
+/// COMMITTED-DIVE TERMINAL EASE (the catch fix, AI side). The decisive dive
+/// fires its anchor downrange ALONG the predicted bell velocity at the
+/// catch point, so winching in pulls the rigger onto a path that runs
+/// PARALLEL to the bell's trajectory (a velocity-matched rendezvous, not a
+/// crossing flyby). When the rigger gets within `DIVE_TERMINAL_RADIUS`
+/// metres of that predicted catch point it STOPS hard-winching (emits
+/// `reel = 0` — it does NOT release the line; grapple latency makes a
+/// re-acquire costly) so it stops gaining winch Δv and its velocity bleeds
+/// toward the bell's velocity, dropping `|bell_v − player_v|` into the
+/// committed absorb window (`COMMIT_CATCH_SPEED = 38`) with `closing ≥
+/// closing_floor`, so `collision::try_catch_ex` returns `Caught`.
+///
+/// = `COMMIT_ARM_REACH (7.0) + 2.0` margin: the ease must begin a little
+/// OUTSIDE the catch reach so the winch Δv has actually stopped (the
+/// winch accel-cap relaxes over ≈ SPEED/ACCEL ≈ 0.22 s) by the time the
+/// bell is in arm's reach, but not so early the dive loses its drive.
+/// Tick/geometry only — no rng, no wall clock. Mirrored verbatim in
+/// `RegConstants.ts` (`FEEL.DIVE_TERMINAL_RADIUS`).
+pub const DIVE_TERMINAL_RADIUS: f64 = 9.0; // m — winch-ease radius around the predicted catch point
+
 /// Soft-grounding penetration push-out spring (rho ≥ R).
 /// ω_n = sqrt(GROUND_K / 78) ≈ 8.0 rad/s ⇒ ω_n·h ≈ 0.033 ≪ 2.
 pub const GROUND_K: f64 = 5000.0;

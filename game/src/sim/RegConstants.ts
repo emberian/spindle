@@ -53,4 +53,16 @@ export const FEEL = {
   // (48 ticks = 0.2 s). Integer tick counts, no wall clock.
   CLAW_SPEED: 80, // m/s — claw travel speed from player to target
   REFIRE_COOLDOWN_TICKS: 48, // ticks — re-fire lockout after release/miss
+
+  // COMMITTED-DIVE TERMINAL EASE (the catch fix) — verbatim mirror of
+  // tuning.rs DIVE_TERMINAL_RADIUS. The decisive dive fires its anchor
+  // downrange ALONG the predicted bell velocity at the catch point so the
+  // winch pulls the rigger PARALLEL to the bell's path (velocity-matched
+  // rendezvous, not a crossing flyby). Within DIVE_TERMINAL_RADIUS m of
+  // that predicted catch point the rigger stops hard-winching (reel = 0,
+  // it does NOT release — latency makes re-acquire costly) so its speed
+  // bleeds toward the bell's, dropping |bell_v − player_v| into the
+  // committed absorb window (COMMIT_CATCH_SPEED 38) ⇒ try_catch_ex Caught.
+  // = COMMIT_ARM_REACH (7.0) + 2.0 margin. Tick/geometry only.
+  DIVE_TERMINAL_RADIUS: 9, // m — winch-ease radius around the predicted catch point
 } as const;
