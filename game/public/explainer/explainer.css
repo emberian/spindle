@@ -1,0 +1,217 @@
+/* RIG explainer — shared styles.
+   Palette flows from the game's canon palette.ts.
+   Static, no build step, no deps. */
+
+:root {
+  --bg:     #11131a;
+  --bg-2:   #161922;
+  --panel:  #1b1f29;
+  --cyan:   #1aa6b7;
+  --orange: #d4602a;
+  --paper:  #f4f1ea;
+  --dim:    #6b7079;
+  --line:   #262b36;
+  color-scheme: dark;
+}
+
+* { box-sizing: border-box; }
+
+html, body { margin: 0; padding: 0; }
+
+body {
+  background: var(--bg);
+  color: var(--paper);
+  font: 400 17px/1.65 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+  overflow-x: hidden;
+}
+
+/* ---- Drifting starfield (fixed, behind everything) ---- */
+.stars {
+  position: fixed; inset: 0; z-index: -2; pointer-events: none;
+  background:
+    radial-gradient(1px 1px at 20% 30%,  rgba(244,241,234,.7), transparent),
+    radial-gradient(1px 1px at 70% 60%,  rgba(244,241,234,.5), transparent),
+    radial-gradient(1.5px 1.5px at 40% 80%, rgba(26,166,183,.6), transparent),
+    radial-gradient(1px 1px at 85% 15%,  rgba(244,241,234,.4), transparent),
+    radial-gradient(1px 1px at 55% 45%,  rgba(244,241,234,.55), transparent),
+    radial-gradient(1.5px 1.5px at 10% 70%, rgba(212,96,42,.45), transparent),
+    radial-gradient(1px 1px at 92% 88%,  rgba(244,241,234,.5), transparent),
+    radial-gradient(1px 1px at 33% 12%,  rgba(244,241,234,.35), transparent);
+  background-size: 100% 100%;
+  animation: drift 90s linear infinite alternate;
+}
+.stars::after {
+  content: ""; position: absolute; inset: -50%;
+  background:
+    radial-gradient(1px 1px at 15% 55%, rgba(244,241,234,.4), transparent),
+    radial-gradient(1px 1px at 60% 25%, rgba(244,241,234,.3), transparent),
+    radial-gradient(1px 1px at 80% 70%, rgba(26,166,183,.35), transparent);
+  animation: drift 140s linear infinite alternate-reverse;
+}
+@keyframes drift {
+  from { transform: translate3d(0,0,0); }
+  to   { transform: translate3d(-40px,-30px,0); }
+}
+
+.glow {
+  position: fixed; z-index: -1; pointer-events: none;
+  width: 60vw; height: 60vw; max-width: 720px; max-height: 720px;
+  top: -18vw; right: -14vw; border-radius: 50%;
+  background: radial-gradient(circle, rgba(26,166,183,.10), transparent 70%);
+}
+
+/* ---- Layout ---- */
+.wrap { max-width: 880px; margin: 0 auto; padding: 0 22px; }
+
+header.site {
+  position: sticky; top: 0; z-index: 10;
+  background: rgba(17,19,26,.82);
+  backdrop-filter: blur(10px);
+  border-bottom: 1px solid var(--line);
+}
+header.site .wrap {
+  display: flex; align-items: center; gap: 18px;
+  min-height: 58px; flex-wrap: wrap; padding-top: 8px; padding-bottom: 8px;
+}
+.brand {
+  font-weight: 800; letter-spacing: .22em; font-size: 15px;
+  color: var(--paper); text-decoration: none; white-space: nowrap;
+}
+.brand b { color: var(--cyan); }
+nav.site { display: flex; gap: 4px 14px; flex-wrap: wrap; margin-left: auto; }
+nav.site a {
+  color: var(--dim); text-decoration: none; font-size: 13px;
+  letter-spacing: .06em; padding: 4px 2px; white-space: nowrap;
+}
+nav.site a:hover, nav.site a[aria-current="page"] { color: var(--paper); }
+nav.site a[aria-current="page"] { border-bottom: 2px solid var(--cyan); }
+
+main { padding: 0 0 80px; }
+
+section { padding: 56px 0; border-bottom: 1px solid var(--line); }
+section:last-of-type { border-bottom: 0; }
+
+h1 {
+  font-size: clamp(34px, 7vw, 62px); line-height: 1.05;
+  letter-spacing: -.02em; font-weight: 800; margin: 0 0 .4em;
+}
+h2 {
+  font-size: clamp(24px, 4.4vw, 34px); line-height: 1.15;
+  letter-spacing: -.01em; font-weight: 800; margin: 0 0 .6em;
+}
+h3 {
+  font-size: 19px; font-weight: 700; margin: 1.8em 0 .4em;
+  color: var(--cyan); letter-spacing: .01em;
+}
+p { margin: 0 0 1.1em; max-width: 64ch; }
+a { color: var(--cyan); }
+.lede { font-size: clamp(18px, 2.4vw, 22px); color: #d9d6cd; max-width: 60ch; }
+.eyebrow {
+  text-transform: uppercase; letter-spacing: .28em; font-size: 12px;
+  font-weight: 700; color: var(--cyan); margin: 0 0 18px;
+}
+strong { color: var(--paper); font-weight: 700; }
+em { color: var(--orange); font-style: normal; font-weight: 600; }
+
+/* ---- Hero ---- */
+.hero { padding: 64px 0 40px; position: relative; }
+.hero .stage {
+  width: 100%; max-width: 760px; margin: 26px auto 0; display: block;
+}
+
+/* ---- Pull-quote (screenshot-friendly) ---- */
+.pull {
+  margin: 40px 0; padding: 26px 28px;
+  border-left: 3px solid var(--orange);
+  background: linear-gradient(90deg, rgba(212,96,42,.08), transparent);
+  font-size: clamp(20px, 3.2vw, 27px); line-height: 1.3;
+  font-weight: 700; color: var(--paper); letter-spacing: -.01em;
+}
+.pull span { color: var(--cyan); }
+
+/* ---- Cards / grid ---- */
+.grid {
+  display: grid; gap: 16px; margin: 28px 0;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+}
+.card {
+  background: var(--panel); border: 1px solid var(--line);
+  border-radius: 12px; padding: 22px;
+}
+.card h3 { margin-top: 0; }
+.card p { font-size: 15px; color: #c7c4bc; margin-bottom: 0; }
+
+/* ---- Buttons ---- */
+.cta { display: flex; gap: 14px; flex-wrap: wrap; margin: 30px 0 8px; }
+.btn {
+  display: inline-flex; align-items: center; gap: 9px;
+  padding: 13px 24px; border-radius: 999px;
+  font-weight: 700; font-size: 15px; text-decoration: none;
+  letter-spacing: .02em; transition: transform .15s ease;
+}
+.btn:hover { transform: translateY(-2px); }
+.btn-primary { background: var(--cyan); color: #07262a; }
+.btn-ghost { border: 1px solid var(--line); color: var(--paper); }
+
+/* ---- Page nav links (subpage chips on hero) ---- */
+.chips { display: grid; gap: 12px; margin: 34px 0; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); }
+.chip {
+  display: block; text-decoration: none; color: var(--paper);
+  background: var(--bg-2); border: 1px solid var(--line);
+  border-radius: 12px; padding: 18px 20px; transition: border-color .15s, transform .15s;
+}
+.chip:hover { border-color: var(--cyan); transform: translateY(-2px); }
+.chip b { display: block; font-size: 17px; margin-bottom: 4px; }
+.chip span { color: var(--dim); font-size: 14px; }
+
+/* ---- Data list (sport/physics specs) ---- */
+.spec { display: grid; gap: 1px; background: var(--line); border: 1px solid var(--line); border-radius: 10px; overflow: hidden; margin: 26px 0; }
+.spec div { display: flex; justify-content: space-between; gap: 16px; background: var(--panel); padding: 14px 18px; font-size: 15px; }
+.spec dt, .spec dfn { color: var(--dim); font-style: normal; }
+.spec dd, .spec b { margin: 0; color: var(--paper); font-weight: 700; text-align: right; }
+
+figure { margin: 30px 0; }
+figure svg { width: 100%; height: auto; display: block; }
+figcaption { color: var(--dim); font-size: 13px; margin-top: 10px; text-align: center; }
+
+ul.clean { list-style: none; padding: 0; margin: 22px 0; }
+ul.clean li { padding: 10px 0 10px 26px; position: relative; border-bottom: 1px solid var(--line); color: #cdcac2; }
+ul.clean li::before { content: ""; position: absolute; left: 4px; top: 19px; width: 7px; height: 7px; border-radius: 50%; background: var(--cyan); }
+ul.clean li:last-child { border-bottom: 0; }
+ul.clean b { color: var(--paper); }
+
+footer.site {
+  border-top: 1px solid var(--line); padding: 40px 0 64px;
+  color: var(--dim); font-size: 14px;
+}
+footer.site a { color: var(--dim); text-decoration: none; }
+footer.site a:hover { color: var(--paper); }
+footer.site .row { display: flex; gap: 8px 20px; flex-wrap: wrap; margin-bottom: 16px; }
+
+.tag {
+  display: inline-block; font-size: 11px; letter-spacing: .14em;
+  text-transform: uppercase; color: var(--orange); font-weight: 700;
+  border: 1px solid rgba(212,96,42,.4); border-radius: 999px;
+  padding: 4px 11px; margin-bottom: 18px;
+}
+
+/* ---- Animated SVG bits ---- */
+.bell-trace { stroke-dasharray: 6 7; animation: dash 9s linear infinite; }
+@keyframes dash { to { stroke-dashoffset: -260; } }
+.bell-orbit { animation: orbit 9s linear infinite; }
+@keyframes orbit { to { transform: rotate(360deg); } }
+.twinkle { animation: tw 4s ease-in-out infinite; }
+@keyframes tw { 0%,100% { opacity:.3 } 50% { opacity:1 } }
+
+@media (prefers-reduced-motion: reduce) {
+  .stars, .stars::after, .bell-trace, .bell-orbit, .twinkle { animation: none !important; }
+}
+
+@media (max-width: 560px) {
+  body { font-size: 16px; }
+  section { padding: 44px 0; }
+  nav.site { width: 100%; margin-left: 0; }
+  header.site .wrap { gap: 10px; }
+}

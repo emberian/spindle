@@ -1,0 +1,110 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>RIG — A zero-g sport, and a lab for swarm coordination</title>
+<meta name="description" content="RIG is a fictional zero-gravity grappling sport played in the weightless axis of a spinning space habitat — and underneath, a deterministic, watchable laboratory for multi-agent swarm coordination.">
+<link rel="canonical" href="https://emberian.github.io/spindle/explainer/">
+<meta property="og:type" content="website">
+<meta property="og:title" content="RIG — A zero-g sport, and a lab for swarm coordination">
+<meta property="og:description" content="A fictional zero-g grappling sport played in the calm — and a deterministic, watchable lab for multi-agent swarm coordination.">
+<meta property="og:image" content="https://emberian.github.io/spindle/explainer/og.svg">
+<meta property="og:url" content="https://emberian.github.io/spindle/explainer/">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="RIG — A zero-g sport, and a lab for swarm coordination">
+<meta name="twitter:description" content="A fictional zero-g grappling sport played in the calm — and a deterministic, watchable lab for multi-agent swarm coordination.">
+<meta name="twitter:image" content="https://emberian.github.io/spindle/explainer/og.svg">
+<link rel="stylesheet" href="explainer.css">
+</head>
+<body>
+<div class="stars"></div><div class="glow"></div>
+
+<header class="site"><div class="wrap">
+  <a class="brand" href="index.html">R<b>I</b>G</a>
+  <nav class="site">
+    <a href="index.html" aria-current="page">What is RIG</a>
+    <a href="sport.html">The Sport</a>
+    <a href="physics.html">The Physics</a>
+    <a href="swarm.html">The Swarm</a>
+    <a href="learning.html">Watching It Learn</a>
+    <a href="tech.html">How It's Built</a>
+    <a href="vision.html">Why</a>
+  </nav>
+</div></header>
+
+<main>
+<div class="wrap">
+
+<section class="hero">
+  <p class="eyebrow">A sport — and a lab</p>
+  <h1>RIG is a sport that doesn't exist, built to study a problem that does.</h1>
+  <p class="lede">On the surface: a zero-gravity grappling sport played in <em>the calm</em> — the weightless near-axis volume of a spinning space habitat. Underneath: a deterministic, bit-exact, watchable laboratory for getting four agents to <strong>cooperate</strong> against a thinking opponent. Every match is a controlled experiment you can replay frame-for-frame — and watch like a highlight reel.</p>
+
+  <svg class="stage" viewBox="0 0 760 360" role="img" aria-label="A bell tracing a curved Coriolis arc through the dark axis of a spinning cylinder">
+    <defs>
+      <linearGradient id="ha" x1="0" y1="1" x2="1" y2="0">
+        <stop offset="0" stop-color="#1aa6b7"/><stop offset="1" stop-color="#d4602a"/>
+      </linearGradient>
+    </defs>
+    <g stroke="#262b36" fill="none" stroke-width="1.4">
+      <ellipse cx="380" cy="180" rx="350" ry="120"/>
+      <ellipse cx="380" cy="180" rx="230" ry="78"/>
+      <ellipse cx="380" cy="180" rx="110" ry="38"/>
+    </g>
+    <g class="twinkle" fill="#f4f1ea">
+      <circle cx="120" cy="60" r="1.5"/><circle cx="660" cy="300" r="1.5"/>
+      <circle cx="700" cy="90" r="1.5" fill="#1aa6b7"/><circle cx="80" cy="290" r="1.5"/>
+    </g>
+    <path class="bell-trace" d="M 90 300 Q 360 40 690 170" stroke="url(#ha)" stroke-width="4" fill="none" stroke-linecap="round"/>
+    <g transform="translate(690 170)">
+      <g class="bell-orbit" style="transform-origin:0 0">
+        <circle cx="34" cy="0" r="3" fill="#1aa6b7"/>
+      </g>
+      <circle r="14" fill="#d4602a"/>
+      <circle r="26" fill="none" stroke="#d4602a" stroke-opacity="0.35" stroke-width="2"/>
+    </g>
+  </svg>
+
+  <div class="cta">
+    <a class="btn btn-primary" href="../">▶ Watch it live</a>
+    <a class="btn btn-ghost" href="sport.html">Read the canon →</a>
+  </div>
+</section>
+
+<section>
+  <h2>Two true things at once</h2>
+  <p>RIG is a real sport with real culture — a bell you read by ear, a money shot called the Loop, a 32-team league and a bracket called The Jump. It is also a serious control problem wearing a sport's clothes: partial information, sparse structured reward, an adversarial side, and physics that lie to your intuition.</p>
+  <p>The trick is that both halves are the <em>same artifact</em>. The thing you watch for fun is the thing the researcher measures — because the simulation is deterministic to the bit. Nothing about it is staged.</p>
+
+  <blockquote class="pull">A sport you can <span>watch</span>. A lab you can <span>replay</span>. The same engine, exactly.</blockquote>
+</section>
+
+<section>
+  <h2>Find your way in</h2>
+  <p>Pick the door that fits how you got here.</p>
+  <div class="chips">
+    <a class="chip" href="sport.html"><b>The Sport →</b><span>The calm, the bell, the Loop, the league. The canon.</span></a>
+    <a class="chip" href="physics.html"><b>The Physics →</b><span>Why Coriolis makes this a genuine control domain.</span></a>
+    <a class="chip" href="swarm.html"><b>The Swarm →</b><span>Four cooperating agents — the actual point.</span></a>
+    <a class="chip" href="learning.html"><b>Watching It Learn →</b><span>The game is the visualizer for a learned team.</span></a>
+    <a class="chip" href="tech.html"><b>How It's Built →</b><span>Rust → WebAssembly, determinism as sacred.</span></a>
+    <a class="chip" href="vision.html"><b>Why →</b><span>More interesting than foosball robots.</span></a>
+  </div>
+</section>
+
+</div>
+</main>
+
+<footer class="site"><div class="wrap">
+  <div class="row">
+    <a href="index.html">What is RIG</a><a href="sport.html">The Sport</a>
+    <a href="physics.html">The Physics</a><a href="swarm.html">The Swarm</a>
+    <a href="learning.html">Watching It Learn</a><a href="tech.html">How It's Built</a>
+    <a href="vision.html">Why</a><a href="../">Watch live</a>
+  </div>
+  RIG — a living experiment in playable multi-agent coordination. Built fast, validated by watching. The simulation is deterministic; everything here is honest about being in motion.
+</div></footer>
+
+</body>
+</html>

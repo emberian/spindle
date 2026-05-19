@@ -1,0 +1,115 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The Physics — why RIG is a real control problem</title>
+<meta name="description" content="RIG is a genuine non-inertial control domain: Coriolis and centrifugal terms in the rotating frame, weightless near the axis, inertial along it. The bell is integrated with rotating-frame RK4 and gyroscopic dynamics — and it is bit-exact deterministic.">
+<link rel="canonical" href="https://emberian.github.io/spindle/explainer/physics.html">
+<meta property="og:type" content="article">
+<meta property="og:title" content="The Physics — why RIG is a real control problem">
+<meta property="og:description" content="A genuine non-inertial control domain: Coriolis + centrifugal, weightless near the axis, inertial along it — and bit-exact deterministic.">
+<meta property="og:image" content="https://emberian.github.io/spindle/explainer/og.svg">
+<meta property="og:url" content="https://emberian.github.io/spindle/explainer/physics.html">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="The Physics — why RIG is a real control problem">
+<meta name="twitter:description" content="Coriolis is not a special effect here. It's the game.">
+<meta name="twitter:image" content="https://emberian.github.io/spindle/explainer/og.svg">
+<link rel="stylesheet" href="explainer.css">
+</head>
+<body>
+<div class="stars"></div><div class="glow"></div>
+
+<header class="site"><div class="wrap">
+  <a class="brand" href="index.html">R<b>I</b>G</a>
+  <nav class="site">
+    <a href="index.html">What is RIG</a>
+    <a href="sport.html">The Sport</a>
+    <a href="physics.html" aria-current="page">The Physics</a>
+    <a href="swarm.html">The Swarm</a>
+    <a href="learning.html">Watching It Learn</a>
+    <a href="tech.html">How It's Built</a>
+    <a href="vision.html">Why</a>
+  </nav>
+</div></header>
+
+<main><div class="wrap">
+
+<section>
+  <span class="tag">Why it's a real problem</span>
+  <h1>Coriolis is not a special effect. It's the game.</h1>
+  <p class="lede">RIG is set in a rotating habitat because a rotating frame is a genuine non-inertial control domain — the same class of problem that makes spinning spacecraft hard to move around inside of. The curves are not animation. They fall out of the equations of motion.</p>
+</section>
+
+<section>
+  <h2>What the rotating frame does to you</h2>
+  <p>Stand in a spinning cylinder and you feel two fictitious forces. <strong>Centrifugal</strong> pushes you outward, growing with radius as ω²r — zero at the axis, about <strong>0.8 m/s²</strong> at play radius, a heavy 4.6 m/s² at the 45 m skin. <strong>Coriolis</strong> acts sideways on anything moving in the spin plane, bending straight intentions into arcs.</p>
+  <p>So the calm is not "just weightless." Near the axis it is nearly weightless and nearly fair. Drift outward and the world starts pulling and turning under you. Aim where the bell is and you will miss; you have to aim where the frame is going to take it.</p>
+</section>
+
+<section>
+  <h2>The one axis that tells the truth</h2>
+  <p>Here is the detail the whole sport is built around: motion <strong>along the cylinder's axis is inertial</strong>. No Coriolis acts on it. Move up the tube and you move straight; move across the spin and you curve.</p>
+  <p>That asymmetry is the strategic spine. The calm has an honest direction and a deceitful one, and good play is knowing, in your hands, which is which at every instant.</p>
+
+  <blockquote class="pull">Across the spin, the world lies to you. <span>Along the axis, it doesn't.</span></blockquote>
+</section>
+
+<section>
+  <h2>The Loop, drawn</h2>
+  <p>A straight push, seen from inside the spinning frame, comes back curved. Time it so the curve closes through a ring and you have a <strong>Loop</strong> — a shot that orbits to its target along a path only this frame could produce.</p>
+
+  <figure>
+    <svg viewBox="0 0 760 340" role="img" aria-label="A straight launch in the inertial frame becomes a closed curved Loop in the rotating frame">
+      <g stroke="#262b36" stroke-width="1.4" fill="none">
+        <circle cx="380" cy="170" r="150"/><circle cx="380" cy="170" r="92"/>
+      </g>
+      <line x1="380" y1="20" x2="380" y2="320" stroke="#262b36" stroke-dasharray="4 8"/>
+      <text x="388" y="34" fill="#6b7079" font-size="12" font-family="ui-sans-serif,system-ui,sans-serif">spin axis (inertial)</text>
+      <!-- straight intent -->
+      <line x1="250" y1="290" x2="470" y2="120" stroke="#6b7079" stroke-width="2" stroke-dasharray="5 6"/>
+      <text x="232" y="305" fill="#6b7079" font-size="13" font-family="ui-sans-serif,system-ui,sans-serif">intended (straight)</text>
+      <!-- coriolis-bent loop -->
+      <path d="M250 290 C 360 200 540 210 470 110 C 430 55 320 70 300 150"
+            stroke="#1aa6b7" stroke-width="4" fill="none" stroke-linecap="round"/>
+      <circle cx="300" cy="150" r="22" fill="none" stroke="#d4602a" stroke-width="3"/>
+      <text x="318" y="155" fill="#d4602a" font-size="13" font-weight="700" font-family="ui-sans-serif,system-ui,sans-serif">ring</text>
+      <circle cx="250" cy="290" r="6" fill="#d4602a"/>
+      <text x="500" y="170" fill="#1aa6b7" font-size="14" font-weight="700" font-family="ui-sans-serif,system-ui,sans-serif">actual (Loop)</text>
+    </svg>
+    <figcaption>Same launch. The frame does the bending. Reading that curve is the skill.</figcaption>
+  </figure>
+</section>
+
+<section>
+  <h2>Honest dynamics under the hood</h2>
+  <p>None of this is faked with eased keyframes. The bell is a rigid body with angular momentum, integrated as a <strong>symmetric top</strong> — proper gyroscopic dynamics, precession and all — stepped with <strong>RK4 in the rotating frame</strong> so Coriolis and centrifugal terms enter the integration, not a shader. Spin it clean and it holds its axis; strike it and it wobbles, exactly as a tumbling object should.</p>
+</section>
+
+<section>
+  <h2>And it is exactly repeatable</h2>
+  <p>This is the part that turns a sport into a laboratory. The simulation is <strong>bit-exact deterministic</strong>: one seed in, one identical match out, every time, on every machine. Same inputs, same trajectory, down to the last bit of the last float.</p>
+  <p>That means a "lucky bounce" is reproducible, a strategy can be compared against itself with nothing else changed, and a highlight is also an experiment. Determinism is what makes any claim about <em>this swarm got better</em> mean something.</p>
+
+  <blockquote class="pull">Determinism is not a feature here. It's the <span>instrument</span>.</blockquote>
+
+  <div class="cta">
+    <a class="btn btn-primary" href="../">▶ See the curve in motion</a>
+    <a class="btn btn-ghost" href="swarm.html">Now: who's flying it →</a>
+  </div>
+</section>
+
+</div></main>
+
+<footer class="site"><div class="wrap">
+  <div class="row">
+    <a href="index.html">What is RIG</a><a href="sport.html">The Sport</a>
+    <a href="physics.html">The Physics</a><a href="swarm.html">The Swarm</a>
+    <a href="learning.html">Watching It Learn</a><a href="tech.html">How It's Built</a>
+    <a href="vision.html">Why</a><a href="../">Watch live</a>
+  </div>
+  RIG — a living experiment in playable multi-agent coordination.
+</div></footer>
+
+</body>
+</html>

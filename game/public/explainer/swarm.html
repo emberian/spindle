@@ -1,0 +1,136 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The Swarm — the actual point of RIG</title>
+<meta name="description" content="The unit of interest is the team as a coordinating swarm: 4 cooperating riggers vs an adversarial side, partial information, sparse reward. A Director assigns roles; per-rigger controllers use Expected Free Energy and Bennett-style w-maximization. Coordination is the design target.">
+<link rel="canonical" href="https://emberian.github.io/spindle/explainer/swarm.html">
+<meta property="og:type" content="article">
+<meta property="og:title" content="The Swarm — the actual point of RIG">
+<meta property="og:description" content="Four cooperating agents vs a thinking opponent. A Director assigns roles; controllers built on active inference and weakest-sufficient-policy. Coordination is the target.">
+<meta property="og:image" content="https://emberian.github.io/spindle/explainer/og.svg">
+<meta property="og:url" content="https://emberian.github.io/spindle/explainer/swarm.html">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="The Swarm — the actual point of RIG">
+<meta name="twitter:description" content="The team, not the agent, is the thing being studied.">
+<meta name="twitter:image" content="https://emberian.github.io/spindle/explainer/og.svg">
+<link rel="stylesheet" href="explainer.css">
+</head>
+<body>
+<div class="stars"></div><div class="glow"></div>
+
+<header class="site"><div class="wrap">
+  <a class="brand" href="index.html">R<b>I</b>G</a>
+  <nav class="site">
+    <a href="index.html">What is RIG</a>
+    <a href="sport.html">The Sport</a>
+    <a href="physics.html">The Physics</a>
+    <a href="swarm.html" aria-current="page">The Swarm</a>
+    <a href="learning.html">Watching It Learn</a>
+    <a href="tech.html">How It's Built</a>
+    <a href="vision.html">Why</a>
+  </nav>
+</div></header>
+
+<main><div class="wrap">
+
+<section>
+  <span class="tag">The actual point</span>
+  <h1>The thing being studied is the team, not the genius.</h1>
+  <p class="lede">It is easy to make one clever agent do one clever thing. RIG is built around the harder, more interesting question: can <strong>four</strong> agents, each seeing only part of the world, sharing a sparse and structured reward, beat an opponent that is also trying — by <em>coordinating</em>, not by being individually brilliant?</p>
+</section>
+
+<section>
+  <h2>Lower stakes, same algorithm</h2>
+  <p>This is a not-quite-robotics control problem. Continuous control, partial observation, an adversary, reward that only arrives at meaningful moments. Nobody gets hurt if a rigger fumbles — but the algorithmic class is the same one that shows up when real machines have to work as a group. RIG is a place to practice that class where mistakes are just a missed Loop.</p>
+
+  <blockquote class="pull">Foosball robots, but the table is <span>physics</span> and the players have to <span>agree</span> with each other.</blockquote>
+</section>
+
+<section>
+  <h2>The layered mind of a side</h2>
+  <p>A team is not one policy. It is a stack.</p>
+
+  <figure>
+    <svg viewBox="0 0 760 300" role="img" aria-label="Director assigns roles at 2 Hz to four per-rigger controllers">
+      <rect x="250" y="20" width="260" height="56" rx="10" fill="#1b1f29" stroke="#1aa6b7" stroke-width="1.5"/>
+      <text x="380" y="44" text-anchor="middle" fill="#f4f1ea" font-size="16" font-weight="700" font-family="ui-sans-serif,system-ui,sans-serif">Director</text>
+      <text x="380" y="64" text-anchor="middle" fill="#6b7079" font-size="12" font-family="ui-sans-serif,system-ui,sans-serif">assigns roles · ~2 Hz</text>
+      <g stroke="#262b36" stroke-width="1.5" fill="none">
+        <path d="M380 76 V100 M140 130 V100 H620 V130 M340 130 V100 M540 130 V100"/>
+      </g>
+      <g font-family="ui-sans-serif,system-ui,sans-serif">
+        <g transform="translate(70 130)">
+          <rect width="140" height="64" rx="9" fill="#1b1f29" stroke="#3ad4b7" stroke-width="1.5"/>
+          <text x="70" y="27" text-anchor="middle" fill="#f4f1ea" font-size="14" font-weight="700">Interceptor</text>
+          <text x="70" y="46" text-anchor="middle" fill="#6b7079" font-size="11">primary on the bell</text>
+        </g>
+        <g transform="translate(270 130)">
+          <rect width="140" height="64" rx="9" fill="#1b1f29" stroke="#1aa6b7" stroke-width="1.5"/>
+          <text x="70" y="27" text-anchor="middle" fill="#f4f1ea" font-size="14" font-weight="700">Shadow</text>
+          <text x="70" y="46" text-anchor="middle" fill="#6b7079" font-size="11">covers the rebound</text>
+        </g>
+        <g transform="translate(470 130)">
+          <rect width="140" height="64" rx="9" fill="#1b1f29" stroke="#d4a02a" stroke-width="1.5"/>
+          <text x="70" y="27" text-anchor="middle" fill="#f4f1ea" font-size="14" font-weight="700">Outlet</text>
+          <text x="70" y="46" text-anchor="middle" fill="#6b7079" font-size="11">sets the next phase</text>
+        </g>
+        <g transform="translate(620 130)">
+          <rect width="120" height="64" rx="9" fill="#1b1f29" stroke="#6b7079" stroke-width="1.5"/>
+          <text x="60" y="27" text-anchor="middle" fill="#f4f1ea" font-size="14" font-weight="700">Spacer</text>
+          <text x="60" y="46" text-anchor="middle" fill="#6b7079" font-size="11">anti-clustering</text>
+        </g>
+      </g>
+      <text x="380" y="250" text-anchor="middle" fill="#6b7079" font-size="13" font-family="ui-sans-serif,system-ui,sans-serif">Each controller acts on its own egocentric view — the roles make the four into a team.</text>
+    </svg>
+    <figcaption>A Director re-decides who does what a couple of times a second. The riggers execute.</figcaption>
+  </figure>
+</section>
+
+<section>
+  <h2>How a rigger decides</h2>
+  <p>Underneath each role, the controllers are built on two ideas worth naming honestly:</p>
+  <div class="grid">
+    <div class="card">
+      <h3>Expected Free Energy</h3>
+      <p>Active inference: an agent acts both to fulfil its preferences <em>and</em> to reduce its uncertainty about the world. It doesn't only chase the goal — it also moves to find out what it needs to know to chase it well. That's why a rigger will reposition for a better read, not just lunge.</p>
+    </div>
+    <div class="card">
+      <h3>Bennett-style w-maximization</h3>
+      <p>Among policies that are good enough, prefer the <em>weakest sufficient</em> one — the simplest commitment that still does the job. Weaker policies generalise: they bend to new situations instead of overfitting one. The team stays robust rather than brittle-clever.</p>
+    </div>
+  </div>
+</section>
+
+<section>
+  <h2>Coordination is the design target</h2>
+  <p>The roles are chosen so the four <em>need</em> each other. A primary interceptor commits to the bell. A shadow is already where the rebound will be. An outlet is positioning for the phase that hasn't happened yet. A spacing pressure keeps them from collapsing onto the same point and becoming one redundant agent in four bodies. Take any one away and the shape breaks — which is exactly the property you want when the thing you're studying is coordination itself.</p>
+
+  <blockquote class="pull">Success isn't a great individual play. It's four decisions that only make sense <span>together</span>.</blockquote>
+</section>
+
+<section>
+  <h2>Honest about where it is</h2>
+  <p>This is an evolving experiment, and that's the good part. The controller stack is not a finished result being shown off — it is a thing in motion, and because every match is deterministic and watchable, you can actually <em>see</em> it get better between versions instead of taking a number's word for it. The weak spots are visible too. That's the deal: nothing here is staged.</p>
+
+  <div class="cta">
+    <a class="btn btn-primary" href="../">▶ Watch a side coordinate</a>
+    <a class="btn btn-ghost" href="learning.html">How it learns →</a>
+  </div>
+</section>
+
+</div></main>
+
+<footer class="site"><div class="wrap">
+  <div class="row">
+    <a href="index.html">What is RIG</a><a href="sport.html">The Sport</a>
+    <a href="physics.html">The Physics</a><a href="swarm.html">The Swarm</a>
+    <a href="learning.html">Watching It Learn</a><a href="tech.html">How It's Built</a>
+    <a href="vision.html">Why</a><a href="../">Watch live</a>
+  </div>
+  RIG — a living experiment in playable multi-agent coordination.
+</div></footer>
+
+</body>
+</html>

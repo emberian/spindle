@@ -1,0 +1,127 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>How It's Built — Rust core, WebAssembly, determinism as sacred</title>
+<meta name="description" content="A pure Rust simulation core compiled to WebAssembly; a TypeScript/Three.js frontend that only reads deterministic snapshots. Seeded RNG only, a behavioral CI gate on every deploy. Built fast and iteratively, validated by watching, with parallel AI agents converging behind green gates.">
+<link rel="canonical" href="https://emberian.github.io/spindle/explainer/tech.html">
+<meta property="og:type" content="article">
+<meta property="og:title" content="How It's Built — Rust core, WebAssembly, determinism as sacred">
+<meta property="og:description" content="Pure Rust → WebAssembly; the frontend only ever reads snapshots. Determinism is treated as sacred, with a behavioral CI gate on every deploy.">
+<meta property="og:image" content="https://emberian.github.io/spindle/explainer/og.svg">
+<meta property="og:url" content="https://emberian.github.io/spindle/explainer/tech.html">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="How It's Built — Rust core, WebAssembly, determinism as sacred">
+<meta name="twitter:description" content="The render layer only ever reads the truth. It never makes it.">
+<meta name="twitter:image" content="https://emberian.github.io/spindle/explainer/og.svg">
+<link rel="stylesheet" href="explainer.css">
+</head>
+<body>
+<div class="stars"></div><div class="glow"></div>
+
+<header class="site"><div class="wrap">
+  <a class="brand" href="index.html">R<b>I</b>G</a>
+  <nav class="site">
+    <a href="index.html">What is RIG</a>
+    <a href="sport.html">The Sport</a>
+    <a href="physics.html">The Physics</a>
+    <a href="swarm.html">The Swarm</a>
+    <a href="learning.html">Watching It Learn</a>
+    <a href="tech.html" aria-current="page">How It's Built</a>
+    <a href="vision.html">Why</a>
+  </nav>
+</div></header>
+
+<main><div class="wrap">
+
+<section>
+  <span class="tag">How it's built</span>
+  <h1>One source of truth. Everything else only reads it.</h1>
+  <p class="lede">RIG is a pure Rust simulation core compiled to WebAssembly and run in your browser. The frontend — TypeScript and Three.js — never decides anything about the match. It asks the core for a snapshot and draws it. That separation is the whole architecture, and it's what makes the determinism believable.</p>
+</section>
+
+<section>
+  <h2>The architecture, in one picture</h2>
+  <figure>
+    <svg viewBox="0 0 760 320" role="img" aria-label="Rust core compiled to WebAssembly feeds snapshots to a Three.js renderer; the Gym and learner sit alongside the core">
+      <g font-family="ui-sans-serif,system-ui,sans-serif">
+        <rect x="40" y="40" width="200" height="86" rx="11" fill="#1b1f29" stroke="#1aa6b7" stroke-width="2"/>
+        <text x="140" y="74" text-anchor="middle" fill="#f4f1ea" font-size="16" font-weight="700">Rust core</text>
+        <text x="140" y="96" text-anchor="middle" fill="#6b7079" font-size="12">deterministic sim · seeded RNG</text>
+
+        <rect x="300" y="40" width="180" height="86" rx="11" fill="#1b1f29" stroke="#1aa6b7" stroke-width="2"/>
+        <text x="390" y="74" text-anchor="middle" fill="#f4f1ea" font-size="16" font-weight="700">WebAssembly</text>
+        <text x="390" y="96" text-anchor="middle" fill="#6b7079" font-size="12">runs in the browser</text>
+
+        <rect x="540" y="40" width="200" height="86" rx="11" fill="#1b1f29" stroke="#d4602a" stroke-width="2"/>
+        <text x="640" y="74" text-anchor="middle" fill="#f4f1ea" font-size="16" font-weight="700">Three.js render</text>
+        <text x="640" y="96" text-anchor="middle" fill="#6b7079" font-size="12">reads snapshots only</text>
+
+        <g stroke="#262b36" stroke-width="1.6" fill="#262b36">
+          <line x1="240" y1="83" x2="296" y2="83"/><polygon points="296,79 304,83 296,87"/>
+          <line x1="480" y1="83" x2="536" y2="83"/><polygon points="536,79 544,83 536,87"/>
+        </g>
+        <text x="500" y="34" text-anchor="middle" fill="#6b7079" font-size="11">snapshot →</text>
+
+        <rect x="40" y="200" width="200" height="80" rx="11" fill="#1b1f29" stroke="#3ad4b7" stroke-width="1.6"/>
+        <text x="140" y="234" text-anchor="middle" fill="#f4f1ea" font-size="15" font-weight="700">Gym</text>
+        <text x="140" y="255" text-anchor="middle" fill="#6b7079" font-size="12">reset · step · snapshot</text>
+
+        <rect x="300" y="200" width="180" height="80" rx="11" fill="#1b1f29" stroke="#d4a02a" stroke-width="1.6"/>
+        <text x="390" y="234" text-anchor="middle" fill="#f4f1ea" font-size="15" font-weight="700">Learner</text>
+        <text x="390" y="255" text-anchor="middle" fill="#6b7079" font-size="12">evolution strategies</text>
+
+        <g stroke="#262b36" stroke-width="1.6" fill="none">
+          <path d="M140 126 V200"/><path d="M240 240 H300"/>
+        </g>
+        <text x="640" y="240" text-anchor="middle" fill="#6b7079" font-size="12">same core, off the browser path</text>
+      </g>
+    </svg>
+    <figcaption>Core → wasm → render for play. Gym → learner alongside the same core for training.</figcaption>
+  </figure>
+</section>
+
+<section>
+  <h2>Determinism is treated as sacred</h2>
+  <p>Every source of nondeterminism is hunted down. <strong>Seeded RNG only</strong> — no wall-clock, no unordered iteration, no platform-dependent float drift in the sim path. The render layer is forbidden from feeding anything back into the simulation; it is strictly downstream. A given seed produces a bit-identical match anywhere, which is why a replay is a replay and not a re-enactment.</p>
+  <p>And it's enforced, not hoped for: a <strong>behavioral CI gate</strong> runs on every deploy. If a change moves the match a single bit off the known trajectory for a seed, the gate goes red and the deploy stops. Determinism isn't a convention here; it's a wall.</p>
+
+  <blockquote class="pull">The renderer only ever <span>reads</span> the truth. It never gets to make it.</blockquote>
+</section>
+
+<section>
+  <h2>How it's actually made — honestly</h2>
+  <p>RIG is built fast and iteratively, and validated by <em>watching</em> as much as by asserting. The development style is itself part of the experiment: parallel AI agents do isolated work in their own worktrees and converge only behind green gates — the behavioral determinism check, the test suite — so speed never gets to quietly cost correctness.</p>
+  <p>That is not a disclaimer. It's the interesting part: the project is a live experiment in humans and AI agents building a real system together, and the same discipline that makes the sport a lab — determinism, gates, watchability — is what keeps that way of building honest.</p>
+
+  <dl class="spec">
+    <div><dt>Simulation core</dt><dd>Pure Rust</dd></div>
+    <div><dt>In the browser</dt><dd>WebAssembly</dd></div>
+    <div><dt>Frontend</dt><dd>TypeScript + Three.js, read-only</dd></div>
+    <div><dt>Randomness</dt><dd>Seeded only</dd></div>
+    <div><dt>Replays</dt><dd>Bit-identical</dd></div>
+    <div><dt>Safety net</dt><dd>Behavioral CI gate per deploy</dd></div>
+    <div><dt>Build style</dt><dd>Parallel agents, isolated, gated</dd></div>
+  </dl>
+
+  <div class="cta">
+    <a class="btn btn-primary" href="../">▶ Run the wasm core</a>
+    <a class="btn btn-ghost" href="vision.html">Why any of this →</a>
+  </div>
+</section>
+
+</div></main>
+
+<footer class="site"><div class="wrap">
+  <div class="row">
+    <a href="index.html">What is RIG</a><a href="sport.html">The Sport</a>
+    <a href="physics.html">The Physics</a><a href="swarm.html">The Swarm</a>
+    <a href="learning.html">Watching It Learn</a><a href="tech.html">How It's Built</a>
+    <a href="vision.html">Why</a><a href="../">Watch live</a>
+  </div>
+  RIG — a living experiment in playable multi-agent coordination.
+</div></footer>
+
+</body>
+</html>
