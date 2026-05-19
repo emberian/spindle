@@ -9,6 +9,8 @@ import { renderState, type RenderView } from './render/RenderState';
 import { Calm } from './render/Calm';
 import { DistantHabitat } from './render/DistantHabitat';
 import { BellTrail, bellGlow } from './render/BellTrail';
+import { BellPulse } from './render/BellPulse';
+import { SpiralMotif } from './render/SpiralMotif';
 import { PostFX } from './render/PostFX';
 import { GameCamera } from './render/Camera';
 import { initDebugViz, debugViz } from './render/DebugViz';
@@ -69,6 +71,7 @@ const distantHabitat = new DistantHabitat(scene, true);
 const camera = new THREE.PerspectiveCamera(60, 1, 0.1, 4000);
 const post = new PostFX(renderer, scene, camera);
 const trail = new BellTrail(scene, camera);
+const spiralMotif = new SpiralMotif(scene, camera);
 const gcam = new GameCamera(camera);
 const riggers = new Riggers(scene);
 const riglines = new RigLines(scene);
@@ -197,6 +200,7 @@ const bellMesh = new THREE.Mesh(
   new THREE.MeshStandardMaterial({ color: 0xe8e0c8, emissive: 0x1aa6b7, emissiveIntensity: 1 }),
 );
 scene.add(bellMesh);
+const bellPulse = new BellPulse();
 
 function resize(): void {
   renderer.setSize(innerWidth, innerHeight);
@@ -371,6 +375,7 @@ async function runMatch(
         k === 'loop' ? 'score_loop' : k === 'rise' || k === 'curl' ? 'score_rise'
           : k === 'ground' ? 'score_ground' : 'score_fall',
       );
+      spiralMotif.trigger(trail.getPath(), k);
     } else if (upd && upd.turnover) {
       audio.event('turnover');
     }
@@ -394,10 +399,22 @@ async function runMatch(
       const lg = s.loopTier === 'loop' ? 1 : s.loopTier === 'curl' ? 0.4 : 0;
       const isLoop = s.loopTier === 'loop';
       bellMesh.position.set(s.bell.p.x, s.bell.p.y, s.bell.p.z);
-      (bellMesh.material as THREE.MeshStandardMaterial).emissiveIntensity = bellGlow(s.bell.chime);
-      trail.push(s.bell.p.x, s.bell.p.y, s.bell.p.z, s.bell.chime);
+      // Bell pulse — visual breathing synced to audio state
+      const bellSpinRate = Math.hypot(s.bell.w.x, s.bell.w.y, s.bell.w.z);
+      bellPulse.update(dt, s.bell.chime, bellSpinRate);
+      const bpScale = bellPulse.scaleMod;
+      bellMesh.scale.set(bpScale, bpScale, bpScale);
+      (bellMesh.material as THREE.MeshStandardMaterial).emissiveIntensity = bellGlow(s.bell.chime) * bellPulse.emissiveMod;
+      trail.push(s.bell.p.x, s.bell.p.y, s.bell.p.z, s.bell.chime, bellPulse.trailWidthMod);
       trail.setLoopMode(isLoop);
+      spiralMotif.update(dt);
       post.setLoopGlow(lg);
+      post.setBroadcast(performance.now() / 1000, s.bell.chime);
+      // Project bell to normalised screen UV for the radial focus shader.
+      {
+        const _bp = bellMesh.position.clone().project(camera);
+        post.setBellScreen((_bp.x + 1) * 0.5, 1 - (_bp.y + 1) * 0.5);
+      }
       riggers.sync(s.players, 'P1');
       for (const pp of s.players) riggers.setPoseEmphasis(pp.id, pp.id === s.bell.heldBy ? 1 : 0);
       riglines.sync(s.players);
@@ -713,6 +730,7 @@ async function runWatch(
         kd === 'loop' ? 'score_loop' : kd === 'rise' || kd === 'curl' ? 'score_rise'
           : kd === 'ground' ? 'score_ground' : 'score_fall',
       );
+      spiralMotif.trigger(trail.getPath(), kd);
     } else if (upd && upd.turnover) {
       dbgScores['turnover'] = (dbgScores['turnover'] ?? 0) + 1;
       dbgPassStreak = 0;
@@ -732,11 +750,23 @@ async function runWatch(
       const s = renderState(driver.prev as RenderView, driver.cur as RenderView, driver.alpha);
       const lg = s.loopTier === 'loop' ? 1 : s.loopTier === 'curl' ? 0.4 : 0;
       const isLoop = s.loopTier === 'loop';
+      // Bell pulse — visual breathing synced to audio state
+      const bellSpinRate = Math.hypot(s.bell.w.x, s.bell.w.y, s.bell.w.z);
+      bellPulse.update(dt, s.bell.chime, bellSpinRate);
+      const bpScale = bellPulse.scaleMod;
+      bellMesh.scale.set(bpScale, bpScale, bpScale);
       bellMesh.position.set(s.bell.p.x, s.bell.p.y, s.bell.p.z);
-      (bellMesh.material as THREE.MeshStandardMaterial).emissiveIntensity = bellGlow(s.bell.chime);
-      trail.push(s.bell.p.x, s.bell.p.y, s.bell.p.z, s.bell.chime);
+      (bellMesh.material as THREE.MeshStandardMaterial).emissiveIntensity = bellGlow(s.bell.chime) * bellPulse.emissiveMod;
+      trail.push(s.bell.p.x, s.bell.p.y, s.bell.p.z, s.bell.chime, bellPulse.trailWidthMod);
       trail.setLoopMode(isLoop);
+      spiralMotif.update(dt);
       post.setLoopGlow(lg);
+      post.setBroadcast(performance.now() / 1000, s.bell.chime);
+      // Project bell to normalised screen UV for the radial focus shader.
+      {
+        const _bp = bellMesh.position.clone().project(camera);
+        post.setBellScreen((_bp.x + 1) * 0.5, 1 - (_bp.y + 1) * 0.5);
+      }
       riggers.sync(s.players, '');
       for (const pp of s.players) riggers.setPoseEmphasis(pp.id, pp.id === s.bell.heldBy ? 1 : 0);
       riglines.sync(s.players);
@@ -993,6 +1023,7 @@ async function runReplay(
         kd === 'loop' ? 'score_loop' : kd === 'rise' || kd === 'curl' ? 'score_rise'
           : kd === 'ground' ? 'score_ground' : 'score_fall',
       );
+      spiralMotif.trigger(trail.getPath(), kd);
     } else if (upd && upd.turnover) {
       audio.event('turnover');
     }
@@ -1009,11 +1040,23 @@ async function runReplay(
       const s = renderState(driver.prev as RenderView, driver.cur as RenderView, driver.alpha);
       const lg = s.loopTier === 'loop' ? 1 : s.loopTier === 'curl' ? 0.4 : 0;
       const isLoop = s.loopTier === 'loop';
+      // Bell pulse — visual breathing synced to audio state
+      const bellSpinRate = Math.hypot(s.bell.w.x, s.bell.w.y, s.bell.w.z);
+      bellPulse.update(dt, s.bell.chime, bellSpinRate);
+      const bpScale = bellPulse.scaleMod;
+      bellMesh.scale.set(bpScale, bpScale, bpScale);
       bellMesh.position.set(s.bell.p.x, s.bell.p.y, s.bell.p.z);
-      (bellMesh.material as THREE.MeshStandardMaterial).emissiveIntensity = bellGlow(s.bell.chime);
-      trail.push(s.bell.p.x, s.bell.p.y, s.bell.p.z, s.bell.chime);
+      (bellMesh.material as THREE.MeshStandardMaterial).emissiveIntensity = bellGlow(s.bell.chime) * bellPulse.emissiveMod;
+      trail.push(s.bell.p.x, s.bell.p.y, s.bell.p.z, s.bell.chime, bellPulse.trailWidthMod);
       trail.setLoopMode(isLoop);
+      spiralMotif.update(dt);
       post.setLoopGlow(lg);
+      post.setBroadcast(performance.now() / 1000, s.bell.chime);
+      // Project bell to normalised screen UV for the radial focus shader.
+      {
+        const _bp = bellMesh.position.clone().project(camera);
+        post.setBellScreen((_bp.x + 1) * 0.5, 1 - (_bp.y + 1) * 0.5);
+      }
       riggers.sync(s.players, '');
       for (const pp of s.players) riggers.setPoseEmphasis(pp.id, pp.id === s.bell.heldBy ? 1 : 0);
       riglines.sync(s.players);

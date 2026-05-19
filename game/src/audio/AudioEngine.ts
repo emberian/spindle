@@ -62,15 +62,29 @@ export class AudioEngine {
   private flutterGain!: GainNode;               // depth of flutter modulation
   private flutterDepth!: GainNode;              // controlled by chime
 
-  // Crowd
-  private crowdGain!: GainNode;                 // inner gain (setHush)
-  private crowdNoiseSource!: AudioBufferSourceNode;
+  // Crowd — spatial ring (6 sections around the cylinder rim)
+  private crowdGain!: GainNode;                 // master inner gain (setHush targets this)
+  private crowdSections!: {
+    source: AudioBufferSourceNode;
+    panner: PannerNode;
+    gain: GainNode;
+    angle: number;               // current azimuth radians
+    baseAngle: number;           // initial azimuth radians
+    lfoRate: number;             // per-section LFO frequency
+  }[];
 
   // Shared noise buffer (reused for crowd + bell noise)
   private noiseBuffer!: AudioBuffer;
 
+  // Crowd rotation
+  private crowdRotationId = 0;   // rAF id for rotation tick
+
   // Hush baseline
   private readonly CROWD_BASE = 0.07;
+  private readonly CROWD_SECTIONS = 6;
+  private readonly CROWD_RING_RADIUS = 10;   // units from listener
+  private readonly CROWD_RING_Y = 4;         // elevation (above = rim)
+  private readonly CROWD_ROTATION_PERIOD = 30; // seconds per revolution
 
   ok = false;
 
@@ -129,45 +143,121 @@ export class AudioEngine {
     humLp2.connect(this.humBus);
     this.humBus.connect(this.master);
 
-    // ── Crowd bed ─────────────────────────────────────────────────────────
-    //    Filtered noise shaped to sound like distant stadium murmur.
-    //    Two bandpass bands give it warmth + presence.
+    // ── Crowd bed — spatial ring of 6 HRTF sections ────────────────────
+    //    Each section is an independent noise source → two bandpass filters
+    //    → per-section gain → PannerNode (HRTF) → crowdGain → crowdBus.
+    //    Positioned in a ring above the listener (cylinder rim audience).
     this.crowdBus = c.createGain();
     this.crowdBus.gain.value = 1.0;
 
     this.crowdGain = c.createGain();
     this.crowdGain.gain.value = this.CROWD_BASE;
 
-    this.crowdNoiseSource = c.createBufferSource();
-    this.crowdNoiseSource.buffer = this.noiseBuffer;
-    this.crowdNoiseSource.loop = true;
+    // Set up AudioListener at origin, facing forward (Z-negative)
+    const listener = c.listener;
+    if (listener.positionX) {
+      // Modern API (AudioParam)
+      listener.positionX.value = 0;
+      listener.positionY.value = 0;
+      listener.positionZ.value = 0;
+      listener.forwardX.value = 0;
+      listener.forwardY.value = 0;
+      listener.forwardZ.value = -1;
+      listener.upX.value = 0;
+      listener.upY.value = 1;
+      listener.upZ.value = 0;
+    } else {
+      // Legacy API
+      listener.setPosition(0, 0, 0);
+      listener.setOrientation(0, 0, -1, 0, 1, 0);
+    }
 
-    const crowdBp1 = c.createBiquadFilter();
-    crowdBp1.type = 'bandpass';
-    crowdBp1.frequency.value = 580;
-    crowdBp1.Q.value = 0.6;
+    // Per-section bandpass frequency offsets to create organic variation
+    const bp1Freqs = [530, 560, 590, 610, 640, 570];
+    const bp2Freqs = [1150, 1180, 1220, 1260, 1300, 1170];
+    const lfoRates = [0.06, 0.073, 0.055, 0.082, 0.065, 0.078];
 
-    const crowdBp2 = c.createBiquadFilter();
-    crowdBp2.type = 'bandpass';
-    crowdBp2.frequency.value = 1200;
-    crowdBp2.Q.value = 0.5;
+    // Per-section gain: divide total level among 6 sections
+    const perSectionGain = 1.0 / this.CROWD_SECTIONS;
 
-    // slow LFO on crowd to give it life
-    const crowdLfo = c.createOscillator();
-    crowdLfo.frequency.value = 0.07;
-    const crowdLfoGain = c.createGain();
-    crowdLfoGain.gain.value = 0.008;
-    crowdLfo.connect(crowdLfoGain);
-    crowdLfoGain.connect(this.crowdGain.gain);
-    crowdLfo.start();
+    this.crowdSections = [];
 
-    this.crowdNoiseSource.connect(crowdBp1);
-    this.crowdNoiseSource.connect(crowdBp2);
-    crowdBp1.connect(this.crowdGain);
-    crowdBp2.connect(this.crowdGain);
+    for (let i = 0; i < this.CROWD_SECTIONS; i++) {
+      const angle = (i / this.CROWD_SECTIONS) * Math.PI * 2;
+
+      // Noise source with phase offset (start at different point in buffer)
+      const src = c.createBufferSource();
+      src.buffer = this.noiseBuffer;
+      src.loop = true;
+
+      // Two bandpass filters with per-section variation
+      const bp1 = c.createBiquadFilter();
+      bp1.type = 'bandpass';
+      bp1.frequency.value = bp1Freqs[i];
+      bp1.Q.value = 0.6;
+
+      const bp2 = c.createBiquadFilter();
+      bp2.type = 'bandpass';
+      bp2.frequency.value = bp2Freqs[i];
+      bp2.Q.value = 0.5;
+
+      // Per-section gain node
+      const sGain = c.createGain();
+      sGain.gain.value = perSectionGain;
+
+      // Per-section LFO for organic life
+      const lfo = c.createOscillator();
+      lfo.frequency.value = lfoRates[i];
+      const lfoGain = c.createGain();
+      lfoGain.gain.value = 0.002; // subtle per-section modulation
+      lfo.connect(lfoGain);
+      lfoGain.connect(sGain.gain);
+      lfo.start();
+
+      // HRTF PannerNode
+      const panner = c.createPanner();
+      panner.panningModel = 'HRTF';
+      panner.distanceModel = 'inverse';
+      panner.refDistance = 5;
+      panner.maxDistance = 50;
+      panner.rolloffFactor = 1;
+      panner.coneInnerAngle = 360;
+      panner.coneOuterAngle = 360;
+
+      // Position in ring
+      const x = Math.cos(angle) * this.CROWD_RING_RADIUS;
+      const z = Math.sin(angle) * this.CROWD_RING_RADIUS;
+      panner.positionX.value = x;
+      panner.positionY.value = this.CROWD_RING_Y;
+      panner.positionZ.value = z;
+
+      // Wire: source → bp1/bp2 → sGain → panner → crowdGain
+      src.connect(bp1);
+      src.connect(bp2);
+      bp1.connect(sGain);
+      bp2.connect(sGain);
+      sGain.connect(panner);
+      panner.connect(this.crowdGain);
+
+      // Start with phase offset so each section is de-correlated
+      const offset = (i / this.CROWD_SECTIONS) * this.noiseBuffer.duration;
+      src.start(0, offset);
+
+      this.crowdSections.push({
+        source: src,
+        panner,
+        gain: sGain,
+        angle,
+        baseAngle: angle,
+        lfoRate: lfoRates[i],
+      });
+    }
+
     this.crowdGain.connect(this.crowdBus);
     this.crowdBus.connect(this.master);
-    this.crowdNoiseSource.start();
+
+    // Start subtle crowd rotation (cylinder spin hint)
+    this.startCrowdRotation();
 
     // ── Chime voice ───────────────────────────────────────────────────────
     //    A tuned bell voice. Purity encodes spin-trueness.
@@ -266,6 +356,15 @@ export class AudioEngine {
     this.oneShotBus.connect(this.master);
 
     this.ok = true;
+  }
+
+  // ── stop (cleanup) ────────────────────────────────────────────────────────
+
+  stop(): void {
+    if (this.crowdRotationId) {
+      cancelAnimationFrame(this.crowdRotationId);
+      this.crowdRotationId = 0;
+    }
   }
 
   // ── setBell ──────────────────────────────────────────────────────────────
@@ -566,16 +665,45 @@ export class AudioEngine {
     o.stop(t + duration + 0.05);
   }
 
-  /** Crowd eruption: spike crowd gain then decay back. */
+  /** Crowd eruption: spike crowd gain then decay back.
+   *  With spatial ring: one random section leads by 50-100ms (nearest crowd reacts first),
+   *  others follow with slight stagger. The master gain still gets the main spike envelope. */
   private crowdErupt(
     _c: AudioContext, t: number,
     spike: number, decay: number
   ): void {
     const peak = this.CROWD_BASE + spike;
+
+    // Master gain envelope (overall eruption)
     this.crowdGain.gain.cancelScheduledValues(t);
     this.crowdGain.gain.setValueAtTime(this.crowdGain.gain.value, t);
     this.crowdGain.gain.linearRampToValueAtTime(peak, t + 0.12);
     this.crowdGain.gain.exponentialRampToValueAtTime(this.CROWD_BASE, t + 0.12 + decay);
+
+    // Directional stagger: pick a random lead section, others offset 50-100ms behind
+    if (this.crowdSections) {
+      const leadIdx = Math.floor(Math.random() * this.CROWD_SECTIONS);
+      const perSectionBase = 1.0 / this.CROWD_SECTIONS;
+      // The lead section gets a brief solo gain boost before others catch up
+      const boostPeak = perSectionBase * 2.5;  // momentarily louder
+
+      for (let i = 0; i < this.CROWD_SECTIONS; i++) {
+        const section = this.crowdSections[i];
+        // Distance from lead section (0..3 wrapping) determines delay
+        const dist = Math.min(
+          Math.abs(i - leadIdx),
+          this.CROWD_SECTIONS - Math.abs(i - leadIdx)
+        );
+        const delay = dist * (0.025 + Math.random() * 0.025); // 25-50ms per step
+
+        section.gain.gain.cancelScheduledValues(t);
+        section.gain.gain.setValueAtTime(perSectionBase, t);
+        section.gain.gain.linearRampToValueAtTime(boostPeak, t + delay + 0.06);
+        section.gain.gain.exponentialRampToValueAtTime(
+          perSectionBase, t + delay + 0.06 + Math.min(decay * 0.4, 0.8)
+        );
+      }
+    }
   }
 
   /** Tension riser: slow filtered noise swell — the held breath. */
@@ -597,6 +725,40 @@ export class AudioEngine {
     g.connect(this.oneShotBus);
     src.start(t);
     src.stop(t + duration + 0.1);
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // Crowd rotation — subtle cylinder spin hint
+  // ─────────────────────────────────────────────────────────────────────────
+
+  /** Slowly rotate panner positions to hint at cylinder spin.
+   *  ~1 revolution per CROWD_ROTATION_PERIOD seconds. Nearly imperceptible. */
+  private startCrowdRotation(): void {
+    if (!this.ctx) return;
+    const angularVelocity = (Math.PI * 2) / this.CROWD_ROTATION_PERIOD;
+    let lastTime = this.ctx.currentTime;
+
+    const tick = () => {
+      if (!this.ctx || !this.crowdSections) return;
+      const now = this.ctx.currentTime;
+      const dt = now - lastTime;
+      lastTime = now;
+
+      const dAngle = angularVelocity * dt;
+
+      for (const section of this.crowdSections) {
+        section.angle += dAngle;
+        const x = Math.cos(section.angle) * this.CROWD_RING_RADIUS;
+        const z = Math.sin(section.angle) * this.CROWD_RING_RADIUS;
+        section.panner.positionX.value = x;
+        section.panner.positionZ.value = z;
+        // Y stays constant (rim elevation)
+      }
+
+      this.crowdRotationId = requestAnimationFrame(tick);
+    };
+
+    this.crowdRotationId = requestAnimationFrame(tick);
   }
 
   // ─────────────────────────────────────────────────────────────────────────

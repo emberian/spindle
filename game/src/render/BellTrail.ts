@@ -73,6 +73,7 @@ export class BellTrail {
   private buf: { x: number; y: number; z: number; c: number }[] = [];
   private limit = NORMAL_LEN;
   private loopMode = false;
+  private _widthMod = 1.0;
 
   // pre-allocated typed arrays: 2 verts per segment × 3 floats
   private readonly CAP = LOOP_LEN;
@@ -123,10 +124,18 @@ export class BellTrail {
     this.geo.setDrawRange(0, 0);
   }
 
+  /** Return a shallow copy of the current path buffer (for SpiralMotif snapshot). */
+  getPath(): { x: number; y: number; z: number; c: number }[] {
+    return this.buf.slice();
+  }
+
   // chime ∈ [0,1]: 1 = ringing true (brilliant cyan-white), 0 = clattered (dim grey)
-  push(x: number, y: number, z: number, chime: number): void {
+  // widthMod: optional per-frame multiplier on ribbon half-width (centered at 1.0)
+  // from BellPulse — gives the trail a subtle heartbeat rhythm.
+  push(x: number, y: number, z: number, chime: number, widthMod = 1.0): void {
     this.buf.push({ x, y, z, c: chime });
     if (this.buf.length > this.limit) this.buf.shift();
+    this._widthMod = widthMod;
     this._rebuild();
   }
 
@@ -134,7 +143,7 @@ export class BellTrail {
     const n = this.buf.length;
     if (n < 2) { this.geo.setDrawRange(0, 0); return; }
 
-    const halfW = this.loopMode ? HALF_W_LOOP : HALF_W_BASE;
+    const halfW = (this.loopMode ? HALF_W_LOOP : HALF_W_BASE) * this._widthMod;
 
     // We need a "right" vector perpendicular to the trail direction at each point.
     // Strategy: compute tangent at each sample, cross with view direction.

@@ -7,6 +7,11 @@
 //   • Scene desaturates to greyscale: colour drains out of everything else.
 //   • A deep vignette closes in: the ring floats in near-darkness.
 //   Combined effect: breathtaking, unambiguous — a visual held breath.
+//
+// Broadcast aesthetic:
+//   Subtle scanlines, chromatic aberration, and rare signal glitch communicate
+//   "you are experiencing an interstellar audio feed visualized." Felt, not
+//   seen — the texture of the medium, not a distraction.
 
 import * as THREE from 'three';
 import { EffectComposer } from 'three/examples/jsm/postprocessing/EffectComposer.js';
@@ -14,8 +19,10 @@ import { RenderPass }     from 'three/examples/jsm/postprocessing/RenderPass.js'
 import { UnrealBloomPass } from 'three/examples/jsm/postprocessing/UnrealBloomPass.js';
 import { ShaderPass }     from 'three/examples/jsm/postprocessing/ShaderPass.js';
 
-// ── Finish shader: vignette + scene-dim + desaturate ─────────────────────────
+// ── Finish shader: vignette + dim + desat + radial focus + broadcast aesthetic
 // Applied AFTER bloom so vignette corners are dark even on bright bloom.
+// The broadcast layer (scanlines, chromatic aberration, signal glitch) is all
+// in this one pass — no additional render targets, no perf cost.
 const FinishShader = {
   uniforms: {
     tDiffuse: { value: null as THREE.Texture | null },
@@ -27,6 +34,15 @@ const FinishShader = {
     vig:       { value: 0.0 },
     // vigRadius:   normalised radius of vignette falloff
     vigRadius: { value: 0.75 },
+    // bellScreen:  normalised screen-space position of the bell (0-1, 0-1)
+    bellScreen: { value: new THREE.Vector2(0.5, 0.5) },
+    // loopG:       0..1 — raw loop intensity (drives radial focus)
+    loopG:     { value: 0.0 },
+    // ── Broadcast / transmission uniforms ────────────────────────────────────
+    time:          { value: 0.0 },           // seconds (performance.now/1000)
+    resolution:    { value: new THREE.Vector2(1, 1) }, // px
+    chromaStrength:{ value: 0.001 },         // UV-space offset at edges
+    signalQuality: { value: 1.0 },           // 0..1 from bell chime
   },
   vertexShader: /* glsl */`
     varying vec2 vUv;
@@ -41,10 +57,54 @@ const FinishShader = {
     uniform float desat;
     uniform float vig;
     uniform float vigRadius;
+    uniform vec2 bellScreen;
+    uniform float loopG;
+    uniform float time;
+    uniform vec2 resolution;
+    uniform float chromaStrength;
+    uniform float signalQuality;
     varying vec2 vUv;
 
+    // Cheap pseudo-random from a seed float
+    float hash(float n) { return fract(sin(n) * 43758.5453123); }
+
     void main() {
-      vec4 c = texture2D(tDiffuse, vUv);
+      // ── Chromatic aberration (transmission dispersion) ──────────────────
+      // Offset R outward, B inward from centre. Strength ramps with distance
+      // from centre and inversely with signalQuality.
+      vec2 centre = vUv - 0.5;
+      float dist = length(centre);
+      float caStr = chromaStrength * (1.0 + (1.0 - signalQuality) * 2.0);
+      vec2 caOffset = centre * dist * caStr;
+
+      // ── Signal glitch (rare horizontal displacement) ────────────────────
+      // Only fires when signalQuality < 0.4, and even then very rarely
+      // (~1 frame every 5-10 seconds). A single-scanline UV offset.
+      float glitchOffset = 0.0;
+      if (signalQuality < 0.4) {
+        // Quantise time to frames (~60fps) so the glitch lasts 1-2 frames
+        float frameId = floor(time * 60.0);
+        float trigger = hash(frameId * 0.017);
+        // Fire roughly once per 360-600 frames (6-10s at 60fps)
+        if (trigger < 0.003) {
+          float scanY = floor(vUv.y * resolution.y);
+          float band = hash(frameId * 0.031);
+          float bandCentre = band * resolution.y;
+          if (abs(scanY - bandCentre) < 3.0) {
+            glitchOffset = (hash(frameId * 0.053) - 0.5) * 0.01;
+          }
+        }
+      }
+
+      vec2 uvR = vUv + caOffset + vec2(glitchOffset, 0.0);
+      vec2 uvG = vUv + vec2(glitchOffset, 0.0);
+      vec2 uvB = vUv - caOffset + vec2(glitchOffset, 0.0);
+
+      vec4 c;
+      c.r = texture2D(tDiffuse, uvR).r;
+      c.g = texture2D(tDiffuse, uvG).g;
+      c.b = texture2D(tDiffuse, uvB).b;
+      c.a = 1.0;
 
       // 1. Desaturate (drain colour from everything except the bloomed loop)
       float luma = dot(c.rgb, vec3(0.2126, 0.7152, 0.0722));
@@ -53,7 +113,23 @@ const FinishShader = {
       // 2. Scene dim (multiply-down the whole frame)
       c.rgb *= (1.0 - dim);
 
-      // 3. Vignette: smooth radial fall-off, deepened by vig parameter.
+      // 3. Radial focus: during Loop (loopG > 0), everything except a circle
+      //    around the bell darkens and desaturates. The bell trail stays
+      //    incandescent; the surrounding scene fades/softens. At g=0 the
+      //    focusRadius is wide (everything sharp); at g=1 it's tight.
+      if (loopG > 0.0) {
+        float rfDist = length(vUv - bellScreen);
+        float focusRadius = mix(0.8, 0.15, loopG);
+        float focus = 1.0 - smoothstep(focusRadius, focusRadius + 0.3, rfDist);
+        // Dim the unfocused area (multiplicative darken)
+        c.rgb *= mix(1.0, focus, loopG * 0.7);
+        // Desaturate the unfocused area
+        float focusLuma = dot(c.rgb, vec3(0.2126, 0.7152, 0.0722));
+        float focusDesat = (1.0 - focus) * loopG * 0.5;
+        c.rgb = mix(c.rgb, vec3(focusLuma), focusDesat);
+      }
+
+      // 4. Vignette: smooth radial fall-off, deepened by vig parameter.
       //    At vig=0 it's off; at vig=1 it turns the corners nearly black.
       vec2 uv2 = vUv - 0.5;
       float r2 = dot(uv2, uv2) * 4.0; // 0 centre → ~1 corners
@@ -67,6 +143,16 @@ const FinishShader = {
       float baseVig = 0.10;
       float loopVig = vig * 0.72; // extra darkness during loop moment
       c.rgb *= mix(1.0, shadow, baseVig + loopVig);
+
+      // ── Scanlines (texture of the medium) ──────────────────────────────
+      // Faint horizontal lines drifting slowly upward — the CRT of an audio
+      // feed reconstructed into image. Barely perceptible: felt, not seen.
+      float scanSpeed = 0.5; // px/sec drift upward
+      float pixelY = vUv.y * resolution.y + time * scanSpeed;
+      float scanline = sin(pixelY * 3.14159265) * 0.5 + 0.5; // ~2px period
+      // Base opacity: 0.03 when signal is clean, rises to 0.07 when degraded
+      float scanOpacity = mix(0.03, 0.07, 1.0 - signalQuality);
+      c.rgb *= 1.0 - scanline * scanOpacity;
 
       gl_FragColor = c;
     }
@@ -123,17 +209,23 @@ export class PostFX {
       w / BLOOM_RESOLUTION_DIVISOR,
       h / BLOOM_RESOLUTION_DIVISOR,
     );
+    // Keep resolution uniform in sync for scanline density calculation
+    const u = this.finishPass.uniforms as {
+      resolution: { value: THREE.Vector2 };
+    };
+    u.resolution.value.set(w, h);
   }
 
   // loopGlow ∈ [0,1]:
   //   0 = normal play (good bloom, tasteful vignette, full colour)
-  //   1 = loop is airborne (bloom roars, colour drains, vignette deepens,
+  //   1 = loop is airborne (bloom roars, radial focus tightens on the bell,
   //       the glowing orbit is the only bright thing — the visual held breath)
   setLoopGlow(g: number): void {
     const u = this.finishPass.uniforms as {
       dim:   { value: number };
       desat: { value: number };
       vig:   { value: number };
+      loopG: { value: number };
     };
 
     // Bloom: interpolate from base to loop peak
@@ -144,13 +236,39 @@ export class PostFX {
     this.bloom.radius    = this.BASE_RADIUS    + (this.LOOP_RADIUS    - this.BASE_RADIUS)    * ge;
     this.bloom.threshold = this.BASE_THRESHOLD + (this.LOOP_THRESHOLD - this.BASE_THRESHOLD) * ge;
 
-    // The Loop "stadium goes silent" dim/desat/vignette was built for the
-    // deleted cinematic loop-cam. With a plain follow camera it just made
-    // the game go near-black every few seconds ("weirdly dark"). Disabled —
-    // a whisper of vignette only; the room never darkens during play.
+    // Radial focus: the raw g drives the shader's radial dim/desat centred
+    // on the bell's screen position. At g=0 it's invisible; at g=1 the
+    // focus is tight and dramatic — but never black, the bell trail punches
+    // through because it's the brightest thing in the scene.
+    u.loopG.value = ge;
+
+    // Legacy dim/desat stay zeroed — the radial focus replaces the old
+    // global darken. A whisper of vignette still deepens the edges.
     u.dim.value   = 0.0;
     u.desat.value = 0.0;
     u.vig.value   = ge * 0.12;
+  }
+
+  // Set the bell's normalised screen-space position (0-1, 0-1) for the
+  // radial focus effect. Called each frame from the render loop after
+  // projecting bellMesh.position through the camera.
+  setBellScreen(x: number, y: number): void {
+    const u = this.finishPass.uniforms as {
+      bellScreen: { value: THREE.Vector2 };
+    };
+    u.bellScreen.value.set(x, y);
+  }
+
+  // ── Broadcast uniforms: fed each frame from the render loop ────────────────
+  // time:          seconds (monotonic clock)
+  // signalQuality: 0..1 mapped from bell chime (1 = clean, 0 = degraded)
+  setBroadcast(time: number, signalQuality: number): void {
+    const u = this.finishPass.uniforms as {
+      time:          { value: number };
+      signalQuality: { value: number };
+    };
+    u.time.value = time;
+    u.signalQuality.value = signalQuality;
   }
 
   render(): void {
