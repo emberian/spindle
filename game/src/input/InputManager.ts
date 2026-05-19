@@ -286,6 +286,7 @@ export class InputManager {
       throwReleased,
       throwSpin,
       thrumbler,
+      catchIntent: false, // human catch is reflex-only (no commit key bound)
     };
   }
 

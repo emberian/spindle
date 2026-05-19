@@ -482,7 +482,7 @@ fn emit_input_frame(frame: &InputFrame) -> String {
         .iter()
         .map(|p| {
             format!(
-                "{{\"id\":{},\"aim\":{},\"fireLineAt\":{},\"reel\":{},\"release\":{},\"pushoff\":{},\"throwCharge\":{},\"throwReleased\":{},\"throwSpin\":{},\"thrumbler\":{}}}",
+                "{{\"id\":{},\"aim\":{},\"fireLineAt\":{},\"reel\":{},\"release\":{},\"pushoff\":{},\"throwCharge\":{},\"throwReleased\":{},\"throwSpin\":{},\"thrumbler\":{},\"catchIntent\":{}}}",
                 json_str(&p.id),
                 json_vec3(&p.aim),
                 json_opt_vec3(&p.fire_line_at),
@@ -493,6 +493,7 @@ fn emit_input_frame(frame: &InputFrame) -> String {
                 if p.throw_released { "true" } else { "false" },
                 json_num(p.throw_spin),
                 json_vec3(&p.thrumbler),
+                if p.catch_intent { "true" } else { "false" },
             )
         })
         .collect();

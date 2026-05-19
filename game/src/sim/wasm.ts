@@ -116,6 +116,7 @@ export class WasmSim {
         throwReleased: pl.throwReleased,
         throwSpin: pl.throwSpin,
         thrumbler: [pl.thrumbler.x, pl.thrumbler.y, pl.thrumbler.z],
+        catchIntent: pl.catchIntent ?? false,
       })),
     });
     return JSON.parse(this.sim.step_json(json)) as SimEvent[];

@@ -23,6 +23,7 @@ function frame(tick: number): InputFrame {
     throwReleased: tick === 5,
     throwSpin: 0.2,
     thrumbler: { ...ZERO },
+    catchIntent: false,
   };
   return { tick, players: [{ id: 'P1', ...base }, { id: 'A1', ...base, throwReleased: false }] };
 }

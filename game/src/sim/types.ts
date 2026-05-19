@@ -97,6 +97,7 @@ export interface PlayerInput {
   throwReleased: boolean; // fire this tick (when holding the bell)
   throwSpin: number; // [-1,1] spin imparted (the curve weapon)
   thrumbler: Vec3; // small delta-v request (capped by budget in sim)
+  catchIntent: boolean; // committed two-hand snare (widens catch envelope)
 }
 
 export interface InputFrame {

@@ -127,7 +127,7 @@ export class ReplayRecorder {
 
 // ── Frame (de)serialisation helpers ────────────────────────────────────────
 
-const FLOATS_PER_PLAYER = 16;
+const FLOATS_PER_PLAYER = 17;
 
 function cloneVec(v: { x: number; y: number; z: number }): { x: number; y: number; z: number } {
   return { x: v.x, y: v.y, z: v.z };
@@ -145,6 +145,7 @@ function clonePlayerInput(p: PlayerInput): PlayerInput {
     throwReleased: p.throwReleased,
     throwSpin: p.throwSpin,
     thrumbler: cloneVec(p.thrumbler),
+    catchIntent: p.catchIntent,
   };
 }
 
@@ -202,6 +203,7 @@ function encodeFrames(frames: InputFrame[], playerCount: number): string {
       buf[o++] = p.thrumbler.x;
       buf[o++] = p.thrumbler.y;
       buf[o++] = p.thrumbler.z;
+      buf[o++] = p.catchIntent ? 1 : 0;
     }
   }
   return bytesToBase64(new Uint8Array(buf.buffer, 0, buf.byteLength));
@@ -236,6 +238,7 @@ function decodeFrames(
       const throwReleased = buf[o++] !== 0;
       const throwSpin = buf[o++];
       const thrumbler = { x: buf[o++], y: buf[o++], z: buf[o++] };
+      const catchIntent = buf[o++] !== 0;
       players.push({
         id: roster[pi].id,
         aim,
@@ -247,6 +250,7 @@ function decodeFrames(
         throwReleased,
         throwSpin,
         thrumbler,
+        catchIntent,
       });
     }
     frames.push({ tick, players });
@@ -300,7 +304,7 @@ export function decodeReplay(s: string): ReplayData {
 
 // ── Storage (localStorage, mirroring Persistence.ts conventions) ───────────
 
-const STORAGE_KEY = 'rig_recalls_v3';
+const STORAGE_KEY = 'rig_recalls_v4';
 /** Keep only the newest N re-calls (frames are bulky — evict oldest). */
 const MAX_RECALLS = 12;
 
