@@ -119,6 +119,11 @@ pub struct RigPolicy {
     /// The baseline AI fills every rigger NOT driven by the policy
     /// (its `controlled` skip-set is reset to the policy ids each tick).
     ai: AiSystem,
+    /// RENDER-ONLY legibility records for the POLICY-driven riggers from
+    /// the last `tick` (the baseline half's records live on `ai`). Merged
+    /// with the baseline half by `ai_debug_json`. NEVER a sim/determinism
+    /// surface — the spectate overlay channel only.
+    rl_debug: Vec<crate::ai::decision_types::AiDebugRec>,
 }
 
 impl RigPolicy {
@@ -136,6 +141,7 @@ impl RigPolicy {
         Ok(RigPolicy {
             policy: RlPolicy::from_weights(w),
             ai: AiSystem::new(),
+            rl_debug: Vec::new(),
         })
     }
 }
@@ -179,9 +185,40 @@ impl RigPolicy {
         // already no-ops an unknown id, but we also drop it so the frame
         // never carries a phantom rigger).
         let mut players: Vec<PlayerInput> = Vec::with_capacity(sim.players.len());
+        self.rl_debug.clear();
         for id in &controlled {
-            if sim.players.iter().any(|p| &p.id == id) {
-                players.push(self.policy.act(&obs, id));
+            if let Some(sp) = sim.players.iter().find(|p| &p.id == id) {
+                let act = self.policy.act(&obs, id);
+                // RENDER-ONLY legibility for a learned rigger. The policy
+                // is a single shared MLP — it has NO Director Job — so the
+                // honest, watchable label is its ROLE + that it is
+                // RL-controlled + the point it is acting on this tick (its
+                // committed grapple target, or the bell when it signals a
+                // catch). Pure read of the just-decoded action; no rng;
+                // never a sim/determinism surface.
+                let intent_target = if let Some(f) = act.fire_line_at {
+                    Some(f)
+                } else if act.catch_intent {
+                    Some(sim.bell.p)
+                } else {
+                    None
+                };
+                self.rl_debug.push(crate::ai::decision_types::AiDebugRec {
+                    id: id.clone(),
+                    role: crate::ai::rigger_ai::role_str(sp.role).to_string(),
+                    // The learned policy has no explicit Job; "learned" is
+                    // the honest verb for the overlay (distinct from every
+                    // baseline Job string).
+                    job: "learned".to_string(),
+                    intent_target,
+                    is_diver: false,
+                    is_contester: false,
+                    is_primary: false,
+                    is_shadow: false,
+                    is_outlet: false,
+                    controlled_by: "rl",
+                });
+                players.push(act);
             }
         }
 
@@ -217,10 +254,23 @@ impl RigPolicy {
         })
     }
 
+    /// RENDER-ONLY legibility seam (mirrors `RigAi::ai_debug_json`).
+    /// Returns the merged per-rigger records IN THE SAME ORDER the last
+    /// `tick` emitted players: the POLICY-driven riggers first
+    /// (`controlledBy:"rl"`), then the baseline half (`"baseline"`). A
+    /// separate method, a pure deterministic read, NEVER a sim or
+    /// `hash_snapshot` surface — the spectate-overlay channel only.
+    pub fn ai_debug_json(&self) -> String {
+        let mut merged = self.rl_debug.clone();
+        merged.extend_from_slice(self.ai.last_debug());
+        crate::ai::system::ai_debug_to_json(&merged)
+    }
+
     /// Reset the baseline AI's director/commitment caches (new inning).
     /// The policy itself is stateless (a pure forward) — nothing to clear.
     pub fn reset(&mut self) {
         self.ai.reset();
+        self.rl_debug.clear();
     }
 }
 

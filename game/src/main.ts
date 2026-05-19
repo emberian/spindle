@@ -14,6 +14,7 @@ import { GameCamera } from './render/Camera';
 import { initDebugViz, debugViz } from './render/DebugViz';
 import { Riggers } from './render/Rigger';
 import { RigLines } from './render/RigLine';
+import { LegibilityOverlay } from './render/LegibilityOverlay';
 import { AudioEngine } from './audio/AudioEngine';
 import { HUD } from './ui/HUD';
 import { Onboarding } from './ui/Onboarding';
@@ -71,6 +72,35 @@ const trail = new BellTrail(scene, camera);
 const gcam = new GameCamera(camera);
 const riggers = new Riggers(scene);
 const riglines = new RigLines(scene);
+// The legibility overlay — the watchable payoff. ON by default in
+// watch/spectate (the whole point); a single key cycles full → labels →
+// off for clean capture. Render-only; reads the deterministic render-only
+// AI-debug seam, never feeds sim.step. Idle (hidden) outside spectate.
+const legib = new LegibilityOverlay(scene, app);
+let legibActive = false; // true only while a watch/spectate match runs
+const legibToast = document.createElement('div');
+legibToast.style.cssText =
+  'position:absolute;left:50%;bottom:118px;transform:translateX(-50%);' +
+  'font-family:ui-monospace,"Space Mono",monospace;font-size:11px;' +
+  'letter-spacing:.16em;color:#f4f1ea;text-shadow:0 0 8px #11131a;' +
+  'pointer-events:none;z-index:41;display:none;text-transform:uppercase;';
+app.appendChild(legibToast);
+let legibToastUntil = 0;
+// 'L' cycles the overlay detail (full → labels → off). Only meaningful in
+// watch/spectate; ignored when typing in a field. Render-only, no sim.
+addEventListener('keydown', (e: KeyboardEvent) => {
+  if (e.code !== 'KeyL' && e.key !== 'l' && e.key !== 'L') return;
+  const t = e.target as HTMLElement | null;
+  if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable)) return;
+  if (!legibActive) return;
+  e.preventDefault();
+  const lvl = legib.cycle();
+  legibToast.textContent =
+    lvl === 'full' ? 'OVERLAY · FULL'
+      : lvl === 'labels' ? 'OVERLAY · LABELS ONLY' : 'OVERLAY · OFF';
+  legibToast.style.display = 'block';
+  legibToastUntil = performance.now() + 1500;
+});
 const audio = new AudioEngine();
 const hud = new HUD(app);
 const onboarding = new Onboarding(app);
@@ -559,6 +589,14 @@ async function runWatch(
   pol?.reset();
   let ended = false;
   let prevLoop = false;
+  // RENDER-ONLY legibility records from the last AI tick (baseline or RL),
+  // parallel-by-id to the players. A pure deterministic read of the
+  // committed AI state via its OWN wasm method — never the InputFrame,
+  // never sim.step, excluded from the determinism hash. Read by the
+  // render block to drive the overlay; replay-safe.
+  let legibRecs: import('./sim/wasm').AiDebugRec[] = [];
+  legib.reset(); // each watch session starts ON (full) by default
+  legibActive = true;
   // AI diagnostics: last sim snapshot + last AI input frame (for __rigai).
   let dbgSnap: ReturnType<typeof sim.snapshot> | null = null;
   let dbgAi: { players: import('./sim/types').PlayerInput[] } | null = null;
@@ -613,6 +651,11 @@ async function runWatch(
             ),
           ) as InputFrame)
         : ai.tick(snap, match.state as never, cfgs, gameSeed);
+    // RENDER-ONLY: pull the legibility records the tick just produced.
+    // The wasm seam already tags each rigger per-rigger ('rl' for the
+    // policy-driven ones, 'baseline' for the AiSystem-filled ones), which
+    // is the per-rigger truth — no team→source remapping needed here.
+    legibRecs = pol !== null ? pol.debug() : ai.debug();
     // Rich AI telemetry bookkeeping — pure debug, feeds only window.__rigai.
     // Gated behind the single debugViz flag so it is genuinely zero-cost
     // (no snapshot capture, no per-player scans) in normal spectate play.
@@ -707,6 +750,27 @@ async function runWatch(
       gcam.setControl(input.cameraState);
       gcam.cinematic(s.bell.p, cinePlayers, atkX, lg, REG.R, Math.min(dt, 1 / 30));
       hud.render(s as never, match.state as never, input.view);
+      // ── Legibility overlay (the watchable payoff) ───────────────────────
+      // ON by default in watch/spectate. Render-only: it reads `legibRecs`
+      // (the deterministic render-only AI-debug seam captured in the sim
+      // tick) + the interpolated render players + the live camera. Never
+      // feeds sim.step. Pass-chain depth is the live possession chain.
+      legib.render(
+        s.players as never,
+        legibRecs,
+        camera,
+        {
+          possession: match.state.possession,
+          passDepth: Math.max(0, (s.bell.passChain?.length ?? 1) - 1),
+          homeSrc: sources.home === 'rl' ? 'rl' : 'baseline',
+          awaySrc: sources.away === 'rl' ? 'rl' : 'baseline',
+        },
+        performance.now(),
+      );
+      if (legibToastUntil && performance.now() > legibToastUntil) {
+        legibToast.style.display = 'none';
+        legibToastUntil = 0;
+      }
       // Diagnostic hook (cheap; lets a harness observe real AI progression).
       (window as unknown as { __rig?: unknown }).__rig = {
         tick: s.tick, bx: s.bell.p.x,
@@ -758,6 +822,8 @@ async function runWatch(
       if (!ended && match.state.winner !== null) {
         ended = true;
         watching = false;
+        legibActive = false;
+        legib.hide();
         runtime?.stop();
         try {
           ReplayStore.save(
@@ -786,6 +852,9 @@ function openSpectate(): void {
 
 function exitWatch(): void {
   watching = false;
+  legibActive = false;
+  legib.hide();
+  legibToast.style.display = 'none';
   runtime?.stop();
   spectateControls.hide();
   openSpectate();

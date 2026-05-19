@@ -203,6 +203,44 @@ pub struct PlayerCommitCache {
     pub decided_tick: f64,
 }
 
+/// RENDER-ONLY legibility record — one per AI-controlled rigger, produced
+/// as a side channel of `AiSystem::tick` and serialized over a SEPARATE
+/// wasm method (`RigAi::ai_debug_json` / `RigPolicy::ai_debug_json`),
+/// PARALLEL to `snapshot_meta.playerIds`. It is the human-watchable
+/// "what is this agent doing and why" surface for the spectate overlay.
+///
+/// It is NOT part of `Snapshot`, NEVER enters `sim_world::hash_snapshot`
+/// or `sim.step`, and is a pure deterministic function of (state, match,
+/// director, commit) — exactly like the existing `lineAnchors` render
+/// channel, only it lives in the AI layer instead of the sim layer (so it
+/// is structurally impossible for it to perturb determinism). No rng.
+#[derive(Clone, Debug)]
+pub struct AiDebugRec {
+    pub id: String,
+    /// The rigger's structural role ("anchor"/"spinner"/…).
+    pub role: String,
+    /// The Director's committed Job verb ("carry"/"recover"/…), or the
+    /// fallback "support" when the rigger has no explicit assignment.
+    pub job: String,
+    /// The committed world-space point the rigger is acting on this
+    /// window: its nav target, lead-intercept when catching, the loose
+    /// bell when diving, or the contest interception point. `None` only
+    /// when no meaningful target exists (e.g. holding & throwing in place).
+    pub intent_target: Option<Vec3>,
+    /// The SINGLE committed loose-bell diver (Director recover lead).
+    pub is_diver: bool,
+    /// The SINGLE committed active-defense contester.
+    pub is_contester: bool,
+    /// Director-named loose-bell PRIMARY (`recover_id`).
+    pub is_primary: bool,
+    /// The flagged loose-bell SHADOW (rebound safety, never co-dives).
+    pub is_shadow: bool,
+    /// A staged down-field outlet (`Job::Receive`) — the pass target.
+    pub is_outlet: bool,
+    /// Which swarm drives this rigger: "baseline" | "rl" | "human".
+    pub controlled_by: &'static str,
+}
+
 /// src/ai/index.ts TeamConfig.
 #[derive(Clone, Debug)]
 pub struct TeamConfig {

@@ -11,7 +11,9 @@
 
 import type { SimState, MatchState, InputFrame } from '../sim/types';
 import type { TeamProfile } from '../league/teams';
-import { aiTick, aiReset } from '../sim/wasm';
+import { aiTick, aiReset, aiDebug, type AiDebugRec } from '../sim/wasm';
+
+export type { AiDebugRec } from '../sim/wasm';
 
 export type Difficulty = 'rookie' | 'pro' | 'legend';
 
@@ -40,6 +42,13 @@ export class AiSystem {
       seed,
     );
     return JSON.parse(out) as InputFrame;
+  }
+
+  /** RENDER-ONLY: the legibility records from the last `tick`, parallel
+   *  to its emitted players. Spectate-overlay channel only — a pure
+   *  deterministic read, never fed back into the sim or replay. */
+  debug(): AiDebugRec[] {
+    return aiDebug();
   }
 
   /** Reset director + commitment caches (e.g., on a new inning). */

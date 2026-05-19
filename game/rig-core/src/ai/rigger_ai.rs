@@ -120,7 +120,11 @@ fn axis_radius(p: Vec3) -> f64 {
 /// the directed recover/receiver outlet OR the bell is genuinely closing
 /// on them (a defender stepping into a pass = a played pick). Deterministic
 /// (pure geometry off the committed assignment + bell kinematics).
-fn wants_catch(player: &PlayerSim, state: &SimState, assignment: &PlayerAssignment) -> bool {
+// Render-only legibility (the overlay seam) re-invokes this committer
+// predicate from `system.rs` to label each rigger's intent. It is a pure
+// deterministic read (no rng, no cache mutation) so re-evaluating it never
+// perturbs the emitted InputFrame or the determinism hash.
+pub(crate) fn wants_catch(player: &PlayerSim, state: &SimState, assignment: &PlayerAssignment) -> bool {
     if state.bell.held_by.is_some() {
         return false;
     }
@@ -149,7 +153,7 @@ fn wants_catch(player: &PlayerSim, state: &SimState, assignment: &PlayerAssignme
 /// catcher actually navigates onto the ball instead of a static slot.
 /// RK4 + skin-bounce predictor (same model the recover branch uses),
 /// horizon scaled by gap so it stays stable. No rng.
-fn bell_intercept(player: &PlayerSim, state: &SimState) -> Vec3 {
+pub(crate) fn bell_intercept(player: &PlayerSim, state: &SimState) -> Vec3 {
     let b = &state.bell;
     let gap = vlen(vsub(b.p, player.p));
     let close_v = 22.0;
@@ -207,7 +211,7 @@ fn dive_intercept_gap(from: Vec3, from_v: Vec3, state: &SimState) -> f64 {
 /// deterministic best-predicted-intercept compare (id tie-break). The
 /// fallback keeps the team from freezing if the Director's pick is stale;
 /// it still yields exactly one diver. Deterministic, no rng.
-fn is_dive_committer(
+pub(crate) fn is_dive_committer(
     player: &PlayerSim,
     state: &SimState,
     director: &DirectorState,
@@ -296,7 +300,7 @@ fn is_dive_committer(
 /// tie-break). Returns `false` when the bell is OURS (the dive path owns
 /// that) so the two single-committer disciplines never overlap.
 /// Deterministic — pure geometry + canon predictor, no rng.
-fn is_contest_committer(
+pub(crate) fn is_contest_committer(
     player: &PlayerSim,
     state: &SimState,
     m: &MatchState,
@@ -1092,7 +1096,7 @@ pub fn compute_player_input(
 }
 
 // ── role/job name snapshots (TS uses the string-union values) ─────────────────
-fn role_str(r: RiggerRole) -> &'static str {
+pub(crate) fn role_str(r: RiggerRole) -> &'static str {
     match r {
         RiggerRole::Anchor => "anchor",
         RiggerRole::Spinner => "spinner",
@@ -1101,7 +1105,7 @@ fn role_str(r: RiggerRole) -> &'static str {
         RiggerRole::Reach => "reach",
     }
 }
-fn job_str(j: Job) -> &'static str {
+pub(crate) fn job_str(j: Job) -> &'static str {
     match j {
         Job::Carry => "carry",
         Job::Recover => "recover",
