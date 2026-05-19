@@ -34,6 +34,24 @@ use crate::tuning;
 // native-only `gym` module; `gym.rs` `pub use`s them so its public API
 // and every existing call site are byte-unchanged.
 
+/// The Director's committed assignment for one rigger, reduced to the
+/// wasm-safe codes the policy needs. This is a DERIVED READ (computed by
+/// running the pure `ai::director::run_director` over the same public
+/// state at the gym/wasm seam) — it is NOT sim physics state and never
+/// enters `hash_snapshot`. Both the native gym and the browser
+/// `policy_wasm` build it identically (same fixed baseline profile + the
+/// same seeded `AiRng`), so the policy sees the SAME assignment-conditioned
+/// features in training and inference.
+#[derive(Clone, Debug)]
+pub struct ObsAssignment {
+    /// `Job` discriminant 0..=5: Carry / Recover / Receive / Mark /
+    /// Support / Zone (the `ai::decision_types::Job` order).
+    pub job: u8,
+    /// The rigger this assignment marks/targets (a mark to cover, or the
+    /// receiver/outlet to feed), if any.
+    pub mark_id: Option<String>,
+}
+
 /// One controlled-or-not rigger's observable state (ordered like the
 /// underlying `Snapshot::players`).
 #[derive(Clone, Debug)]
@@ -49,6 +67,10 @@ pub struct ObsPlayer {
     /// `None` (so a policy can see tether state).
     pub line_anchor: Option<Vec3>,
     pub line_rest_len: Option<f64>,
+    /// The Director's committed assignment for this rigger (derived read;
+    /// `None` if the seam did not resolve one — featurize then zeroes the
+    /// assignment block, never panics).
+    pub assignment: Option<ObsAssignment>,
 }
 
 /// The documented observation. A flat, derived view of the SimWorld
@@ -75,6 +97,17 @@ pub struct Observation {
     /// The ids the external agent drives, in action order (echoed from
     /// the scenario so a stateless policy can map actions positionally).
     pub controlled_ids: Vec<String>,
+    /// DERIVED gate-geometry of the controlled side (the team whose reward
+    /// is scored — `controlled_ids`' team, defaulting Home). Real world
+    /// coordinates, not a gate index:
+    ///   `attack_sign` ∈ {+1,-1}: the controlled side's downrange dir,
+    ///   `gate_plane_x`: signed world-x of the CURRENT cast gate plane the
+    ///                   controlled side must drive a completed pass past.
+    /// Both are pure functions of (team, match gate) via
+    /// `ai::orientation` — a derived read, never sim state. Default
+    /// (`attack_sign=1, gate_plane_x=0`) if the seam left it unset.
+    pub attack_sign: f64,
+    pub gate_plane_x: f64,
 }
 
 // ── Canon normalization scales (from tuning.rs) ─────────────────────────────
@@ -92,6 +125,12 @@ pub const K: usize = 3;
 /// Per-other-rigger feature block: rel p (3) + rel v (3).
 const OTHER_W: usize = 6;
 
+/// Number of `Job` discriminants (Carry/Recover/Receive/Mark/Support/Zone).
+const JOB_W: usize = 6;
+/// Number of `RiggerRole` discriminants (Anchor/Spinner/Faithwing/
+/// Freewing/Reach).
+const ROLE_W: usize = 5;
+
 /// Fixed, documented feature width. Layout (all egocentric, normalized):
 ///   [0..3)   self p / POS_SCALE
 ///   [3..6)   self v / VEL_SCALE
@@ -107,21 +146,57 @@ const OTHER_W: usize = 6;
 ///   [32..50) K=3 nearest TEAMMATES, each rel p (3) + rel v (3),
 ///            sorted by (distance, id)
 ///   [50..68) K=3 nearest OPPONENTS, same block + sort key
-///   [68]     constant bias 1.0
-pub const FEAT_W: usize = 32 + 2 * K * OTHER_W + 1; // = 69
+///   ── richer (assignment / role / gate-geometry / context) block ──
+///   [68..74) Director Job one-hot (JOB_W=6) of self's assignment
+///            (all-zero if no assignment resolved)
+///   [74..77) assignment mark/target rel p / POS_SCALE (the marked /
+///            fed rigger's position relative to self; 0 if no mark)
+///   [77..82) self RiggerRole one-hot (ROLE_W=5)
+///   [82]     attack-gate plane offset: (gate_plane_x − self.x) ·
+///            attack_sign / POS_SCALE — signed *downrange* distance to
+///            the cast-gate plane the controlled side must clear (real
+///            geometry, NOT a gate index)
+///   [83]     controlled-side attack_sign ∈ {+1,−1}
+///   [84]     self forward progress: self.x · attack_sign / POS_SCALE
+///   [85]     nearest-opponent closing speed onto the bell: that
+///            opponent's velocity component toward the bell / VEL_SCALE
+///            (0 if no opponent)
+///   [86]     score margin from the controlled side:
+///            (score_ctrl − score_opp) / SCORE_SCALE, clamped
+///   [87]     clock context: tick / CLOCK_SCALE, clamped to [0,1]
+///   [88]     constant bias 1.0
+pub const FEAT_W: usize =
+    32 + 2 * K * OTHER_W + JOB_W + 3 + ROLE_W + 4 + 2 + 1; // = 89
+
+/// Score normalization (a few points decides a match — keep O(1)).
+const SCORE_SCALE: f64 = 8.0;
+/// Clock normalization (a real episode budget is thousands of ticks; the
+/// learner only needs an O(1) "how late" signal, saturated past the cap).
+const CLOCK_SCALE: f64 = 8000.0;
+/// Index where the richer block begins (right after the K-other blocks).
+const RICH_BASE: usize = 32 + 2 * K * OTHER_W; // = 68
 
 /// Raw network outputs before decode.
-///   [0..3)  aim head (normalized to a unit-ish 3-vec)
-///   [3..6)  reel logits (argmax → -1 / 0 / +1)
-///   [6]     fire gate logit (>0 ⇒ fire this tick)
-///   [7..10) fire direction head (normalized; target = self.p + dir*range)
-///   [10]    release logit (tanh>0)
-///   [11]    pushoff logit (tanh>0)
-///   [12]    catch_intent logit (tanh>0)
-///   [13]    throw_charge head (squashed to [0,1])
-///   [14]    throw_spin head (tanh → [-1,1])
+///   [0..3)   aim head (normalized to a unit-ish 3-vec)
+///   [3..6)   reel logits (argmax → -1 / 0 / +1)
+///   [6]      fire gate logit (>0 ⇒ fire this tick)
+///   [7..10)  fire direction head (normalized; target = self.p + dir*range)
+///   [10]     release logit (tanh>0)
+///   [11]     pushoff logit (tanh>0)
+///   [12]     catch_intent logit (tanh>0)
+///   [13]     throw_charge head (squashed to [0,1])
+///   [14]     throw_spin head (tanh → [-1,1])
 ///   [15..18) thrumbler head (tanh per-axis → [-1,1]^3)
-pub const OUT_W: usize = 18;
+///   ── RELATIONAL PASS head (K=3) ──
+///   [18]     pass gate logit (>0 ⇒ this tick is a teammate-targeted
+///            pass: it OVERRIDES the raw downrange fire point with a
+///            Coriolis lead-solved aim at teammate-k's predicted
+///            catch point — a relational, coordination-capable action)
+///   [19..22) pass-target logits over the K=3 deterministically-sorted
+///            teammate slots (argmax → which teammate to feed); if that
+///            slot is empty the pass gate is ignored (graceful: falls
+///            back to the continuous fire head, every field stays valid)
+pub const OUT_W: usize = 18 + 1 + K; // = 22
 
 /// Hidden layer width (two hidden layers).
 pub const HID: usize = 64;
@@ -152,6 +227,43 @@ fn norm3(v: Vec3) -> Vec3 {
     } else {
         Vec3::new(0.0, 0.0, 0.0)
     }
+}
+
+/// Deterministically sort the OTHER riggers into (teammates, opponents)
+/// relative to `me`, each ordered by the total key `(distance_bits, id)`
+/// — built from the ORDERED `obs.players`, never hash order. Returned by
+/// VALUE-INDEX so both `featurize` (feature block) and `decode` (the
+/// relational pass head's teammate-k pick) consume the EXACT same slot
+/// ordering ⇒ "pass to teammate-k" addresses the same feature the policy
+/// saw. Pure: no rng, no clock.
+fn sorted_others<'a>(
+    obs: &'a Observation,
+    me: &ObsPlayer,
+    self_id: &str,
+) -> (Vec<&'a ObsPlayer>, Vec<&'a ObsPlayer>) {
+    let sp = me.p;
+    let mut mates: Vec<(u64, &str, &ObsPlayer)> = Vec::new();
+    let mut opps: Vec<(u64, &str, &ObsPlayer)> = Vec::new();
+    for p in obs.players.iter() {
+        if p.id == self_id {
+            continue;
+        }
+        let key = d2(p.p, sp).to_bits();
+        if p.team == me.team {
+            mates.push((key, p.id.as_str(), p));
+        } else {
+            opps.push((key, p.id.as_str(), p));
+        }
+    }
+    let sort_key = |a: &(u64, &str, &ObsPlayer), b: &(u64, &str, &ObsPlayer)| {
+        a.0.cmp(&b.0).then(a.1.cmp(b.1))
+    };
+    mates.sort_by(sort_key);
+    opps.sort_by(sort_key);
+    (
+        mates.into_iter().map(|(_, _, p)| p).collect(),
+        opps.into_iter().map(|(_, _, p)| p).collect(),
+    )
 }
 
 /// Build the egocentric, normalized, deterministic feature vector for the
@@ -223,33 +335,14 @@ pub fn featurize(obs: &Observation, self_id: &str) -> [f64; FEAT_W] {
         f[31] = 1.0;
     }
 
-    // K nearest teammates / opponents — built from the ORDERED players
-    // vec, sorted by an explicit total key (distance bits, then id).
-    let mut mates: Vec<(u64, &str, &ObsPlayer)> = Vec::new();
-    let mut opps: Vec<(u64, &str, &ObsPlayer)> = Vec::new();
-    for p in obs.players.iter() {
-        if p.id == self_id {
-            continue;
-        }
-        let key = d2(p.p, sp).to_bits();
-        if p.team == me.team {
-            mates.push((key, p.id.as_str(), p));
-        } else {
-            opps.push((key, p.id.as_str(), p));
-        }
-    }
-    let sort_key =
-        |a: &(u64, &str, &ObsPlayer),
-         b: &(u64, &str, &ObsPlayer)| {
-            a.0.cmp(&b.0).then(a.1.cmp(b.1))
-        };
-    mates.sort_by(sort_key);
-    opps.sort_by(sort_key);
+    // K nearest teammates / opponents — the SHARED deterministic sort
+    // (also consumed by `decode`'s relational pass head).
+    let (mates, opps) = sorted_others(obs, me, self_id);
 
-    let mut put = |base: usize, list: &[(u64, &str, &ObsPlayer)]| {
+    let mut put = |base: usize, list: &[&ObsPlayer]| {
         for k in 0..K {
             let o = base + k * OTHER_W;
-            if let Some((_, _, p)) = list.get(k) {
+            if let Some(p) = list.get(k) {
                 f[o] = (p.p.x - sp.x) / POS_SCALE;
                 f[o + 1] = (p.p.y - sp.y) / POS_SCALE;
                 f[o + 2] = (p.p.z - sp.z) / POS_SCALE;
@@ -262,7 +355,73 @@ pub fn featurize(obs: &Observation, self_id: &str) -> [f64; FEAT_W] {
     put(32, &mates);
     put(32 + K * OTHER_W, &opps);
 
-    // constant bias feature
+    // ── richer block (RICH_BASE = 68) ─────────────────────────────────
+    let mut o = RICH_BASE;
+
+    // [68..74) Director Job one-hot of self's assignment.
+    if let Some(asg) = &me.assignment {
+        let j = (asg.job as usize).min(JOB_W - 1);
+        f[o + j] = 1.0;
+        // [74..77) mark/target rel p (the marked / fed rigger).
+        if let Some(mid) = &asg.mark_id {
+            if let Some(mp) = obs.players.iter().find(|p| &p.id == mid) {
+                f[o + JOB_W] = (mp.p.x - sp.x) / POS_SCALE;
+                f[o + JOB_W + 1] = (mp.p.y - sp.y) / POS_SCALE;
+                f[o + JOB_W + 2] = (mp.p.z - sp.z) / POS_SCALE;
+            }
+        }
+    }
+    o += JOB_W + 3; // → 77
+
+    // [77..82) self RiggerRole one-hot.
+    let r = (me.role as usize).min(ROLE_W - 1);
+    f[o + r] = 1.0;
+    o += ROLE_W; // → 82
+
+    // [82] signed downrange distance to the cast-gate plane the
+    // controlled side must clear (real geometry, not a gate index).
+    f[o] = ((obs.gate_plane_x - sp.x) * obs.attack_sign) / POS_SCALE;
+    // [83] controlled-side attack sign.
+    f[o + 1] = obs.attack_sign;
+    // [84] self forward progress along the attack axis.
+    f[o + 2] = (sp.x * obs.attack_sign) / POS_SCALE;
+    // [85] nearest-opponent closing speed onto the bell (its velocity
+    // component along the unit vector from that opponent toward the bell).
+    if let Some(op) = opps.first() {
+        let to_bell = Vec3::new(
+            obs.bell_p.x - op.p.x,
+            obs.bell_p.y - op.p.y,
+            obs.bell_p.z - op.p.z,
+        );
+        let n = norm3(to_bell);
+        f[o + 3] =
+            (op.v.x * n.x + op.v.y * n.y + op.v.z * n.z) / VEL_SCALE;
+    }
+    o += 4; // → 86
+
+    // [86] score margin from the controlled side. The controlled side is
+    // the controlled_ids' team (Home unless every controlled id is Away);
+    // default Home if none. Clamped to keep O(1).
+    let ctrl_is_away = !obs.controlled_ids.is_empty()
+        && obs.controlled_ids.iter().all(|id| {
+            obs.players
+                .iter()
+                .find(|p| &p.id == id)
+                .map(|p| p.team == 1)
+                .unwrap_or(false)
+        });
+    let margin = if ctrl_is_away {
+        (obs.score_away - obs.score_home) as f64
+    } else {
+        (obs.score_home - obs.score_away) as f64
+    };
+    f[o] = (margin / SCORE_SCALE).clamp(-1.0, 1.0);
+    // [87] clock context.
+    f[o + 1] = ((obs.tick as f64) / CLOCK_SCALE).clamp(0.0, 1.0);
+    o += 2; // → 88
+
+    // [88] constant bias feature.
+    debug_assert_eq!(o, FEAT_W - 1);
     f[FEAT_W - 1] = 1.0;
     f
 }
@@ -345,12 +504,35 @@ impl RlPolicy {
         out
     }
 
+    /// A representative throw/grapple speed for the relational lead-solve
+    /// (the canon reel/cruise scale — the same O(1) speed `VEL_SCALE`
+    /// uses; deterministic, no profile dependence so train==inference).
+    const PASS_SPEED: f64 = VEL_SCALE; // 26 m/s
+
     /// Decode raw outputs into the EXACT `ai::PlayerInput` contract for
     /// `self_id`. Every field is always valid: aim/fire-dir normalized,
     /// reel ∈ {-1,0,1} (argmax of 3 logits), bools thresholded,
     /// throw_charge ∈ [0,1], throw_spin ∈ [-1,1], thrumbler ∈ [-1,1]^3.
-    pub fn decode(&self, out: &[f64; OUT_W], self_id: &str, self_p: Vec3) -> ai::PlayerInput {
+    ///
+    /// RELATIONAL PASS: when the pass-gate logit `out[18] > 0` AND the
+    /// argmax pass-target slot `out[19..22]` indexes an EXISTING teammate
+    /// (over the SAME deterministic `sorted_others` mate ordering
+    /// `featurize` used), the raw downrange fire point is OVERRIDDEN with
+    /// a Coriolis lead-solved aim at that teammate's predicted catch
+    /// point (`lead_predict::solve_lead_velocity`, reusing the SACRED
+    /// canon integrator — not reinvented), the throw is charged+released
+    /// and the aim points at the lead intercept. If the slot is empty or
+    /// the solve fails, it gracefully falls back to the continuous fire
+    /// head — every `ai::PlayerInput` field stays valid every tick.
+    pub fn decode(
+        &self,
+        out: &[f64; OUT_W],
+        obs: &Observation,
+        self_id: &str,
+    ) -> ai::PlayerInput {
         let mut a = ai::PlayerInput::idle(self_id);
+        let me = obs.players.iter().find(|p| p.id == self_id);
+        let self_p = me.map(|p| p.p).unwrap_or(Vec3::new(0.0, 0.0, 0.0));
 
         // aim: normalized 3-vec head.
         a.aim = norm3(Vec3::new(out[0], out[1], out[2]));
@@ -386,20 +568,50 @@ impl RlPolicy {
         a.throw_spin = out[14].tanh(); // [-1,1]
         a.thrumbler = Vec3::new(out[15].tanh(), out[16].tanh(), out[17].tanh());
 
+        // ── relational pass head ──────────────────────────────────────
+        if out[18] > 0.0 {
+            if let Some(me) = me {
+                let (mates, _) = sorted_others(obs, me, self_id);
+                // argmax over the K pass-target logits → teammate slot.
+                let mut sk = 0usize;
+                for k in 1..K {
+                    if out[19 + k] > out[19 + sk] {
+                        sk = k;
+                    }
+                }
+                if let Some(tm) = mates.get(sk) {
+                    if let Some(lr) = crate::ai::lead_predict::solve_lead_velocity(
+                        self_p,
+                        Self::PASS_SPEED,
+                        tm.p,
+                        tm.v,
+                        crate::tuning::OMEGA,
+                    ) {
+                        // Aim AND fire-target the lead intercept; charge
+                        // and release a thrown pass; the teammate is the
+                        // committed catcher (widen its catch envelope).
+                        a.aim = norm3(Vec3::new(
+                            lr.intercept.x - self_p.x,
+                            lr.intercept.y - self_p.y,
+                            lr.intercept.z - self_p.z,
+                        ));
+                        a.fire_line_at = Some(lr.intercept);
+                        a.throw_charge = a.throw_charge.max(0.8);
+                        a.throw_released = true;
+                        a.catch_intent = true;
+                    }
+                }
+            }
+        }
+
         a
     }
 
     /// Convenience: featurize + forward + decode for one rigger.
     pub fn act(&self, obs: &Observation, self_id: &str) -> ai::PlayerInput {
-        let self_p = obs
-            .players
-            .iter()
-            .find(|p| p.id == self_id)
-            .map(|p| p.p)
-            .unwrap_or(Vec3::new(0.0, 0.0, 0.0));
         let feat = featurize(obs, self_id);
         let out = self.forward(&feat);
-        self.decode(&out, self_id, self_p)
+        self.decode(&out, obs, self_id)
     }
 }
 

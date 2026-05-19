@@ -109,10 +109,20 @@ const H: f64 = 1.0 / 240.0;
 /// A spread of matchups so fitness is the mean intrinsic outcome over
 /// several styles — a one-matchup overfit cannot win (the generalization
 /// pressure, complementary to the w-maxing tie-break).
-const MATCHUPS: [(&str, &str, &str, &str); 3] = [
+// BROADENED (the audit: 3 narrow rows let an overfit win). A wider
+// style/cylinder spread of opponents — including same-style, power,
+// chaos, tempo and grind matchups across both cylinder classes — so the
+// MEAN intrinsic outcome is the generalization pressure: a genome that
+// only beats one archetype scores poorly here. Fixed order (the parallel
+// mean folds in matchup-index order — determinism contract).
+const MATCHUPS: [(&str, &str, &str, &str); 7] = [
     ("fall-dynasty", "big-slow", "fall-dynasty", "big-slow"),
     ("fall-grind", "big-slow", "rise-power", "small-fast"),
     ("fall-tempo", "big-slow", "rise-chaos", "small-fast"),
+    ("fall-dynasty", "small-fast", "rise-power", "big-slow"),
+    ("fall-tempo", "small-fast", "fall-dynasty", "small-fast"),
+    ("fall-grind", "big-slow", "rise-chaos", "big-slow"),
+    ("fall-dynasty", "big-slow", "rise-power", "small-fast"),
 ];
 
 // ── Seam adapters ───────────────────────────────────────────────────────────
@@ -414,6 +424,14 @@ pub struct GenReport {
 pub struct Learned {
     pub params: EfeParams,
     pub fitness: f64,
+    /// The verbatim `EfeParams::default()` controller's fitness on the
+    /// SAME matchup spread/seed — the honest baseline, NOT seeded into
+    /// the population (de-rigged).
+    pub baseline_fitness: f64,
+    /// `fitness − baseline_fitness`. A null/negative learning result is
+    /// now VISIBLE here (it is no longer masked by an elitist verbatim-
+    /// default seed). Callers/tests assert/report this explicitly.
+    pub delta_vs_default: f64,
     pub history: Vec<GenReport>,
 }
 
@@ -428,21 +446,27 @@ impl CoordLearner {
         CoordLearner { cfg, rng }
     }
 
-    /// Deterministic initial population: index 0 = the verbatim
-    /// behavior-preserving default (so elitism guarantees the learner can
-    /// never do worse than the baseline controller); the next ~third are
-    /// Gaussian-jittered defaults; the rest uniform-random within bounds.
-    /// Every draw is threaded through `self.rng` in fixed per-individual,
-    /// per-gene order.
+    /// Deterministic initial population. DE-RIGGED (the audit: seeding
+    /// `pop[0]` with the verbatim default + elitism made a null/negative
+    /// result invisible — it could never report worse than baseline even
+    /// if it learned nothing). NO individual is the verbatim default now:
+    /// ~half are Gaussian-jittered around the default (a sane search
+    /// neighbourhood, but DISPLACED — not the exact baseline), the rest
+    /// uniform-random within bounds. So the elitist best is a genuinely
+    /// EVOLVED genome; if it fails to beat the default the reported
+    /// best-vs-default DELTA is honestly ≤ 0 (visible, not masked). Every
+    /// draw is threaded through `self.rng` in fixed per-individual,
+    /// per-gene order (determinism unchanged).
     fn init_pop(&mut self) -> Vec<Genome> {
         let n = self.cfg.pop_size.max(1);
         let base = EfeParams::default();
         let bounds = EfeParams::bounds();
         let mut pop = Vec::with_capacity(n);
-        pop.push(Genome::from_params(&base));
-        let jittered_until = (n / 3).max(1);
-        let jitter = Normal::new(0.0, 0.20).expect("valid normal");
-        for i in 1..n {
+        let jittered_until = (n / 2).max(1);
+        // A DISPLACING jitter (mean-0 but wide) so even index 0 is a
+        // perturbed genome, never the verbatim default.
+        let jitter = Normal::new(0.0, 0.25).expect("valid normal");
+        for i in 0..n {
             let mut g = Genome::from_params(&base);
             if i < jittered_until {
                 for (gi, gene) in g.genes.iter_mut().enumerate() {
@@ -605,9 +629,20 @@ impl CoordLearner {
             pop = next;
         }
 
+        // De-rigged honesty: the verbatim default's fitness on the SAME
+        // spread/seed is computed SEPARATELY (never seeded into the pop)
+        // so the reported delta is a true learned-vs-baseline figure.
+        let (baseline_fitness, _) = evaluate_params(
+            &EfeParams::default(),
+            self.cfg.eval_seed,
+            self.cfg.eval_max_ticks,
+        );
+
         Learned {
             params: best.params(),
             fitness: best_fit,
+            baseline_fitness,
+            delta_vs_default: best_fit - baseline_fitness,
             history,
         }
     }
@@ -663,7 +698,12 @@ mod tests {
         }
     }
 
-    /// Elitist best-fitness is monotone non-decreasing across generations.
+    /// Elitist best-fitness is monotone non-decreasing across generations
+    /// (elitism over the EVOLVED population is intact) — but the learner
+    /// is now DE-RIGGED: it does NOT seed the verbatim default, so it is
+    /// NOT guaranteed ≥ baseline. The honest best-vs-default delta is
+    /// REPORTED (finite, consistent with the recomputed baseline) and may
+    /// be ≤ 0 — that visibility is the point of the de-rigging.
     #[test]
     fn learner_elitism_monotone() {
         let l = learn_coordination(tiny(7));
@@ -676,15 +716,14 @@ mod tests {
                 w[1].best_fitness
             );
         }
-        // index-0 is the verbatim default ⇒ the learner's best is ≥ the
-        // baseline controller's own intrinsic outcome.
-        let (base_fit, _) =
-            evaluate_params(&EfeParams::default(), 1234, 250);
+        // The reported delta is honest: it equals best − baseline, the
+        // baseline is the verbatim default on the SAME spread/seed, and
+        // it is NOT forced ≥ 0 (a null/negative is now visible).
+        assert!(l.baseline_fitness.is_finite());
         assert!(
-            l.fitness >= base_fit - 1e-9,
-            "elitism guarantees ≥ baseline ({} vs {})",
-            l.fitness,
-            base_fit
+            (l.delta_vs_default - (l.fitness - l.baseline_fitness)).abs()
+                < 1e-9,
+            "delta must equal best − baseline (honest, unmasked)"
         );
     }
 
@@ -735,12 +774,21 @@ mod tests {
             );
         }
         println!(
-            "LEARNED: fitness={:.3} (baseline {:.3}, delta {:+.3})",
-            learned.fitness,
-            base_fit,
-            learned.fitness - base_fit
+            "LEARNED: fitness={:.3} baseline(default)={:.3} \
+             delta_vs_default={:+.3} (DE-RIGGED: default NOT seeded; a \
+             negative delta is a real null result, not masked)",
+            learned.fitness, learned.baseline_fitness, learned.delta_vs_default
         );
         println!("LEARNED PARAMS: {:?}", learned.params.to_genes());
-        assert!(learned.fitness >= base_fit - 1e-9, "elitism guarantees ≥ baseline");
+        // Honest reporting only — NO ≥-baseline guarantee anymore. We
+        // only assert internal consistency + the external recompute
+        // agrees with the carried baseline.
+        assert!((learned.baseline_fitness - base_fit).abs() < 1e-9);
+        assert!(
+            (learned.delta_vs_default
+                - (learned.fitness - learned.baseline_fitness))
+                .abs()
+                < 1e-9
+        );
     }
 }

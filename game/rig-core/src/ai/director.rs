@@ -764,6 +764,77 @@ pub fn run_director(
     }
 }
 
+// ── RL-observation Director hints (a DERIVED READ for the policy obs) ───────
+//
+// The shared-parameter RL policy needs to SEE its Director assignment +
+// the real gate-plane geometry of the controlled side (the audit found
+// the obs had none, so coordination could not be learned). This helper
+// runs the SAME pure `run_director` over the public state with a FIXED
+// baseline profile + a FIXED seeded `AiRng` (so it is identical in the
+// native gym AND the browser `policy_wasm` — train==inference) and
+// projects out exactly the wasm-safe codes the policy obs carries. It is
+// a DERIVED READ: it never mutates sim state, never enters
+// `hash_snapshot`, and does not drive any rigger (the policy replaces the
+// controlled riggers' inputs entirely — this is only a feature hint).
+// Determinism: pure fn of (state, match, side); the `AiRng` seed is the
+// constant 0 with the current tick, exactly the deterministic idiom
+// `AiSystem` uses, no wall-clock.
+pub struct ObsDirectorHints {
+    /// Per-rigger-id: (Job discriminant 0..=5, mark/target id).
+    pub assignments: Vec<(String, u8, Option<String>)>,
+    /// Controlled side's downrange sign (+1 Home / −1 Away).
+    pub attack_sign: f64,
+    /// Signed world-x of the CURRENT cast-gate plane for the side.
+    pub gate_plane_x: f64,
+}
+
+fn job_code(j: Job) -> u8 {
+    match j {
+        Job::Carry => 0,
+        Job::Recover => 1,
+        Job::Receive => 2,
+        Job::Mark => 3,
+        Job::Support => 4,
+        Job::Zone => 5,
+    }
+}
+
+/// Compute the policy-observation Director hints for `side`. Pure +
+/// wasm-safe (no rng beyond a fixed-seed `AiRng`, no clock, no HashMap
+/// fold leaking iteration order — the assignment list is emitted in the
+/// ORDERED `state.players` order, then by id, a total deterministic key).
+pub fn obs_director_hints(
+    state: &SimState,
+    m: &MatchState,
+    side: TeamSide,
+) -> ObsDirectorHints {
+    let profile = TeamProfile::baseline();
+    let tick_u = state.tick as u32;
+    let mut rng = AiRng::make(0, tick_u, 0);
+    let ds = run_director(state, m, &profile, side, &mut rng);
+
+    // Emit per-rigger assignments in the ORDERED player vector order,
+    // restricted to `side` (no HashMap iteration fold).
+    let mut assignments: Vec<(String, u8, Option<String>)> = Vec::new();
+    for p in state.players.iter() {
+        if p.team != side {
+            continue;
+        }
+        if let Some(asg) = ds.assignments.get(&p.id) {
+            assignments.push((
+                p.id.clone(),
+                job_code(asg.job),
+                asg.mark_id.clone(),
+            ));
+        }
+    }
+    ObsDirectorHints {
+        assignments,
+        attack_sign: attack_sign(side),
+        gate_plane_x: gate_world_x(side, m.cast.gate),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
