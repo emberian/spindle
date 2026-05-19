@@ -310,7 +310,7 @@ export class RiggerFigure {
       depthWrite: false,
       depthTest: false,
     }));
-    this.aura.scale.set(5.0, 5.0, 1);
+    this.aura.scale.set(7.5, 7.5, 1);
     this.aura.position.y = HIP_Y + TORSO_LEN * 0.55;
     this.aura.renderOrder = 9990; // above scene, below the P1 halo/beacon
     this.root.add(this.aura);
@@ -561,10 +561,11 @@ export class RiggerFigure {
     // so a small figure is always a clear coloured presence.
     const auraMat = this.aura.material as THREE.SpriteMaterial;
     if (emissiveHex === 0) {
-      auraMat.opacity = 0;
+      auraMat.opacity = 0.15;
+      auraMat.color.setHex(bodyHex);
     } else {
       auraMat.color.setHex(emissiveHex);
-      auraMat.opacity = Math.max(0.55, Math.min(0.8, emissiveInt * 0.65));
+      auraMat.opacity = Math.max(0.7, Math.min(1.0, emissiveInt * 0.8));
     }
   }
 

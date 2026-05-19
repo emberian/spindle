@@ -311,7 +311,7 @@ class RiggerInstance {
     const bodyCol = bodyColor(ps.team, ps.grounded);
     const accent = isP1 ? PAL.paper : (ROLE_TINT[ps.role] ?? lerpHex(base, PAL.paper, 0.4));
     const emissiveHex = isP1 ? base : (ps.grounded ? 0x000000 : base);
-    const emissiveInt = isP1 ? (ps.grounded ? 0.6 : 1.4) : (ps.grounded ? 0.0 : 1.0);
+    const emissiveInt = isP1 ? (ps.grounded ? 0.8 : 1.8) : (ps.grounded ? 0.0 : 1.4);
     this.figure.setColors(bodyCol, accent, emissiveHex, emissiveInt);
 
     // ── Drive the pose ──────────────────────────────────────────────────────

@@ -43,9 +43,9 @@ const SAG_SEGMENTS = 24;
 // World-space line radii (m). Thick enough to read at play distance in a 45m
 // tube — grapple is THE core mechanic and must be visible, but still shaped
 // so 8 simultaneous hauls stay separable (no halo/double-tube).
-const TAUT_RADIUS = 0.16;   // hauling: clearly visible energised cable
-const SLACK_RADIUS = 0.06;  // slack/inactive: faint but not invisible
-const P1_RADIUS_BOOST = 0.05;
+const TAUT_RADIUS = 0.28;   // hauling: bold energised cable
+const SLACK_RADIUS = 0.12;  // slack/inactive: still readable
+const P1_RADIUS_BOOST = 0.06;
 
 // Chord length (m) over which a tether fades — gentler than before so long
 // grapples stay readable (the mechanic IS the long haul).
@@ -53,22 +53,22 @@ const LEN_FADE_NEAR = 60;   // ≤ this: full strength
 const LEN_FADE_FAR  = 300;  // ≥ this: faded to the long-haul floor
 
 // Typed anchor sizes (m) — visible endpoint markers.
-const ANCHOR_SIZE = 0.35;
-const HAND_SIZE = 0.2;
+const ANCHOR_SIZE = 0.55;
+const HAND_SIZE = 0.3;
 
 // GRAPPLE LATENCY: the in-flight claw should be clearly visible — it's the
 // "action moment" of the throw. Render-only progress (CLAW_SPEED · elapsed).
-const CLAW_HEAD_SIZE = 0.32; // m — the flying bite: crisp and readable
-const FLIGHT_RADIUS = 0.09;  // m — pay-out thread: visible trailing line
+const CLAW_HEAD_SIZE = 0.45; // m — the flying bite: crisp and readable
+const FLIGHT_RADIUS = 0.16;  // m — pay-out thread: visible trailing line
 
 // Glow tube: additive halo around the rope that feeds into UnrealBloomPass.
-const GLOW_RADIUS_MULT = 2.2;   // width relative to the solid rope
-const GLOW_OPACITY_TAUT = 0.28;
-const GLOW_OPACITY_FLIGHT = 0.35;
-const GLOW_OPACITY_SLACK = 0.08;
+const GLOW_RADIUS_MULT = 2.8;   // width relative to the solid rope
+const GLOW_OPACITY_TAUT = 0.55;
+const GLOW_OPACITY_FLIGHT = 0.50;
+const GLOW_OPACITY_SLACK = 0.18;
 
 // Claw point-light sprite (bloom-friendly bright dot on the flying hook).
-const CLAW_SPRITE_SIZE = 1.4;   // world units
+const CLAW_SPRITE_SIZE = 2.0;   // world units
 
 // Fallback hand offset (figure-local) if Rigger hasn't published a hand yet.
 const HAND_FALLBACK_LOCAL = new THREE.Vector3(0.42, 1.55, 0.55);
@@ -407,8 +407,8 @@ class LineInstance {
       (chord - LEN_FADE_NEAR) / (LEN_FADE_FAR - LEN_FADE_NEAR), 0, 1,
     );
     const lenFade = 1 - lenT * 0.45;            // long haul → 55% strength
-    const tautBase  = isPlayerAnchor ? 0.72 : 0.65;
-    const slackBase = 0.20;
+    const tautBase  = isPlayerAnchor ? 0.92 : 0.85;
+    const slackBase = 0.40;
     const reelBoost = reelingIn ? 0.15 : 0;
     rm.opacity = (taut ? tautBase + reelBoost : slackBase) * lenFade;
 
