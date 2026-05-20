@@ -2263,7 +2263,18 @@ fn catch_brake_thrumbler(player: &PlayerSim, state: &SimState) -> Vec3 {
     let rel = vsub(player.v, bell_v); // player's excess velocity over the ball
     let rel_speed = vlen(rel);
 
-    if gap > 30.0 || gap < 1e-6 {
+    // When the ball is far (>30m), counteract drift (centrifugal/Coriolis)
+    // by braking our own velocity. This keeps us stationary at the catch
+    // point while waiting for the ball to arrive.
+    if gap > 30.0 {
+        let speed = vlen(player.v);
+        if speed > 1.0 {
+            let brake_mag = MICRO_DV_MAX.min(speed);
+            return vscale(player.v, -brake_mag / speed);
+        }
+        return v3z();
+    }
+    if gap < 1e-6 {
         return v3z();
     }
 
