@@ -262,7 +262,7 @@ fn rrt_replan_ticks() -> i64 {
 
 // ── Simulation helpers (TS GrapplePlanner.ts:152-165) ────────────────────────
 const PLAN_H: f64 = 1.0 / 15.0;
-const PLAN_STEPS: u32 = 45;
+const PLAN_STEPS: u32 = 75; // 5s horizon (was 3s) — long enough to see far-anchor payoff
 const SKIN_BUFFER: f64 = 4.0;
 const ANCHOR_SWITCH_MARGIN: f64 = 6.0;
 const DIRECT_REACH: f64 = 12.0;
@@ -2327,7 +2327,34 @@ pub fn plan_grapple(
         candidates.push((*spar, 0, pd_s, true, c_s - 4.0 - swing_bonus));
     }
 
-    // Candidate 2: skin anchor (TS GP.ts:766-782). Predicate + point are
+    // Candidate 2a: DOWNRANGE ANCHOR — fire past the target so the winch
+    // pulls through it at speed. This produces the athletic "fly-through"
+    // movement that looks intentional. The anchor is placed 30m beyond
+    // the target along the approach direction, clamped inside the cylinder.
+    {
+        let to_tgt = target.sub(pos);
+        let td = to_tgt.len();
+        if td > 10.0 {
+            let dir = to_tgt.scale(1.0 / td);
+            let beyond = 30.0_f64.min(td * 0.5);
+            let mut dr_anchor = target.add(dir.scale(beyond));
+            // Clamp inside cylinder skin
+            let dr_rho = dr_anchor.y.hypot(dr_anchor.z);
+            let max_r = crate::tuning::R - 2.0;
+            if dr_rho > max_r && dr_rho > 1e-6 {
+                let s = max_r / dr_rho;
+                dr_anchor.y *= s;
+                dr_anchor.z *= s;
+            }
+            let dr_dist = pos.sub(dr_anchor).len();
+            if dr_dist > 5.0 && dr_dist < 80.0 {
+                let (pd, c) = score_plan(dr_anchor, -1);
+                candidates.push((dr_anchor, -1, pd, false, c));
+            }
+        }
+    }
+
+    // Candidate 2b: skin anchor (TS GP.ts:766-782). Predicate + point are
     // factored into `skin_anchor` so the BLOCKER-2 contract is testable
     // without depending on the cost sort (spars are usually cheaper).
     let skin_candidate = skin_anchor(pos, target);
