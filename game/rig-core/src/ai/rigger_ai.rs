@@ -1104,7 +1104,7 @@ pub fn compute_player_input(
                 let to_anchor_len = vlen(to_anchor);
                 if to_anchor_len > 1e-6 && bell_dist > 1e-6 {
                     let cos_angle = vdot(to_anchor, to_bell) / (to_anchor_len * bell_dist);
-                    cos_angle < -0.2 // >100° means line is actively pulling AWAY from ball
+                    cos_angle < 0.2 // >78° means line is no longer helping close on ball
                 } else {
                     false
                 }
@@ -1312,7 +1312,7 @@ pub fn compute_player_input(
                 let to_anchor = vsub(line.anchor_pos, player.p);
                 let to_anchor_len = vlen(to_anchor);
                 if to_anchor_len > 1e-6 && bell_dist > 1e-6 {
-                    vdot(to_anchor, to_bell) / (to_anchor_len * bell_dist) < -0.2
+                    vdot(to_anchor, to_bell) / (to_anchor_len * bell_dist) < 0.2
                 } else { false }
             } else { false };
 
@@ -2315,6 +2315,44 @@ fn role_target(
                 }
             }
         }
+        // COMEBACK CUT: if a defender is in the passing lane between carrier
+        // and our center, add candidate positions closer to the carrier.
+        let center = Vec3::new(center_x, center_y, center_z);
+        let lane_to_center = vsub(center, carrier_p);
+        let lane_dist = vlen(lane_to_center);
+        if lane_dist > 20.0 {
+            let lane_dir = vscale(lane_to_center, 1.0 / lane_dist);
+            let lane_denied = defender_positions.iter().any(|&op| {
+                let to_opp = vsub(op, carrier_p);
+                let proj = vdot(to_opp, lane_dir);
+                if proj < 5.0 || proj > lane_dist - 5.0 {
+                    return false;
+                }
+                let perp_dist = vlen(vsub(to_opp, vscale(lane_dir, proj)));
+                perp_dist < 12.0
+            });
+            if lane_denied {
+                let comeback_dist = 25.0_f64.min(lane_dist * 0.4);
+                let comeback = vsub(center, vscale(lane_dir, comeback_dist));
+
+                let perp = Vec3::new(0.0, -lane_dir.z, lane_dir.y);
+                let perp_cut = vadd(
+                    vsub(center, vscale(lane_dir, comeback_dist * 0.6)),
+                    vscale(perp, 15.0),
+                );
+
+                for cand in [comeback, perp_cut] {
+                    let rq = efe::reception_quality(
+                        carrier_p, cand, player.v, &defender_positions, state.omega, skin_r,
+                    );
+                    if rq > best_rq {
+                        best_rq = rq;
+                        best_pos = cand;
+                    }
+                }
+            }
+        }
+
         base = best_pos;
     }
     base
@@ -2695,7 +2733,11 @@ fn decide_throw(
     // If we just caught a pass that has already been relayed (multiple
     // throwers in the chain), we're deep in a chain and can throw sooner.
     let continuing_chain = state.bell.pass_chain.len() >= 2;
-    let min_hold = if nearest_opp < 12.0 {
+    let fresh_possession = state.bell.pass_chain.is_empty()
+        && (state.tick - state.bell.release_tick) < 60.0;
+    let min_hold = if fresh_possession && nearest_opp > 12.0 {
+        18.0 // fast break: quick outlet before defense sets
+    } else if nearest_opp < 12.0 {
         12.0 // urgent — dump in ~0.05s
     } else if nearest_opp < 18.0 || continuing_chain {
         30.0 // moderate pressure or relay — throw in ~0.125s
@@ -2893,6 +2935,15 @@ fn decide_throw(
                     bias += 0.10;
                 } else if gain < -20.0 {
                     bias -= 0.15;
+                }
+            }
+            if fresh_possession {
+                let tm_fp = forward_progress(team, tm.p.x);
+                let gain = tm_fp - my_fp;
+                if gain > 30.0 {
+                    bias += 0.30;
+                } else if gain > 15.0 {
+                    bias += 0.15;
                 }
             }
             candidates.push(ThrowCandidate {
