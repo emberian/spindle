@@ -28,6 +28,10 @@ use std::collections::{HashMap, HashSet};
 struct DirectorCache {
     state: DirectorState,
     last_updated_tick: f64,
+    /// Tracks the ball holder at the last Director evaluation so we can
+    /// detect possession changes and force an immediate re-run (no 0.5s
+    /// stale window after catches/throws/turnovers).
+    prev_bell_held_by: Option<String>,
 }
 
 /// Side discriminant used as part of cache keys. Mirrors the two
@@ -139,9 +143,17 @@ impl AiSystem {
                 self.active_pass_targets.remove(&dir_key);
             }
             let active_pass_target = self.active_pass_targets.get(&dir_key).cloned();
+            let possession_changed = self
+                .director_caches
+                .get(&dir_key)
+                .map(|dc| dc.prev_bell_held_by.as_deref() != sim_state.bell.held_by.as_deref())
+                .unwrap_or(false);
             let needs_director_update = match self.director_caches.get(&dir_key) {
                 None => true,
-                Some(dc) => tick - dc.last_updated_tick >= DIRECTOR_TICK_INTERVAL,
+                Some(dc) => {
+                    possession_changed
+                        || tick - dc.last_updated_tick >= DIRECTOR_TICK_INTERVAL
+                }
             };
             if needs_director_update {
                 let mut dir_rng = AiRng::make(seed, tick_u, (ci as u32) * 1000);
@@ -157,6 +169,7 @@ impl AiSystem {
                     DirectorCache {
                         state: new_state,
                         last_updated_tick: tick,
+                        prev_bell_held_by: sim_state.bell.held_by.clone(),
                     },
                 );
             }

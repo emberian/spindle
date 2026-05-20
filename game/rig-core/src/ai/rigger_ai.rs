@@ -1007,14 +1007,34 @@ pub fn compute_player_input(
             // commit-once latch (no per-tick fireLineAt re-issue), kept
             // deterministic (snapshot-driven, no rng, no wall clock).
             let has_line = player.line.is_some();
-            // Release if the ball is clearly not catchable: either far away (>25m)
+            // Release if the ball is clearly not catchable: either far away (>20m)
             // OR we've reached/passed the predicted catch point but the ball isn't
-            // here (missed the rendezvous).
+            // here (missed the rendezvous), OR the current winch direction is no
+            // longer helping us close on the ball (tracking dive correction).
             let to_catch = vlen(vsub(catch_pt, player.p));
-            let bell_far = vlen(to_bell) > 25.0;
+            let bell_dist = vlen(to_bell);
+            let bell_far = bell_dist > 30.0;
             let past_catch_point =
-                to_catch < crate::tuning::DIVE_TERMINAL_RADIUS && vlen(to_bell) > 12.0;
-            let should_release = bell_far || past_catch_point;
+                to_catch < crate::tuning::DIVE_TERMINAL_RADIUS && bell_dist > 12.0;
+
+            // Tracking dive: check if our current winch direction is still
+            // productive (closing on the ball). If the line pulls us >60° away
+            // from the ball direction, release so we can re-acquire on a
+            // better vector. Pure geometry, deterministic.
+            let winch_stale = if let Some(line) = &player.line {
+                let to_anchor = vsub(line.anchor_pos, player.p);
+                let to_anchor_len = vlen(to_anchor);
+                if to_anchor_len > 1e-6 && bell_dist > 1e-6 {
+                    let cos_angle = vdot(to_anchor, to_bell) / (to_anchor_len * bell_dist);
+                    cos_angle < -0.2 // >100° means line is actively pulling AWAY from ball
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+
+            let should_release = bell_far || past_catch_point || winch_stale;
             let (fire, do_release) = if !has_line {
                 (partial.fire_line_at.unwrap_or(None), false)
             } else if should_release {
@@ -1140,7 +1160,31 @@ pub fn compute_player_input(
     let (target, aim_dither) = {
         let commit = cache.value.as_ref().unwrap();
         let target = if catch_intent {
-            bell_intercept(player, state)
+            // If we're the intended receiver of a friendly pass and the ball is
+            // still far away, maintain our pre-throw trajectory — the throw was
+            // aimed at where we were GOING, not where the ball currently is.
+            // Only switch to active bell_intercept once the ball is close enough
+            // that tracking helps more than trajectory stability.
+            let ball_dist = vlen(vsub(state.bell.p, player.p));
+            let is_intended_receiver =
+                active_pass_target == Some(player.id.as_str());
+            let friendly_ball = state
+                .bell
+                .thrown_by
+                .as_deref()
+                .and_then(|tid| state.players.iter().find(|p| p.id == tid))
+                .map(|p| p.team == player.team)
+                .unwrap_or(false);
+
+            if is_intended_receiver && friendly_ball && ball_dist > 30.0 {
+                // Maintain pre-throw trajectory for throw accuracy
+                match commit.nav_target {
+                    Some(nt) => vadd(nt, commit.catch_offset),
+                    None => player.p,
+                }
+            } else {
+                bell_intercept(player, state)
+            }
         } else {
             match commit.nav_target {
                 Some(nt) => vadd(nt, commit.catch_offset),
@@ -2029,22 +2073,49 @@ fn settle_thrumbler(player: &PlayerSim, target: Vec3) -> Vec3 {
 }
 
 /// Catch-intent velocity matching thrumbler. When approaching the ball to
-/// catch it, brake relative velocity to stay within the absorb window.
+/// catch it, brake relative velocity AND nudge toward the ball to close
+/// the last few meters (the dead zone between max-reel and arm's-reach).
 /// Pure geometry, deterministic, no rng.
 fn catch_brake_thrumbler(player: &PlayerSim, state: &SimState) -> Vec3 {
     let bell_v = state.bell.v;
-    let rel = vsub(player.v, bell_v); // player's excess velocity over the ball
-    let rel_speed = vlen(rel);
-    if rel_speed < 2.0 {
-        return v3z(); // already well-matched
-    }
-    // Brake: oppose the relative velocity (try to match ball speed)
-    // Stronger as we get closer to the ball
     let to_bell = vsub(state.bell.p, player.p);
     let gap = vlen(to_bell);
+    let rel = vsub(player.v, bell_v); // player's excess velocity over the ball
+    let rel_speed = vlen(rel);
+
+    if gap > 30.0 || gap < 1e-6 {
+        return v3z();
+    }
+
+    // Two components: brake relative velocity + nudge toward ball
     let urgency = (1.0 - gap / 30.0).clamp(0.1, 1.0);
-    let brake_mag = (MICRO_DV_MAX * urgency).min(rel_speed);
-    vscale(rel, -brake_mag / rel_speed)
+
+    // Brake component: oppose relative velocity (try to match ball speed)
+    let brake = if rel_speed > 2.0 {
+        let brake_mag = (MICRO_DV_MAX * 0.6 * urgency).min(rel_speed);
+        vscale(rel, -brake_mag / rel_speed)
+    } else {
+        v3z()
+    };
+
+    // Approach nudge: gently push toward the ball when close and relative
+    // speed is manageable. This closes the dead zone between grapple reach
+    // and the catch envelope.
+    let approach = if gap < 18.0 && rel_speed < 20.0 {
+        let dir = vscale(to_bell, 1.0 / gap);
+        let approach_strength = MICRO_DV_MAX * 0.4 * urgency;
+        vscale(dir, approach_strength)
+    } else {
+        v3z()
+    };
+
+    let combined = vadd(brake, approach);
+    let mag = vlen(combined);
+    if mag > MICRO_DV_MAX {
+        vscale(combined, MICRO_DV_MAX / mag)
+    } else {
+        combined
+    }
 }
 
 /// Repel a nav target away from nearby teammate positions to prevent

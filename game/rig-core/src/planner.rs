@@ -301,6 +301,20 @@ impl HashRng {
     }
 }
 
+// ── Swing probability — speed-adaptive reel selection ────────────────────────
+// When the player is already fast (>15 m/s), prefer reel=0 (swing) over
+// reel=-1 (winch) in the stochastic planners. A swing preserves angular
+// momentum and enables slingshot release, whereas a winch accelerates but
+// kills tangential speed. At 15 m/s the probability is 50/50; by 25 m/s it
+// reaches 75% swing preference.
+fn swing_prob(speed: f64) -> f64 {
+    if speed <= 15.0 {
+        0.5
+    } else {
+        (0.5 + 0.025 * (speed - 15.0)).min(0.75)
+    }
+}
+
 // ── Anchor candidates shared by RRT & CEM (TS GP.ts:458-473 / 582-597) ───────
 #[derive(Clone, Copy)]
 struct Anchor {
@@ -478,7 +492,8 @@ fn plan_rrt(
         let ai = (((u * u * anchors.len() as f64) as i64 as i32) as usize)
             .min(anchors.len() - 1);
         let a = anchors[ai];
-        let reel: i32 = if rng.next() < 0.5 { -1 } else { 0 };
+        let sp = swing_prob(fv.len());
+        let reel: i32 = if rng.next() < (1.0 - sp) { -1 } else { 0 };
         let r = rollout_primitive(fp, fv, a.pos, omega, reel, target, RRT_PRIM_STEPS, PLAN_H);
         let branch_best = fbest.min(r.min_dist);
         nodes.push(RrtNode {
@@ -597,7 +612,8 @@ fn plan_cem(
                 }
                 ai += 1;
             }
-            let reel: i32 = if rng.next() < 0.5 { -1 } else { 0 };
+            let sp = swing_prob(vel.len());
+            let reel: i32 = if rng.next() < (1.0 - sp) { -1 } else { 0 };
             let r = rollout_primitive(
                 pos, vel, anchors[ai].pos, omega, reel, target, RRT_PRIM_STEPS, PLAN_H,
             );
@@ -702,6 +718,7 @@ fn plan_mppi(
     let mut samples: Vec<(usize, i32, f64)> = Vec::with_capacity(MPPI_POP as usize);
     let mut best_c = f64::INFINITY;
     let mut min_c = f64::INFINITY;
+    let sp_mppi = swing_prob(vel.len());
     for _ in 0..MPPI_POP {
         let mut u = rng.next() * wsum;
         let mut ai: usize = 0;
@@ -712,7 +729,7 @@ fn plan_mppi(
             }
             ai += 1;
         }
-        let reel: i32 = if rng.next() < 0.5 { -1 } else { 0 };
+        let reel: i32 = if rng.next() < (1.0 - sp_mppi) { -1 } else { 0 };
         let r = rollout_primitive(
             pos, vel, anchors[ai].pos, omega, reel, target, RRT_PRIM_STEPS, PLAN_H,
         );
@@ -850,7 +867,8 @@ fn plan_simanneal(
             nai = a_n as i64 - 1;
         }
         let nai = nai as usize;
-        let nreel: i32 = if rng.next() < 0.5 { -1 } else { 0 };
+        let sp_sa = swing_prob(vel.len());
+        let nreel: i32 = if rng.next() < (1.0 - sp_sa) { -1 } else { 0 };
         let (nc, npd) = cost_of(nai, nreel);
         let d = nc - cur_c;
         let accept = if d < 0.0 {
@@ -1237,9 +1255,11 @@ fn plan_mcts(
         };
         let mut d = nodes[leaf].depth;
         while d < MCTS_DEPTH {
-            // Uniform random action over the discrete action set.
+            // Uniform random action over the discrete action set; bias toward
+            // swing when the simulated state is already fast.
             let ai = ((rng.next() * a_n as f64) as i64 as usize).min(a_n - 1);
-            let reel: i32 = if rng.next() < 0.5 { -1 } else { 0 };
+            let sp_mcts = swing_prob(sv.len());
+            let reel: i32 = if rng.next() < (1.0 - sp_mcts) { -1 } else { 0 };
             let r = rollout_primitive(
                 sp, sv, anchors[ai].pos, omega, reel, target, RRT_PRIM_STEPS, PLAN_H,
             );
@@ -1512,10 +1532,11 @@ fn plan_random_shooting(
     let mut best_reel = -1i32;
     let mut best_is_spar = anchors[0].is_spar;
     let mut best_pd = f64::INFINITY;
+    let sp_rs = swing_prob(vel.len());
     for _ in 0..RS_N {
-        // Truly uniform anchor index (no u*u goal bias) and uniform reel.
+        // Truly uniform anchor index (no u*u goal bias) and speed-adaptive reel.
         let ai = ((rng.next() * a_n as f64) as i64 as usize).min(a_n - 1);
-        let reel: i32 = if rng.next() < 0.5 { -1 } else { 0 };
+        let reel: i32 = if rng.next() < (1.0 - sp_rs) { -1 } else { 0 };
         let r = rollout_primitive(
             pos, vel, anchors[ai].pos, omega, reel, target, RRT_PRIM_STEPS, PLAN_H,
         );
@@ -2137,6 +2158,20 @@ pub fn plan_grapple(
         return None;
     }
 
+    // ── Soar phase: don't re-anchor when already flying well toward target ──
+    // If the player has no active line AND has good speed AND is heading broadly
+    // toward the target, return None (coast). This produces free-flight arcs
+    // instead of constant short winches. Re-anchor once speed drops, alignment
+    // drifts, or we get close enough to need fine control.
+    let speed = vel.len();
+    if sticky.is_none() && speed > 12.0 && direct_dist > 15.0 {
+        let to_target = target.sub(pos);
+        let align = vel.dot(to_target) / (speed * direct_dist);
+        if align > 0.3 {
+            return None;
+        }
+    }
+
     let opponents: Vec<Vec3> = if avoid_defenders {
         state
             .players
@@ -2274,7 +2309,21 @@ pub fn plan_grapple(
         let (pd_s, c_s) = score_plan(*spar, 0);
         // Swing bias: free-swings build momentum that pays off over multiple hops.
         // Give them a fixed discount so they can compete with straight winches.
-        candidates.push((*spar, 0, pd_s, true, c_s - 4.0));
+        // When already fast (>15 m/s), increase the swing bonus — a swing from a
+        // well-placed anchor preserves angular momentum and redirects without
+        // killing speed, whereas a winch locks into a straight line toward anchor.
+        let swing_bonus = if speed > 15.0 {
+            // Extra bonus for perpendicular spars (good swing pivots): the cross
+            // product magnitude measures how "perpendicular" the spar direction is
+            // to the current velocity.
+            let to_spar_n = spar.sub(pos).norm();
+            let vel_n = if speed > 1e-6 { vel.scale(1.0 / speed) } else { to_spar_n };
+            let perp = 1.0 - vel_n.dot(to_spar_n).abs(); // 0 = inline, 1 = perpendicular
+            4.0 + 6.0 * perp // 4..10 extra bonus at high speed
+        } else {
+            0.0
+        };
+        candidates.push((*spar, 0, pd_s, true, c_s - 4.0 - swing_bonus));
     }
 
     // Candidate 2: skin anchor (TS GP.ts:766-782). Predicate + point are
