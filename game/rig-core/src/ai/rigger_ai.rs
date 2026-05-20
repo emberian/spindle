@@ -87,6 +87,20 @@ fn v3z() -> Vec3 {
     Vec3::new(0.0, 0.0, 0.0)
 }
 
+// ── Station-keeping velocity dampening ──────────────────────────────────────
+const STATIONKEEP_VEL_THRESHOLD: f64 = 8.0;
+const STATIONKEEP_YZ_DAMPEN: f64 = 0.3;
+
+#[inline]
+fn dampen_stationkeep_vel(v: Vec3) -> Vec3 {
+    let yz_speed = v.y.hypot(v.z);
+    if yz_speed <= STATIONKEEP_VEL_THRESHOLD {
+        v
+    } else {
+        Vec3::new(v.x, v.y * STATIONKEEP_YZ_DAMPEN, v.z * STATIONKEEP_YZ_DAMPEN)
+    }
+}
+
 // Predictor skin bounce — EXACT mirror of sim Collision.skinBounce
 // (RiggerAI.ts:50-70). RESTITUTION 0.55, no rng.
 const PRED_SKIN_RESTITUTION: f64 = 0.55;
@@ -140,7 +154,9 @@ pub(crate) fn wants_catch(
     }
     let to_bell = vsub(state.bell.p, player.p);
     let gap = vlen(to_bell);
-    if gap > 70.0 {
+    let is_named_target = active_pass_target == Some(player.id.as_str());
+    let max_catch_dist = if is_named_target { 150.0 } else { 70.0 };
+    if gap > max_catch_dist {
         return false;
     }
 
@@ -2682,7 +2698,8 @@ fn decide_throw(
         .iter()
         .enumerate()
         .map(|(i, tm)| {
-            let st = efe::roll_forward(tm.p, tm.v, omega, ep.throw_tm_horizon, skin_r);
+            let dv = dampen_stationkeep_vel(tm.v);
+            let st = efe::roll_forward(tm.p, dv, omega, ep.throw_tm_horizon, skin_r);
             (i, st.p)
         })
         .collect();
@@ -2804,8 +2821,9 @@ fn decide_throw(
         if rng.next() < scaling.miss_open_chance {
             continue;
         }
+        let tm_dv = dampen_stationkeep_vel(tm.v);
         if let Some(lead) =
-            solve_lead_velocity(player.p, throw_speed, tm.p, tm.v, omega)
+            solve_lead_velocity(player.p, throw_speed, tm.p, tm_dv, omega)
         {
             let is_gate_runner =
                 director.gate_receiver_id.as_deref() == Some(tm.id.as_str());
@@ -2814,6 +2832,17 @@ fn decide_throw(
             let mut bias = 0.0_f64;
             if is_gate_runner { bias += 0.20; }
             if is_play_primary { bias += 0.35; }
+            if nearest_opp < 18.0 {
+                let tm_fp = forward_progress(team, tm.p.x);
+                let gain = tm_fp - my_fp;
+                if gain > 10.0 {
+                    bias += 0.25;
+                } else if gain > 0.0 {
+                    bias += 0.10;
+                } else if gain < -20.0 {
+                    bias -= 0.15;
+                }
+            }
             candidates.push(ThrowCandidate {
                 v0: lead.v0,
                 target_id: Some(tm.id.clone()),
@@ -2851,7 +2880,7 @@ fn decide_throw(
     // Build teammate (position, velocity) pairs for efe::pass_outcome_ev.
     let tm_with_vel: Vec<(Vec3, Vec3)> = teammates
         .iter()
-        .map(|tm| (tm.p, tm.v))
+        .map(|tm| (tm.p, dampen_stationkeep_vel(tm.v)))
         .collect();
     // Build defender positions.
     let defender_positions: Vec<Vec3> = opponents

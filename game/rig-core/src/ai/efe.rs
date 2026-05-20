@@ -435,11 +435,25 @@ pub fn pass_outcome_ev(
         return 0.0;
     }
 
-    // Roll the ball forward for a generous flight horizon. 2.5s covers a
-    // ~55m throw at 22 m/s (the common case) while keeping prediction
-    // trustworthy. Longer passes use the eval_candidate in decide_throw
-    // which has its own 3.0s horizon.
-    let flight_time = 2.5_f64;
+    // Estimate flight time dynamically: project each teammate onto the throw
+    // axis to find when the ball passes through the nearest receiver region.
+    let flight_time = if speed < 1.0 {
+        2.5
+    } else {
+        let throw_dir = v0.scale(1.0 / speed);
+        let mut best_t = 2.5_f64;
+        for &(tp, _) in teammates {
+            let to_tm = tp.sub(from_p);
+            let proj = to_tm.dot(throw_dir);
+            if proj > 0.0 {
+                let t = proj / speed;
+                if t < best_t {
+                    best_t = t;
+                }
+            }
+        }
+        best_t.clamp(0.8, 5.0)
+    };
 
     // Roll the ball forward for the flight horizon.
     let arrived = roll_forward(from_p, v0, omega, flight_time, skin_r);
@@ -456,7 +470,7 @@ pub fn pass_outcome_ev(
     let mut any_reachable = false;
     for &(tp, tv) in teammates {
         // Predict where the teammate will be at ball-arrival time.
-        let tm_future = tp.add(tv.scale(flight_time.min(2.0)));
+        let tm_future = tp.add(tv.scale(flight_time.min(3.5)));
         // Can the teammate reach the arrived point within the flight time?
         let dist = tm_future.sub(arrived.p).len();
         let reachable = dist < CATCH_RADIUS + DEF_CLOSE_SPEED * flight_time * 0.5;
