@@ -16,6 +16,7 @@ import { GameCamera } from './render/Camera';
 import { initDebugViz, debugViz } from './render/DebugViz';
 import { Riggers } from './render/Rigger';
 import { RigLines } from './render/RigLine';
+import { RiggerTrails } from './render/RiggerTrail';
 import { LegibilityOverlay } from './render/LegibilityOverlay';
 import { AudioEngine } from './audio/AudioEngine';
 import { HUD } from './ui/HUD';
@@ -75,6 +76,7 @@ const spiralMotif = new SpiralMotif(scene, camera);
 const gcam = new GameCamera(camera);
 const riggers = new Riggers(scene);
 const riglines = new RigLines(scene);
+const rigtrails = new RiggerTrails(scene);
 // The legibility overlay — the watchable payoff. ON by default in
 // watch/spectate (the whole point); a single key cycles full → labels →
 // off for clean capture. Render-only; reads the deterministic render-only
@@ -427,6 +429,7 @@ async function runMatch(
       riggers.sync(s.players, 'P1');
       for (const pp of s.players) riggers.setPoseEmphasis(pp.id, pp.id === s.bell.heldBy ? 1 : 0);
       riglines.sync(s.players);
+      rigtrails.sync(s.players);
       audio.setBell(s.bell.chime, Math.hypot(s.bell.w.x, s.bell.w.y, s.bell.w.z),
         Math.max(-1, Math.min(1, s.bell.p.z / REG.R)), s.bell.heldBy === null);
       audio.setHush(lg);
@@ -780,6 +783,7 @@ async function runWatch(
       riggers.sync(s.players, '');
       for (const pp of s.players) riggers.setPoseEmphasis(pp.id, pp.id === s.bell.heldBy ? 1 : 0);
       riglines.sync(s.players);
+      rigtrails.sync(s.players);
       audio.setBell(s.bell.chime, Math.hypot(s.bell.w.x, s.bell.w.y, s.bell.w.z),
         Math.max(-1, Math.min(1, s.bell.p.z / REG.R)), s.bell.heldBy === null);
       audio.setHush(lg);
@@ -1071,6 +1075,7 @@ async function runReplay(
       riggers.sync(s.players, '');
       for (const pp of s.players) riggers.setPoseEmphasis(pp.id, pp.id === s.bell.heldBy ? 1 : 0);
       riglines.sync(s.players);
+      rigtrails.sync(s.players);
       audio.setBell(s.bell.chime, Math.hypot(s.bell.w.x, s.bell.w.y, s.bell.w.z),
         Math.max(-1, Math.min(1, s.bell.p.z / REG.R)), s.bell.heldBy === null);
       audio.setHush(lg);
