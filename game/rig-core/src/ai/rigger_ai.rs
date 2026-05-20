@@ -2417,29 +2417,25 @@ fn settle_thrumbler(player: &PlayerSim, target: Vec3) -> Vec3 {
         return v3z();
     }
 
-    // FAR RANGE (> 18m): active thrust toward target. This prevents the
-    // "purposeless drift" between grapple hops where players had zero
-    // thrust and just floated under Coriolis.
+    // FAR RANGE (> 18m): gentle drift correction only. Just enough to
+    // counteract Coriolis and show intent, not enough to jitter.
     if dist > SETTLE_RADIUS {
         let approach = vscale(to_target, 1.0 / dist);
-        let speed = vlen(player.v);
-        // Thrust toward target, scaled by distance (more urgent when far)
-        let thrust_mag = MICRO_DV_MAX * 0.5;
-        // Also counteract perpendicular drift
         let v_toward = vdot(player.v, approach);
-        let v_perp = vsub(player.v, vscale(approach, v_toward));
-        let perp_brake = if vlen(v_perp) > 2.0 {
-            vscale(v_perp, -(MICRO_DV_MAX * 0.3).min(vlen(v_perp)) / vlen(v_perp))
-        } else {
-            v3z()
-        };
-        let combined = vadd(vscale(approach, thrust_mag), perp_brake);
-        let mag = vlen(combined);
-        return if mag > MICRO_DV_MAX {
-            vscale(combined, MICRO_DV_MAX / mag)
-        } else {
-            combined
-        };
+        // Only thrust if we're NOT already heading toward target
+        if v_toward > 3.0 {
+            // Already closing — just brake perpendicular drift gently
+            let v_perp = vsub(player.v, vscale(approach, v_toward));
+            let vp_len = vlen(v_perp);
+            if vp_len > 4.0 {
+                let brake = vscale(v_perp, -(MICRO_DV_MAX * 0.15).min(vp_len) / vp_len);
+                return brake;
+            }
+            return v3z();
+        }
+        // Not closing: gentle push toward target
+        let thrust_mag = MICRO_DV_MAX * 0.2;
+        return vscale(approach, thrust_mag);
     }
     let approach = vscale(to_target, 1.0 / dist);
     let speed = vlen(player.v);
