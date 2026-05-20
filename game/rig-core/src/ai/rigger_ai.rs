@@ -1627,16 +1627,48 @@ fn decide_nav_target(
 
         if let Some(def_p) = nearest_def {
             if nearest_dist < 20.0 {
-                // Immediate pressure: juke perpendicular to the defender's
-                // approach vector (cross-radius dodge).
                 let approach = vnorm(vsub(player.p, *def_p));
-                // Perpendicular in the YZ plane (cross product with X axis).
                 let perp = Vec3::new(0.0, -approach.z, approach.y);
                 let perp_len = vlen(perp);
-                if perp_len > 1e-6 {
-                    let dodge = vscale(perp, 12.0 / perp_len);
+
+                let fwd_dir = Vec3::new(sgn, 0.0, 0.0);
+                let def_in_front = vdot(vsub(*def_p, player.p), fwd_dir) > 0.0;
+
+                let second_def = defenders.iter()
+                    .filter(|d| vlen(vsub(**d, player.p)) < 30.0 && *d != def_p)
+                    .min_by(|a, b| {
+                        vlen(vsub(**a, player.p))
+                            .partial_cmp(&vlen(vsub(**b, player.p)))
+                            .unwrap()
+                    });
+
+                if let Some(def2) = second_def {
+                    let mid = vscale(vadd(*def_p, *def2), 0.5);
+                    let gap_perp = vnorm(vsub(player.p, mid));
+                    let dodge = vscale(gap_perp, 15.0);
                     target_y += dodge.y;
                     target_z += dodge.z;
+                    target_x += sgn * 15.0;
+                } else if perp_len > 1e-6 {
+                    let speed = vlen(player.v);
+                    let momentum_factor = if speed > 15.0 {
+                        let align = vdot(vnorm(player.v), fwd_dir);
+                        if align > 0.5 { 0.5 } else { 1.0 }
+                    } else {
+                        1.0
+                    };
+
+                    let juke_mag = 12.0 * momentum_factor;
+                    let dodge = vscale(perp, juke_mag / perp_len);
+
+                    if !def_in_front {
+                        target_x += sgn * 8.0;
+                        target_y += dodge.y * 0.6;
+                        target_z += dodge.z * 0.6;
+                    } else {
+                        target_y += dodge.y;
+                        target_z += dodge.z;
+                    }
                 }
             } else if play_base.is_none() {
                 // No immediate pressure and no play target: carry toward
@@ -2399,6 +2431,10 @@ fn catch_brake_thrumbler(player: &PlayerSim, state: &SimState) -> Vec3 {
     let rel = vsub(player.v, bell_v); // player's excess velocity over the ball
     let rel_speed = vlen(rel);
 
+    if gap < 1e-6 {
+        return v3z();
+    }
+
     // When the ball is far (>30m), counteract drift (centrifugal/Coriolis)
     // by braking our own velocity. This keeps us stationary at the catch
     // point while waiting for the ball to arrive.
@@ -2410,14 +2446,33 @@ fn catch_brake_thrumbler(player: &PlayerSim, state: &SimState) -> Vec3 {
         }
         return v3z();
     }
-    if gap < 1e-6 {
+
+    let closing_speed = -vdot(vsub(state.bell.v, player.v), to_bell) / gap;
+    let ball_incoming = closing_speed > 2.0;
+
+    // COMMITTED RANGE (<8m): pure velocity matching for the catch.
+    if gap < 8.0 {
+        if rel_speed > 1.0 {
+            let brake_mag = MICRO_DV_MAX.min(rel_speed);
+            return vscale(rel, -brake_mag / rel_speed);
+        }
         return v3z();
     }
 
-    // Two components: brake relative velocity + nudge toward ball
+    // CLOSE RANGE (<15m) with ball incoming: aggressive intercept.
+    if gap < 15.0 && ball_incoming {
+        let t_intercept = (gap / closing_speed.max(5.0)).min(1.0);
+        let pred_bell = vadd(state.bell.p, vscale(bell_v, t_intercept));
+        let to_pred = vsub(pred_bell, player.p);
+        let pred_dist = vlen(to_pred);
+        if pred_dist > 1e-6 {
+            return vscale(to_pred, MICRO_DV_MAX / pred_dist);
+        }
+    }
+
+    // MEDIUM RANGE (15-30m): blended brake + approach nudge
     let urgency = (1.0 - gap / 30.0).clamp(0.1, 1.0);
 
-    // Brake component: oppose relative velocity (try to match ball speed)
     let brake = if rel_speed > 2.0 {
         let brake_mag = (MICRO_DV_MAX * 0.6 * urgency).min(rel_speed);
         vscale(rel, -brake_mag / rel_speed)
@@ -2425,9 +2480,6 @@ fn catch_brake_thrumbler(player: &PlayerSim, state: &SimState) -> Vec3 {
         v3z()
     };
 
-    // Approach nudge: gently push toward the ball when close and relative
-    // speed is manageable. This closes the dead zone between grapple reach
-    // and the catch envelope.
     let approach = if gap < 18.0 && rel_speed < 20.0 {
         let dir = vscale(to_bell, 1.0 / gap);
         let approach_strength = MICRO_DV_MAX * 0.4 * urgency;

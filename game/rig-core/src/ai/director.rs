@@ -350,6 +350,86 @@ fn assign_marks(
         );
         zi += 1;
     }
+
+    // ── HELP ROTATION (double-team) ─────────────────────────────────────────
+    if let Some(carrier_pos_val) = carrier_pos {
+        if let Some(carrier_id_str) = bell_holder_id {
+            let carrier_marker_id: Option<String> = assignments
+                .iter()
+                .find(|(_, a)| {
+                    a.job == Job::Mark && a.mark_id.as_deref() == Some(carrier_id_str)
+                })
+                .map(|(id, _)| id.clone());
+
+            if let Some(ref marker_id) = carrier_marker_id {
+                let marker_pos: Option<Vec3> = my_players
+                    .iter()
+                    .find(|p| p.id == *marker_id)
+                    .map(|p| p.p);
+
+                if let Some(m_pos) = marker_pos {
+                    let marker_gap = dist3(&m_pos, &carrier_pos_val);
+
+                    if marker_gap > 20.0 {
+                        let mut best_helper: Option<(String, f64)> = None;
+                        for (def_id, a) in assignments.iter() {
+                            if a.job != Job::Mark || def_id == marker_id {
+                                continue;
+                            }
+                            if let Some(def_p) = my_players
+                                .iter()
+                                .find(|p| &p.id == def_id)
+                                .map(|p| p.p)
+                            {
+                                let d = dist3(&def_p, &carrier_pos_val);
+                                if d < 15.0 {
+                                    let take = match &best_helper {
+                                        None => true,
+                                        Some((_, bd)) => d < *bd - 1e-9
+                                            || ((d - *bd).abs() <= 1e-9
+                                                && def_id < marker_id),
+                                    };
+                                    if take {
+                                        best_helper = Some((def_id.clone(), d));
+                                    }
+                                }
+                            }
+                        }
+
+                        if let Some((helper_id, _)) = best_helper {
+                            let helper_old_mark = assignments
+                                .get(&helper_id)
+                                .and_then(|a| a.mark_id.clone());
+
+                            assignments.insert(
+                                helper_id.clone(),
+                                PlayerAssignment {
+                                    job: Job::Mark,
+                                    mark_id: Some(carrier_id_str.to_string()),
+                                    depth_slot: 0.0,
+                                    radius_slot: 0.0,
+                                    pressure: (0.92 + aggression * 0.08).min(1.0),
+                                },
+                            );
+
+                            if let Some(old_mark) = helper_old_mark {
+                                assignments.insert(
+                                    marker_id.clone(),
+                                    PlayerAssignment {
+                                        job: Job::Mark,
+                                        mark_id: Some(old_mark),
+                                        depth_slot: 0.0,
+                                        radius_slot: 0.0,
+                                        pressure: (0.35 + aggression * 0.30).min(0.62),
+                                    },
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 // ── offensive receiver slots (Director.ts:308-385) ───────────────────────────
@@ -538,8 +618,8 @@ fn select_play(
         );
     }
 
-    if dist_to_ring < 120.0 {
-        // Near the attack gate with a reasonably clear lane.
+    if dist_to_ring < 180.0 {
+        // Within realistic scoring range of the attack gate.
         // "Reasonably clear" = no defender within 10m of the direct axis
         // path from carrier to ring.
         let lane_clear = opponents.iter().all(|o| {
@@ -601,11 +681,10 @@ fn select_gate_run(
     // forward with best separation from defenders).
     let primary = pick_best_receiver(&teammates, opponents, a_sign);
     if let Some(prim) = primary {
-        // Just past gate plane, on-axis, offset slightly in Coriolis direction.
-        // Coriolis-favored = positive y (spinward drift in our coordinate frame).
+        // Gate runner: 40m from ring on approach, tube center for clean shot.
         let prim_target = clamp_inside_tube(Vec3::new(
-            a_ring_x - a_sign * 15.0, // just before gate
-            5.0,                        // slight Coriolis offset
+            a_ring_x - a_sign * 40.0,
+            0.0,
             0.0,
         ));
         play_assignments.insert(
@@ -1411,6 +1490,18 @@ pub fn run_director(
     // gives the assigned players interlocking targets. This layer does NOT
     // override Job assignments — it adds coordinated nav targets ON TOP.
     let active_play = select_play(state, m, team_side, profile, &director_out);
+
+    if active_play.kind == PlayKind::GateRun {
+        let gate_runner_id = active_play
+            .assignments
+            .iter()
+            .find(|(_, a)| a.play_role == PlayRole::PrimaryReceiver)
+            .map(|(id, _)| id.clone());
+        if gate_runner_id.is_some() {
+            director_out.gate_receiver_id = gate_runner_id;
+        }
+    }
+
     director_out.active_play = Some(active_play);
 
     director_out

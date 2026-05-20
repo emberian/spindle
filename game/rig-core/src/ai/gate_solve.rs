@@ -152,13 +152,19 @@ pub fn solve_gate_throw(
 
     // Axial-speed sweep. Slower → longer flight → more Coriolis winding;
     // faster → flatter. All thread the ring by construction; keep the
-    // smallest-rho skin-safe one. (Order preserved verbatim from the TS.)
-    let speeds: Vec<f64> = [
-        10.0, 12.0, 14.0, 16.0, 18.0, 20.0, 22.0, 25.0, 28.0, 30.0, 32.0, base_speed,
-    ]
-    .into_iter()
-    .filter(|&s| s > 6.0 && s < THROW_MAX_SPEED + 8.0)
-    .collect();
+    // smallest-rho skin-safe one.
+    let speeds: Vec<f64> = if dx > 150.0 {
+        let mut s: Vec<f64> = (6..=36).map(|i| i as f64).collect();
+        if !s.contains(&base_speed) {
+            s.push(base_speed);
+        }
+        s
+    } else {
+        [10.0, 12.0, 14.0, 16.0, 18.0, 20.0, 22.0, 25.0, 28.0, 30.0, 32.0, base_speed]
+            .into_iter()
+            .filter(|&s| s > 6.0 && s < THROW_MAX_SPEED + 8.0)
+            .collect()
+    };
 
     let mut best: Option<GateSolution> = None;
     let mut best_cost: f64 = f64::INFINITY;
