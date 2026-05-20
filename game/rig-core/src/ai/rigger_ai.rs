@@ -1483,10 +1483,14 @@ fn decide_nav_target(
             // - PrimaryReceiver / SecondaryReceiver: play tells them where to cut
             // - Screen / DeepOption: play tells them where to station
             //
-            // Do NOT override: Recover job (dive is time-critical), or if
-            // the player is the dive committer (handled elsewhere).
+            // Do NOT override:
+            // - Recover job (dive is time-critical)
+            // - Mark job (lane-denial positioning is more tactical than
+            //   the play's static stations — Mark defenders use their own
+            //   proactive positioning logic based on carrier/lane/help)
             let dominated_by_dive = assignment.job == Job::Recover;
-            if !dominated_by_dive {
+            let mark_uses_own_logic = assignment.job == Job::Mark;
+            if !dominated_by_dive && !mark_uses_own_logic {
                 return pa.target;
             }
         }
@@ -1678,31 +1682,104 @@ fn decide_nav_target(
                         let lane = vsub(mark.p, carrier.p);
                         let lane_len = vlen(lane);
 
+                        // CASE 1A: We ARE marking the carrier (mark == carrier,
+                        // lane_len ≈ 0). PRESS directly onto them — approach from
+                        // the best passing-lane side to disrupt the throw.
+                        if lane_len <= 5.0 {
+                            // Find the nearest enemy receiver (teammate of the
+                            // carrier, not the carrier itself) — that's where
+                            // the throw will go. Press from that side.
+                            let mut nearest_receiver: Option<Vec3> = None;
+                            let mut nearest_d = f64::INFINITY;
+                            for p in state.players.iter() {
+                                if p.team == carrier.team && p.id != carrier.id {
+                                    let d = vlen(vsub(p.p, carrier.p));
+                                    if d < nearest_d {
+                                        nearest_d = d;
+                                        nearest_receiver = Some(p.p);
+                                    }
+                                }
+                            }
+                            // Position: press onto carrier, biased toward the
+                            // throwing lane so the defender's body disrupts the
+                            // release. Standoff at high pressure is ~2-3m.
+                            let press_standoff = standoff.max(1.5);
+                            let approach_dir = if let Some(recv_p) = nearest_receiver {
+                                // Approach from the receiver's side — get BETWEEN
+                                // carrier and their best target.
+                                let to_recv = vnorm(vsub(recv_p, carrier.p));
+                                // Blend: 60% from receiver side, 40% goal-side
+                                vadd(vscale(to_recv, 0.6), vscale(to_ring, 0.4))
+                            } else {
+                                to_ring
+                            };
+                            let approach_norm = vnorm(approach_dir);
+                            return vadd(mark.p, vscale(approach_norm, press_standoff));
+                        }
+
                         if lane_len > 5.0 {
                             let lane_dir = vscale(lane, 1.0 / lane_len);
 
-                            // Station IN the passing lane between carrier and mark,
-                            // biased toward the mark (so we can still recover if
-                            // they cut). Position = mark - standoff along the lane
-                            // direction (between carrier and mark).
-                            let lane_pos = vsub(mark.p, vscale(lane_dir, standoff.max(4.0)));
+                            // HOLD-TIME URGENCY: the longer the carrier has held
+                            // the ball, the more likely a throw is imminent. Read
+                            // from release_tick (when the ball was caught) vs the
+                            // current sim tick. A hold of 60+ ticks (~1s) is "long".
+                            let hold_ticks = (state.tick - state.bell.release_tick).max(0.0);
+                            let hold_urgency = (hold_ticks / 60.0).clamp(0.0, 1.0);
 
-                            // Blend: high pressure = cheat MORE into the lane;
-                            // low pressure = stay closer to traditional goal-side.
-                            let lane_weight = (assignment.pressure * 1.4).clamp(0.0, 0.85);
+                            // FACING ANTICIPATION: if the carrier's velocity vector
+                            // (approximation of facing) points toward our mark, they
+                            // are likely about to throw to them. Tighten denial.
+                            let carrier_speed = vlen(carrier.v);
+                            let facing_toward_mark = if carrier_speed > 1.0 {
+                                let carrier_dir = vscale(carrier.v, 1.0 / carrier_speed);
+                                vdot(carrier_dir, lane_dir).max(0.0)
+                            } else {
+                                // Carrier nearly stationary — use carrier→mark
+                                // direction as implicit facing (they're reading).
+                                0.4
+                            };
+
+                            // Combined threat level: base pressure + hold urgency +
+                            // facing anticipation. Drives how aggressively we commit
+                            // to the passing lane vs staying goal-side.
+                            let threat = (assignment.pressure + hold_urgency * 0.3 + facing_toward_mark * 0.3).clamp(0.0, 1.0);
+
+                            // Station IN the passing lane between carrier and mark.
+                            // Position closer to the lane midpoint when threat is
+                            // high (fully deny the pass), closer to the mark when
+                            // threat is low (able to recover on a cut).
+                            let deny_depth = standoff.max(4.0) + threat * 4.0;
+                            let lane_pos = vsub(mark.p, vscale(lane_dir, deny_depth.min(lane_len * 0.6)));
+
+                            // Blend: at high threat, FULLY commit to the lane-denial
+                            // position (lane_weight → 1.0). This is the key change:
+                            // old code capped at 0.85; now we go up to 0.97.
+                            let lane_weight = (threat * 1.3).clamp(0.0, 0.97);
                             let goal_side = vadd(mark.p, vscale(to_ring, standoff));
                             let base = vadd(
                                 vscale(lane_pos, lane_weight),
                                 vscale(goal_side, 1.0 - lane_weight),
                             );
 
-                            // DOUBLING: if the carrier is very close to us (< 18m)
-                            // and our mark is far from the ball (> 25m), crash
-                            // toward the carrier to create a double-team. Our mark
-                            // is unlikely to receive soon.
+                            // HELP / DOUBLING: if the carrier is within 25m of our
+                            // mark, cheat toward the carrier to create a double-team.
+                            // This prevents easy short passes and forces turnovers.
                             let carrier_dist = vlen(vsub(carrier.p, player.p));
-                            let mark_ball_dist = vlen(vsub(state.bell.p, mark.p));
-                            if carrier_dist < 18.0 && mark_ball_dist > 25.0 && assignment.pressure > 0.5 {
+                            let carrier_to_mark = vlen(vsub(carrier.p, mark.p));
+                            if carrier_to_mark < 25.0 && assignment.pressure > 0.4 {
+                                // Cheat proportional to proximity: closer carrier =
+                                // more aggressive help. Scale: up to 10m of crash.
+                                let help_intensity = 1.0 - (carrier_to_mark / 25.0);
+                                let crash_dist = help_intensity * 10.0;
+                                let to_carrier = vnorm(vsub(carrier.p, base));
+                                let crash = vadd(base, vscale(to_carrier, crash_dist));
+                                return crash;
+                            }
+
+                            // LEGACY DOUBLING: carrier very close to US specifically
+                            // and mark far from ball — hard crash.
+                            if carrier_dist < 18.0 && lane_len > 30.0 && assignment.pressure > 0.5 {
                                 let to_carrier = vnorm(vsub(carrier.p, player.p));
                                 let crash = vadd(base, vscale(to_carrier, 8.0));
                                 return crash;
@@ -1713,35 +1790,71 @@ fn decide_nav_target(
                     }
                 }
 
-                // CASE 2: Ball is loose or in flight — rotate toward the ball.
-                // The mark just threw or the ball is loose. Don't stay locked
-                // on a player who doesn't have the ball — rotate toward where
-                // the ball is going to deny the next reception.
+                // CASE 2: Ball is loose or in flight — aggressively pursue the
+                // ball to intercept / deny advance. When the ball is loose,
+                // marking a receiver is secondary to ball recovery.
                 let ball_loose = state.bell.held_by.is_none();
                 if ball_loose {
-                    let to_bell = vsub(state.bell.p, mark.p);
+                    let to_bell = vsub(state.bell.p, player.p);
                     let bell_dist = vlen(to_bell);
+                    let bell_speed = vlen(state.bell.v);
 
-                    // If the ball is heading toward our mark (they might catch it),
-                    // tighten up and get between ball and mark.
-                    let bell_closing = if bell_dist > 1e-6 {
-                        -vdot(state.bell.v, to_bell) / (vlen(state.bell.v).max(1e-6) * bell_dist)
+                    // PRIMARY STRATEGY: predict where the ball will be in
+                    // 1-3 seconds and get AHEAD of it (lead intercept). The
+                    // key insight is to position where the ball is GOING, not
+                    // where it IS — grapple movement is slower than ball
+                    // travel, so stern-chasing always loses.
+                    if bell_speed > 2.0 {
+                        // CPA: find closest approach point and time.
+                        let rel_pos = to_bell; // bell - player
+                        let rel_vel = vsub(state.bell.v, player.v);
+                        let rv2 = vdot(rel_vel, rel_vel);
+                        let t_cpa = if rv2 > 1e-6 {
+                            (-vdot(rel_pos, rel_vel) / rv2).clamp(0.0, 4.0)
+                        } else {
+                            1.5
+                        };
+
+                        // Predict ball position at CPA time (simple linear).
+                        let future_bell = vadd(state.bell.p, vscale(state.bell.v, t_cpa));
+
+                        // If we can reach the CPA point reasonably (within
+                        // ~40m), go there. Otherwise, go to a LEAD point:
+                        // where the ball will be in 1.5s, which is farther
+                        // but gives us time to set up.
+                        let cpa_dist = vlen(vsub(future_bell, player.p));
+                        if cpa_dist < 40.0 {
+                            return future_bell;
+                        }
+
+                        // LEAD INTERCEPT: predict ball in 1.5s and go there.
+                        // This gets us AHEAD of the ball so it comes to us.
+                        let lead_time = 1.5_f64.min(bell_dist / 20.0);
+                        let lead_pos = vadd(state.bell.p, vscale(state.bell.v, lead_time));
+                        let lead_dist = vlen(vsub(lead_pos, player.p));
+                        if lead_dist < 60.0 {
+                            return lead_pos;
+                        }
+                    }
+
+                    // Ball heading toward our mark — get between ball and mark.
+                    let mark_to_bell = vsub(state.bell.p, mark.p);
+                    let mark_bell_dist = vlen(mark_to_bell);
+                    let bell_closing_on_mark = if mark_bell_dist > 1e-6 && bell_speed > 1.0 {
+                        -vdot(state.bell.v, mark_to_bell) / (bell_speed * mark_bell_dist)
                     } else {
                         0.0
                     };
 
-                    if bell_closing > 0.3 && bell_dist < 50.0 {
+                    if bell_closing_on_mark > 0.3 && mark_bell_dist < 50.0 {
                         // Ball heading toward our mark — get in the way!
                         let intercept_pos = vadd(mark.p, vscale(vnorm(vsub(state.bell.p, mark.p)), standoff.min(6.0)));
                         return intercept_pos;
                     }
 
-                    // Ball not heading toward mark — sag off toward the ball
-                    // side to provide help defense (zone up).
-                    let sag_toward_ball = vnorm(vsub(state.bell.p, mark.p));
-                    let sag_dist = (standoff + 4.0).min(15.0);
-                    let base = vadd(mark.p, vscale(to_ring, standoff));
-                    return vadd(base, vscale(sag_toward_ball, sag_dist * 0.4));
+                    // FALLBACK: move directly toward the ball. Every meter
+                    // closer improves future interception chances.
+                    return state.bell.p;
                 }
 
                 // CASE 3: We have the ball (shouldn't be marking, but safety fallback).

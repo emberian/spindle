@@ -234,10 +234,17 @@ fn assign_marks(
         }
     });
 
-    // DYNAMISM: defenders HUNT. Carrier-marker presses onto the carrier; the
-    // next two get close shadows; the rest a tighter goal-side screen.
+    // DYNAMISM: defenders HUNT. Carrier-marker presses hard onto the carrier;
+    // off-ball defenders deny passing lanes and cheat toward the carrier when
+    // their mark is near the ball ("help" concept).
     // `defenders` is the mutable pool; `splice(bestI,1)` → swap-free remove.
     let mut defenders: Vec<&PlayerSim> = my_players.iter().collect();
+
+    // Pre-compute carrier position for lane-denial and help calculations.
+    let carrier_pos: Option<Vec3> = bell_holder_id
+        .and_then(|hid| opponents.iter().find(|o| o.id == hid))
+        .map(|c| c.p);
+
     let mut rank: i32 = 0;
     for opp in &ranked {
         if defenders.is_empty() {
@@ -250,8 +257,30 @@ fn assign_marks(
         let mut best_d = f64::INFINITY;
         for (i, def) in defenders.iter().enumerate() {
             let d = dist3(&def.p, &opp.p);
-            if d < best_d - 1e-6 {
-                best_d = d;
+            // For non-carrier marks when carrier is known, bias defender
+            // selection toward defenders that are already near the passing
+            // lane (carrier→mark midpoint). This produces better lane-denial
+            // assignments than pure closest-to-mark greedy.
+            let lane_bonus = if bell_holder_id != Some(opp.id.as_str()) {
+                if let Some(cp) = carrier_pos {
+                    let mid = Vec3::new(
+                        (cp.x + opp.p.x) * 0.5,
+                        (cp.y + opp.p.y) * 0.5,
+                        (cp.z + opp.p.z) * 0.5,
+                    );
+                    let to_mid = dist3(&def.p, &mid);
+                    // Reduce effective distance by up to 8m if defender is
+                    // near the lane midpoint (incentivizes lane-denial picks).
+                    (8.0 - to_mid * 0.3).clamp(0.0, 8.0)
+                } else {
+                    0.0
+                }
+            } else {
+                0.0
+            };
+            let effective_d = d - lane_bonus;
+            if effective_d < best_d - 1e-6 {
+                best_d = effective_d;
                 best_i = i as i32;
             }
         }
@@ -262,12 +291,35 @@ fn assign_marks(
         // shifting the rest left (order-preserving) — `Vec::remove`.
         let def = defenders.remove(best_i as usize);
         let is_carrier = bell_holder_id == Some(opp.id.as_str());
+
+        // PRESSURE: carrier-marker presses HARD (0.92+); off-ball defenders
+        // get elevated pressure when their mark is near the carrier ("help"
+        // double-team concept: carrier within 25m of the mark).
         let pressure: f64 = if is_carrier {
-            (0.85 + aggression * 0.15).min(1.0)
-        } else if rank <= 2 {
-            (0.28 + aggression * 0.30).min(0.55)
+            // Floor raised from 0.85 → 0.92 to ensure aggressive press.
+            (0.92 + aggression * 0.08).min(1.0)
         } else {
-            (0.12 + aggression * 0.23).min(0.35)
+            // Base pressure by rank.
+            let base = if rank <= 2 {
+                (0.35 + aggression * 0.30).min(0.62)
+            } else {
+                (0.18 + aggression * 0.25).min(0.42)
+            };
+            // HELP BOOST: if the carrier is within 25m of this defender's
+            // mark, this defender should cheat toward the carrier — signal
+            // via elevated pressure (rigger_ai reads this to tighten denial).
+            if let Some(cp) = carrier_pos {
+                let carrier_to_mark = dist3(&cp, &opp.p);
+                if carrier_to_mark < 25.0 {
+                    // The closer the carrier is to our mark, the more we help.
+                    let help_factor = 1.0 - (carrier_to_mark / 25.0);
+                    (base + help_factor * 0.35).min(0.92)
+                } else {
+                    base
+                }
+            } else {
+                base
+            }
         };
         assignments.insert(
             def.id.clone(),
@@ -832,23 +884,32 @@ fn select_recovery_formation(
     for (i, player) in sorted.iter().enumerate() {
         let (role, target) = match i {
             0 => {
-                // Station 1 (nearest to bell): between bell and our ring, 30m back.
-                let t_x = bell_pos.x - a_sign * 30.0;
+                // Station 1 (nearest to bell): between ball-carrier and our
+                // ring, close to the carrier. 20m back — tight enough to
+                // threaten a strip / deny the next pass while still
+                // providing goal-side coverage.
+                let t_x = bell_pos.x - a_sign * 20.0;
                 (PlayRole::PrimaryReceiver, clamp_inside_tube(Vec3::new(t_x, 0.0, 0.0)))
             }
             1 => {
-                // Station 2 (midfield): halfway between bell and our ring.
-                let t_x = bell_pos.x + bell_to_ring_x * 0.5;
+                // Station 2: deny the ADVANCE lane. Position between the
+                // carrier and the nearest offensive teammate (passing lane
+                // denial), clamped to at most 50m from the carrier so we
+                // don't drift uselessly far. Previously this was "halfway to
+                // our ring" which sent defenders 200m from the action.
+                let max_spread = 50.0_f64;
+                let t_x = bell_pos.x + (bell_to_ring_x).signum() * max_spread.min(bell_to_ring_x.abs() * 0.25);
                 (PlayRole::SecondaryReceiver, clamp_inside_tube(Vec3::new(t_x, 0.0, 10.0)))
             }
             2 => {
-                // Station 3 (deep): near our ring — last back.
-                let t_x = d_ring_x - a_sign * 40.0; // 40m in front of our ring
+                // Station 3 (deep): 80m from the carrier toward our ring.
+                // Provides last-back coverage without being too far to help.
+                let t_x = bell_pos.x + (bell_to_ring_x).signum() * 80.0_f64.min(bell_to_ring_x.abs() * 0.4);
                 (PlayRole::DeepOption, clamp_inside_tube(Vec3::new(t_x, 0.0, -10.0)))
             }
             _ => {
-                // Extra players: screen at varied positions.
-                let t_x = bell_pos.x + bell_to_ring_x * (0.3 + 0.15 * i as f64);
+                // Extra players: screen at varied positions closer to the ball.
+                let t_x = bell_pos.x + (bell_to_ring_x).signum() * (40.0 + 20.0 * i as f64).min(bell_to_ring_x.abs() * 0.3);
                 (PlayRole::Screen, clamp_inside_tube(Vec3::new(t_x, player.p.y, player.p.z)))
             }
         };
