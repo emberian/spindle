@@ -2408,14 +2408,38 @@ fn should_pushoff(player: &PlayerSim, target: Vec3) -> bool {
     align > PUSHOFF_ALIGN_COS
 }
 
-/// settleThrumbler (RiggerAI.ts:742-762). Pure geometry, no rng.
-/// Velocity-aware: gentle nudge far out, firm correction mid-range, hard
-/// brake + settle close in. Covers the 6-18m grapple dead zone.
+/// settleThrumbler — active at ALL distances. Far out: push toward target
+/// to counteract Coriolis drift. Mid-range: firm correction. Close: brake.
 fn settle_thrumbler(player: &PlayerSim, target: Vec3) -> Vec3 {
     let to_target = vsub(target, player.p);
     let dist = vlen(to_target);
-    if dist > SETTLE_RADIUS || dist < 1e-6 {
+    if dist < 1e-6 {
         return v3z();
+    }
+
+    // FAR RANGE (> 18m): active thrust toward target. This prevents the
+    // "purposeless drift" between grapple hops where players had zero
+    // thrust and just floated under Coriolis.
+    if dist > SETTLE_RADIUS {
+        let approach = vscale(to_target, 1.0 / dist);
+        let speed = vlen(player.v);
+        // Thrust toward target, scaled by distance (more urgent when far)
+        let thrust_mag = MICRO_DV_MAX * 0.5;
+        // Also counteract perpendicular drift
+        let v_toward = vdot(player.v, approach);
+        let v_perp = vsub(player.v, vscale(approach, v_toward));
+        let perp_brake = if vlen(v_perp) > 2.0 {
+            vscale(v_perp, -(MICRO_DV_MAX * 0.3).min(vlen(v_perp)) / vlen(v_perp))
+        } else {
+            v3z()
+        };
+        let combined = vadd(vscale(approach, thrust_mag), perp_brake);
+        let mag = vlen(combined);
+        return if mag > MICRO_DV_MAX {
+            vscale(combined, MICRO_DV_MAX / mag)
+        } else {
+            combined
+        };
     }
     let approach = vscale(to_target, 1.0 / dist);
     let speed = vlen(player.v);
