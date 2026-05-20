@@ -80,6 +80,11 @@ pub struct AiSystem {
     /// non-target teammates keep their spacing instead of all swarming the
     /// same friendly pass.
     active_pass_targets: HashMap<(u8, usize), String>,
+    /// Pass contract: the predicted intercept point the throw was AIMED AT.
+    /// The receiver navigates to THIS point instead of independently computing
+    /// bell_rendezvous (which might disagree due to prediction divergence).
+    /// Cleared when the ball is caught or the pass ends.
+    pass_contract_points: HashMap<(u8, usize), Vec3>,
 }
 
 impl AiSystem {
@@ -141,6 +146,7 @@ impl AiSystem {
                     .unwrap_or(false);
             if !own_throw_in_flight {
                 self.active_pass_targets.remove(&dir_key);
+                self.pass_contract_points.remove(&dir_key);
             }
             let active_pass_target = self.active_pass_targets.get(&dir_key).cloned();
             let possession_changed = self
@@ -200,6 +206,7 @@ impl AiSystem {
                         decided_tick: -1.0,
                     });
 
+                let pass_contract_pt = self.pass_contract_points.get(&dir_key).copied();
                 let input = compute_player_input(
                     player,
                     sim_state,
@@ -209,6 +216,7 @@ impl AiSystem {
                     cfg.difficulty,
                     &mut player_rng,
                     active_pass_target.as_deref(),
+                    pass_contract_pt,
                     commit,
                     director_refreshed,
                     DIRECTOR_TICK_INTERVAL,
@@ -219,7 +227,20 @@ impl AiSystem {
                         .as_ref()
                         .and_then(|c| c.throw_target_id.clone())
                     {
-                        released_pass_target = Some(target_id);
+                        released_pass_target = Some(target_id.clone());
+                        // Pass contract: compute the intercept point the throw
+                        // is aimed at. The receiver should navigate HERE instead
+                        // of independently predicting (avoids prediction divergence).
+                        if let Some(target_player) = sim_state.players.iter().find(|p| p.id == target_id) {
+                            // The throw was aimed via solve_lead_velocity; the
+                            // intercept point is where the ball and receiver converge.
+                            // Approximate: target's current position + velocity * flight_time.
+                            let throw_speed = input.aim.len() * 24.0; // approximate
+                            let dist = player.p.sub(target_player.p).len();
+                            let flight_t = (dist / throw_speed.max(10.0)).min(3.0);
+                            let contract_pt = target_player.p.add(target_player.v.scale(flight_t));
+                            self.pass_contract_points.insert(dir_key, contract_pt);
+                        }
                     }
                 }
                 inputs.push(input);
@@ -311,6 +332,7 @@ impl AiSystem {
         self.commit_cache.clear();
         self.last_debug.clear();
         self.active_pass_targets.clear();
+        self.pass_contract_points.clear();
     }
 
     /// RENDER-ONLY: the legibility records produced by the last `tick`,

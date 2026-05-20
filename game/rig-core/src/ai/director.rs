@@ -646,11 +646,13 @@ fn select_outlet_chain(
         .filter(|p| p.id != carrier.id)
         .collect();
 
-    // Primary: 60% of distance from carrier to attack ring, radius 15-25m.
+    // Primary: a catchable pass distance ahead (40-80m), capped so the
+    // receiver stays within throw range rather than sprinting to half-field.
     let dist_to_ring = (carrier.p.x - a_ring_x).abs();
     let primary = pick_best_receiver(&teammates, opponents, a_sign);
     if let Some(prim) = primary {
-        let prim_x = carrier.p.x + a_sign * dist_to_ring * 0.6;
+        let lead = (dist_to_ring * 0.3).min(80.0).max(40.0);
+        let prim_x = carrier.p.x + a_sign * lead;
         let prim_target = clamp_inside_tube(Vec3::new(prim_x, 0.0, 20.0));
         play_assignments.insert(
             prim.id.clone(),

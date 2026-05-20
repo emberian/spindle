@@ -216,7 +216,16 @@ pub(crate) fn wants_catch(
 pub(crate) fn bell_intercept(player: &PlayerSim, state: &SimState) -> Vec3 {
     let b = &state.bell;
     let gap = vlen(vsub(b.p, player.p));
-    let close_v = 22.0;
+    // Credit inbound velocity: if we're already closing on the ball, the
+    // rendezvous is sooner than gap/close_v suggests. This tightens the
+    // prediction horizon and reduces Coriolis drift error.
+    let to_b = vsub(b.p, player.p);
+    let inbound = if gap > 1e-6 {
+        (vdot(player.v, to_b) / gap).max(0.0)
+    } else {
+        0.0
+    };
+    let close_v = (22.0 + inbound.min(14.0)).max(8.0);
     let t_lead = (gap / close_v).max(0.1).min(2.5);
     let mut st = PointState { p: b.p, v: b.v };
     let h: f64 = 1.0 / 60.0;
@@ -368,9 +377,6 @@ pub(crate) fn is_contest_committer(
     m: &MatchState,
     director: &DirectorState,
 ) -> bool {
-    if !director.contest_commit {
-        return false;
-    }
     // Who controls the bell? Held by an opponent, OR loose but thrown by an
     // opponent (an opposing pass in flight we can contest / pick).
     let opp_controls = match state.bell.held_by.as_deref() {
@@ -391,6 +397,22 @@ pub(crate) fn is_contest_committer(
         },
     };
     if !opp_controls {
+        return false;
+    }
+    // Active interception: when an opponent pass is in flight (loose ball
+    // thrown by opponent), ANY defender close enough to the ball's predicted
+    // path should contest, even without a formal contest_commit from the
+    // Director. This is the pass-picking mechanic.
+    let opp_pass_in_flight = state.bell.held_by.is_none()
+        && state.bell.thrown_by.as_deref()
+            .and_then(|tid| state.players.iter().find(|p| p.id == tid))
+            .map(|p| p.team != player.team)
+            .unwrap_or(false);
+    if !director.contest_commit && !opp_pass_in_flight {
+        return false;
+    }
+    // For held-ball contest, still require director.contest_commit
+    if state.bell.held_by.is_some() && !director.contest_commit {
         return false;
     }
     // It must also be OUR cast-defense (we are not in possession).
@@ -705,6 +727,7 @@ pub fn compute_player_input(
     difficulty: Difficulty,
     rng: &mut AiRng,
     active_pass_target: Option<&str>,
+    pass_contract_point: Option<Vec3>,
     cache: &mut PlayerCommitCache,
     director_refreshed: bool,
     director_interval: f64,
@@ -986,6 +1009,38 @@ pub fn compute_player_input(
             ));
             let pushoff = should_pushoff(player, state.bell.p);
 
+            // HOLD-AND-CATCH: when the predicted catch point is very close
+            // to us (< 10m), the ball is COMING TO US — don't fire a hook
+            // and fly away. Just hold position with the thrumbler and let
+            // the ball arrive. Release any existing line so we don't get
+            // pulled away from the catch point.
+            let catch_close = vlen(vsub(catch_pt, player.p)) < 10.0;
+            let ball_approaching = {
+                let to_us = vsub(player.p, state.bell.p);
+                let tl = vlen(to_us);
+                if tl > 1e-6 {
+                    vdot(state.bell.v, to_us) / (vlen(state.bell.v).max(1e-6) * tl) > 0.3
+                } else {
+                    true
+                }
+            };
+            if catch_close && ball_approaching {
+                let thrumbler = catch_brake_thrumbler(player, state);
+                return PlayerInput {
+                    id: player.id.clone(),
+                    aim: nav_aim,
+                    fire_line_at: None,
+                    reel: 0,
+                    release: player.line.is_some(), // release existing line
+                    pushoff,
+                    throw_charge: 0.0,
+                    throw_released: false,
+                    throw_spin: 0.0,
+                    thrumbler,
+                    catch_intent: true,
+                };
+            }
+
             // ── COMMIT ONCE, THEN RIDE THE LINE (the catch fix, AI side) ──
             // Grappling now has latency: a fired claw takes flight time to
             // land and the line then LOCKS to its anchor until released
@@ -1156,6 +1211,125 @@ pub fn compute_player_input(
         };
     }
 
+    // ── RECEIVE RENDEZVOUS — the named receiver of a friendly in-flight
+    // pass gets a powered-hook rendezvous (same quality as the dive) so
+    // passes actually complete. The old path used generic navigate_to +
+    // bell_intercept which left receivers arriving at crossing angles
+    // with high relative velocity (50% catch failure). This uses the same
+    // bell_rendezvous predictor + velocity-matched anchor + terminal ease.
+    // Fires when: ball is loose, thrown by our team, we are the named
+    // active_pass_target, ball is > 15m away. Below 15m, the hold-for-ball
+    // path with catch_brake_thrumbler handles it.
+    {
+        let is_receive_rdv = catch_intent
+            && active_pass_target == Some(player.id.as_str())
+            && state.bell.held_by.is_none()
+            && state.bell.thrown_by.as_deref()
+                .and_then(|tid| state.players.iter().find(|p| p.id == tid))
+                .map(|p| p.team == player.team)
+                .unwrap_or(false)
+            && vlen(vsub(state.bell.p, player.p)) > 15.0;
+
+        if is_receive_rdv {
+            let aim_dither = cache.value.as_ref()
+                .map(|c| c.aim_dither)
+                .unwrap_or_else(v3z);
+            // Use the pass contract point if available (the same point the
+            // throw was aimed at). Fall back to independent bell_rendezvous.
+            let (catch_pt, bv) = if let Some(contract) = pass_contract_point {
+                // The contract point is where the receiver should BE. The
+                // ball's velocity at that point is estimated from current.
+                let bv_est = state.bell.v; // approximate
+                (contract, bv_est)
+            } else {
+                bell_rendezvous(player, state)
+            };
+            let to_bell = vsub(state.bell.p, player.p);
+            let bell_dist = vlen(to_bell);
+            let to_ip = vsub(catch_pt, player.p);
+            let d = vlen(to_ip);
+            let app_dir = if d > 1e-6 {
+                vscale(to_ip, 1.0 / d)
+            } else {
+                if bell_dist > 1e-6 { vscale(to_bell, 1.0 / bell_dist) }
+                else { Vec3::new(attack_sign(player.team), 0.0, 0.0) }
+            };
+            let bspeed = vlen(bv);
+            let bvdir = if bspeed > 1e-3 { vscale(bv, 1.0 / bspeed) } else { app_dir };
+            let term_r = crate::tuning::DIVE_TERMINAL_RADIUS;
+
+            // Anchor direction: direct approach for slow balls, velocity-blended for fast.
+            let dir = if bspeed < 20.0 {
+                app_dir
+            } else {
+                let w_par = (1.0 - (d / (3.0 * term_r)).min(1.0)).clamp(0.0, 1.0);
+                let blended = vnorm(vadd(vscale(app_dir, 1.0 - w_par), vscale(bvdir, w_par)));
+                if vlen(blended) > 1e-6 { blended } else { app_dir }
+            };
+            let beyond = if bspeed < 20.0 { 8.0 } else { 14.0 };
+            let anchor_dir = if bspeed < 20.0 { app_dir } else { bvdir };
+            let mut anchor = vadd(catch_pt, vscale(anchor_dir, beyond));
+            let arho = (anchor.y * anchor.y + anchor.z * anchor.z).sqrt();
+            let max_r = REG_R - 1.0;
+            if arho > max_r && arho > 1e-6 {
+                let s = max_r / arho;
+                anchor.y *= s;
+                anchor.z *= s;
+            }
+
+            let nav_aim = vnorm(vadd(dir, aim_dither));
+            let pushoff = should_pushoff(player, catch_pt);
+            let has_line = player.line.is_some();
+
+            // Commit-once, ride-the-line: same discipline as the dive.
+            let to_catch = vlen(vsub(catch_pt, player.p));
+            let bell_far = bell_dist > 30.0;
+            let past_catch_point = to_catch < term_r && bell_dist > 12.0;
+            let winch_stale = if let Some(line) = &player.line {
+                let to_anchor = vsub(line.anchor_pos, player.p);
+                let to_anchor_len = vlen(to_anchor);
+                if to_anchor_len > 1e-6 && bell_dist > 1e-6 {
+                    vdot(to_anchor, to_bell) / (to_anchor_len * bell_dist) < -0.2
+                } else { false }
+            } else { false };
+
+            let should_release = bell_far || past_catch_point || winch_stale;
+            let (fire, do_release) = if !has_line {
+                (Some(anchor), false)
+            } else if should_release {
+                (None, true)
+            } else {
+                (None, false)
+            };
+
+            let near_catch_pt = to_catch <= term_r;
+            let near_bell = bell_dist <= term_r + 3.0;
+            let reel_cmd: i32 = if near_catch_pt && near_bell { 0 } else { -1 };
+            // Use catch_brake_thrumbler when near the ball to close the last
+            // few meters and match velocity. This is the 2-3m correction that
+            // makes the difference between a catch and a miss.
+            let thrumbler = if bell_dist < 20.0 {
+                catch_brake_thrumbler(player, state)
+            } else {
+                v3z()
+            };
+
+            return PlayerInput {
+                id: player.id.clone(),
+                aim: nav_aim,
+                fire_line_at: fire,
+                reel: reel_cmd,
+                release: do_release,
+                pushoff,
+                throw_charge: 0.0,
+                throw_released: false,
+                throw_spin: 0.0,
+                thrumbler,
+                catch_intent: true,
+            };
+        }
+    }
+
     // Otherwise execute committed navigation toward the cached target.
     let (target, aim_dither) = {
         let commit = cache.value.as_ref().unwrap();
@@ -1176,17 +1350,17 @@ pub fn compute_player_input(
                 .map(|p| p.team == player.team)
                 .unwrap_or(false);
 
-            if is_intended_receiver && friendly_ball && ball_dist > 15.0 {
-                // Blend between maintaining trajectory (far) and tracking
-                // the ball (near). The throw was aimed at where we're going,
-                // but as the ball approaches we need to correct for Coriolis.
+            if is_intended_receiver && friendly_ball && ball_dist > 30.0 {
+                // Far ball: blend trajectory hold with active tracking.
+                // Hold less aggressively and only at truly long range
+                // (>30m), so Coriolis correction kicks in sooner.
                 let hold_target = match commit.nav_target {
                     Some(nt) => vadd(nt, commit.catch_offset),
                     None => player.p,
                 };
                 let track_target = bell_intercept(player, state);
-                // Smooth blend: at 60m+ hold 80% heading, at 15m hold 0%
-                let hold_w = ((ball_dist - 15.0) / 45.0).clamp(0.0, 0.8);
+                // Smooth blend: at 80m+ hold 50% heading, at 30m hold 0%
+                let hold_w = ((ball_dist - 30.0) / 50.0).clamp(0.0, 0.5);
                 vadd(vscale(hold_target, hold_w), vscale(track_target, 1.0 - hold_w))
             } else {
                 bell_intercept(player, state)
@@ -2310,12 +2484,26 @@ fn decide_throw(
     cache: &mut PlayerCommitCache,
     rng: &mut AiRng,
 ) {
-    // Minimum hold time: don't even evaluate throws until we've held for
-    // at least 60 ticks (0.25s). This gives teammates time to reposition
-    // after a catch before we throw again. Skip only if forced (stall/last).
+    // Minimum hold time: context-aware. Under pressure or continuing a pass
+    // chain, release faster; without pressure, hold longer to let receivers
+    // reposition. Skip entirely if forced (stall/last throw).
     let hold = cache.value.as_ref().unwrap().hold_ticks;
     let is_forced = hold > 540.0 || m.cast.throws_left as f64 <= 1.0;
-    if hold < 60.0 && !is_forced {
+    let opponents: Vec<&PlayerSim> =
+        state.players.iter().filter(|p| p.team != player.team).collect();
+    let nearest_opp = nearest_opponent_dist(player, &opponents);
+    // Pressure-adaptive: if a defender is within 18m, allow earlier release.
+    // If we just caught a pass (pass_chain is non-empty and we are last in
+    // it), we're continuing a chain and can throw sooner.
+    let continuing_chain = state.bell.pass_chain.len() >= 2;
+    let min_hold = if nearest_opp < 12.0 {
+        12.0 // urgent — dump in ~0.05s
+    } else if nearest_opp < 18.0 || continuing_chain {
+        30.0 // moderate pressure or relay — throw in ~0.125s
+    } else {
+        60.0 // safe — full reposition window
+    };
+    if hold < min_hold && !is_forced {
         let commit = cache.value.as_mut().unwrap();
         commit.throw_go = false;
         commit.throw_target_id = None;
@@ -2798,7 +2986,7 @@ mod tests {
         let mut cache = PlayerCommitCache::default();
         let out = compute_player_input(
             &player, &state, &m, &profile, &dir, Difficulty::Pro, &mut rng,
-            None, &mut cache, true, 30.0,
+            None, None, &mut cache, true, 30.0,
         );
         (out, cache.value.unwrap())
     }
@@ -2916,7 +3104,7 @@ mod tests {
         let mut cache = PlayerCommitCache::default();
         let out = compute_player_input(
             &player, &state, &m, &style_to_profile("balanced", "medium"),
-            &dir, Difficulty::Pro, &mut rng, None, &mut cache, true, 30.0,
+            &dir, Difficulty::Pro, &mut rng, None, None, &mut cache, true, 30.0,
         );
         assert!(
             out.fire_line_at.is_some(),
@@ -2951,7 +3139,7 @@ mod tests {
         let mut cache2 = PlayerCommitCache::default();
         let out2 = compute_player_input(
             &h2, &state, &m, &style_to_profile("balanced", "medium"),
-            &dir, Difficulty::Pro, &mut rng2, None, &mut cache2, true, 30.0,
+            &dir, Difficulty::Pro, &mut rng2, None, None, &mut cache2, true, 30.0,
         );
         assert!(
             cache2.value.as_ref().unwrap().dive_commit_tick < 0.0,
@@ -2976,7 +3164,7 @@ mod tests {
         let mut rng1 = AiRng::make(424242, 100, 0);
         let o = compute_player_input(
             &player, &state, &m, &profile, &dir, Difficulty::Pro, &mut rng1,
-            None, &mut cache, true, 30.0,
+            None, None, &mut cache, true, 30.0,
         );
         assert!(o.aim.x.is_finite() && o.aim.y.is_finite() && o.aim.z.is_finite());
         let c1 = cache.value.clone().expect("commit persists");
@@ -2985,7 +3173,7 @@ mod tests {
         let mut rng2 = AiRng::make(424242, 101, 0);
         compute_player_input(
             &player, &state, &m, &profile, &dir, Difficulty::Pro, &mut rng2,
-            None, &mut cache, false, 30.0,
+            None, None, &mut cache, false, 30.0,
         );
         let c2 = cache.value.clone().expect("commit persists");
         assert_eq!(c2.hold_ticks, 1.0, "second tick still holding → 1");

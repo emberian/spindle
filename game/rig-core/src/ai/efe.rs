@@ -435,8 +435,14 @@ pub fn pass_outcome_ev(
         return 0.0;
     }
 
-    // Roll the ball forward for the pass horizon.
-    let arrived = roll_forward(from_p, v0, omega, PASS_HORIZON, skin_r);
+    // Roll the ball forward for a generous flight horizon. 2.5s covers a
+    // ~55m throw at 22 m/s (the common case) while keeping prediction
+    // trustworthy. Longer passes use the eval_candidate in decide_throw
+    // which has its own 3.0s horizon.
+    let flight_time = 2.5_f64;
+
+    // Roll the ball forward for the flight horizon.
+    let arrived = roll_forward(from_p, v0, omega, flight_time, skin_r);
 
     // ─── Skin-wall penalty ───
     // If the ball ended up plastered against the skin, it's a bad throw.
@@ -450,11 +456,10 @@ pub fn pass_outcome_ev(
     let mut any_reachable = false;
     for &(tp, tv) in teammates {
         // Predict where the teammate will be at ball-arrival time.
-        let tm_future = tp.add(tv.scale(PASS_HORIZON));
-        // Can the teammate reach the arrived point within PASS_HORIZON?
+        let tm_future = tp.add(tv.scale(flight_time.min(2.0)));
+        // Can the teammate reach the arrived point within the flight time?
         let dist = tm_future.sub(arrived.p).len();
-        // Teammate has the flight time to close from their predicted pos.
-        let reachable = dist < CATCH_RADIUS + DEF_CLOSE_SPEED * PASS_HORIZON * 0.5;
+        let reachable = dist < CATCH_RADIUS + DEF_CLOSE_SPEED * flight_time * 0.5;
         if !reachable {
             continue;
         }
