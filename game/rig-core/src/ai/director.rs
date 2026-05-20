@@ -700,11 +700,21 @@ fn select_outlet_chain(
 
     // Primary: a catchable pass distance ahead (40-80m), capped so the
     // receiver stays within throw range rather than sprinting to half-field.
+    // Never pull the receiver backward — if they're already beyond the
+    // computed lead target, keep them at their current forward progress
+    // along the attack axis. This prevents OutletChain from pulling an
+    // advanced receiver back toward the carrier (which would cause the
+    // throw solver to aim behind them, missing the catch).
     let dist_to_ring = (carrier.p.x - a_ring_x).abs();
     let primary = pick_best_receiver(&teammates, opponents, a_sign);
     if let Some(prim) = primary {
         let lead = (dist_to_ring * 0.3).min(80.0).max(40.0);
-        let prim_x = carrier.p.x + a_sign * lead;
+        let prim_x_base = carrier.p.x + a_sign * lead;
+        let prim_x = if a_sign > 0.0 {
+            prim_x_base.max(prim.p.x)
+        } else {
+            prim_x_base.min(prim.p.x)
+        };
         let prim_target = clamp_inside_tube(Vec3::new(prim_x, 0.0, 20.0));
         play_assignments.insert(
             prim.id.clone(),

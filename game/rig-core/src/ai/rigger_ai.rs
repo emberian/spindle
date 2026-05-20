@@ -750,7 +750,13 @@ pub fn compute_player_input(
     };
 
     // Re-decide when: first time, Director refreshed, or a hard trigger fired.
-    let re_decide = cache.value.is_none() || director_refreshed || triggered;
+    // Also force a throw re-eval (ungated) when hold_ticks hits the chain
+    // min-hold boundary (30 ticks). This is an internal timer, not a
+    // reaction to external events, so it bypasses the reaction-latency gate.
+    let hold_boundary_fire = cache.value.as_ref()
+        .map(|c| have_bell_now && c.hold_ticks == 30.0)
+        .unwrap_or(false);
+    let re_decide = cache.value.is_none() || director_refreshed || triggered || hold_boundary_fire;
 
     if re_decide {
         if cache.value.is_none() {
@@ -800,7 +806,8 @@ pub fn compute_player_input(
 
         let gated = {
             let commit = cache.value.as_ref().unwrap();
-            tick < commit.react_gate_until_tick
+            // Internal timer fires (hold boundary) bypass the reaction gate.
+            !hold_boundary_fire && tick < commit.react_gate_until_tick
         };
 
         if !gated {
@@ -2617,8 +2624,8 @@ fn decide_throw(
         state.players.iter().filter(|p| p.team != player.team).collect();
     let nearest_opp = nearest_opponent_dist(player, &opponents);
     // Pressure-adaptive: if a defender is within 18m, allow earlier release.
-    // If we just caught a pass (pass_chain is non-empty and we are last in
-    // it), we're continuing a chain and can throw sooner.
+    // If we just caught a pass that has already been relayed (multiple
+    // throwers in the chain), we're deep in a chain and can throw sooner.
     let continuing_chain = state.bell.pass_chain.len() >= 2;
     let min_hold = if nearest_opp < 12.0 {
         12.0 // urgent — dump in ~0.05s
