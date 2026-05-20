@@ -1176,12 +1176,18 @@ pub fn compute_player_input(
                 .map(|p| p.team == player.team)
                 .unwrap_or(false);
 
-            if is_intended_receiver && friendly_ball && ball_dist > 30.0 {
-                // Maintain pre-throw trajectory for throw accuracy
-                match commit.nav_target {
+            if is_intended_receiver && friendly_ball && ball_dist > 15.0 {
+                // Blend between maintaining trajectory (far) and tracking
+                // the ball (near). The throw was aimed at where we're going,
+                // but as the ball approaches we need to correct for Coriolis.
+                let hold_target = match commit.nav_target {
                     Some(nt) => vadd(nt, commit.catch_offset),
                     None => player.p,
-                }
+                };
+                let track_target = bell_intercept(player, state);
+                // Smooth blend: at 60m+ hold 80% heading, at 15m hold 0%
+                let hold_w = ((ball_dist - 15.0) / 45.0).clamp(0.0, 0.8);
+                vadd(vscale(hold_target, hold_w), vscale(track_target, 1.0 - hold_w))
             } else {
                 bell_intercept(player, state)
             }
@@ -2304,6 +2310,19 @@ fn decide_throw(
     cache: &mut PlayerCommitCache,
     rng: &mut AiRng,
 ) {
+    // Minimum hold time: don't even evaluate throws until we've held for
+    // at least 60 ticks (0.25s). This gives teammates time to reposition
+    // after a catch before we throw again. Skip only if forced (stall/last).
+    let hold = cache.value.as_ref().unwrap().hold_ticks;
+    let is_forced = hold > 540.0 || m.cast.throws_left as f64 <= 1.0;
+    if hold < 60.0 && !is_forced {
+        let commit = cache.value.as_mut().unwrap();
+        commit.throw_go = false;
+        commit.throw_target_id = None;
+        commit.throw_dir = None;
+        return;
+    }
+
     let teammates: Vec<&PlayerSim> = state
         .players
         .iter()
@@ -2561,14 +2580,23 @@ fn decide_throw(
     let pressured = nearest_opponent_dist(player, &opponents) < ep.throw_pressure_dist;
     let force = stall > ep.throw_stall_force_ticks || m.cast.throws_left as f64 <= 1.0;
 
-    // Threshold: normal play requires a meaningful EV; pressure/stall
-    // lowers the bar so the carrier releases rather than getting stripped.
+    // HOLD PREFERENCE: don't throw untargeted flings unless forced. If the
+    // best candidate has no target_id (it's a fan throw, not a lead pass),
+    // require a higher threshold. This prevents throwing into empty space
+    // when no teammate is positioned to receive.
+    let best_is_targeted = best_candidate.as_ref()
+        .map(|c| c.target_id.is_some())
+        .unwrap_or(false);
+
     let ev_threshold = if force {
         0.0
     } else if pressured {
         0.15
+    } else if best_is_targeted {
+        0.30
     } else {
-        0.35
+        // Untargeted throw needs much higher bar (or just hold and carry)
+        0.55
     };
 
     let chosen = match best_candidate.clone() {
