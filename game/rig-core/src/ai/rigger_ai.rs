@@ -2599,6 +2599,31 @@ fn navigate_to(
         reel: commit.last_anchor_reel,
     });
 
+    // ── STUCK DETECTION: if we have a taut line but have stopped moving
+    // (arrived at the anchor with no momentum), release immediately so we
+    // can replan. Without this, players hang on spars indefinitely.
+    if let Some(line) = &player.line {
+        if line.taut {
+            let speed = vlen(player.v);
+            let to_anchor = vsub(line.anchor_pos, player.p);
+            let anchor_dist = vlen(to_anchor);
+            let to_target = vsub(target, player.p);
+            let target_dist = vlen(to_target);
+            if speed < 2.0 && anchor_dist < 8.0 && target_dist > 10.0 {
+                commit.last_anchor_pos = None;
+                commit.last_anchor_reel = -1;
+                let pushoff = target_dist > 1e-6;
+                return PartialInput {
+                    aim: Some(if target_dist > 1e-6 { vnorm(to_target) } else { Vec3::new(1.0, 0.0, 0.0) }),
+                    fire_line_at: Some(None),
+                    reel: Some(0),
+                    release: Some(true),
+                    pushoff: Some(pushoff),
+                };
+            }
+        }
+    }
+
     // ── GRAPPLE COMMITMENT: if we have an active attached line and our
     // swing is making progress toward the target, RIDE THE ARC instead
     // of re-planning every tick. Only for ACTIVE WINCH (reel=-1) — a
@@ -2671,6 +2696,49 @@ fn navigate_to(
         commit.last_anchor_reel = p.reel;
     } else {
         commit.last_anchor_pos = None;
+    }
+
+    // ANCHOR SWITCH: if we have an attached line but the planner picked a
+    // DIFFERENT anchor, we must release the current line first. Without this,
+    // the player stays stuck on the old anchor because the sim ignores
+    // fire_line_at when a line already exists.
+    if let Some(line) = &player.line {
+        if line.taut {
+            if let Some(p) = plan {
+                let to_planned = vsub(p.anchor_pos, line.anchor_pos);
+                let anchor_switched = vlen(to_planned) > 5.0;
+                if anchor_switched {
+                    // Check if the current line is counterproductive: we've
+                    // reached the anchor (close to it) or it's pulling us
+                    // away from target.
+                    let to_anchor = vsub(line.anchor_pos, player.p);
+                    let anchor_dist = vlen(to_anchor);
+                    let to_target = vsub(target, player.p);
+                    let target_dist = vlen(to_target);
+
+                    // Release if: arrived at current anchor, OR current
+                    // anchor is not helping reach target.
+                    let arrived_at_anchor = anchor_dist < 5.0;
+                    let anchor_unhelpful = if target_dist > 1e-6 && anchor_dist > 1e-6 {
+                        vdot(to_anchor, to_target) / (anchor_dist * target_dist) < 0.0
+                    } else {
+                        false
+                    };
+
+                    if arrived_at_anchor || anchor_unhelpful {
+                        commit.last_anchor_pos = None;
+                        commit.last_anchor_reel = -1;
+                        return PartialInput {
+                            aim: Some(vnorm(to_target)),
+                            fire_line_at: Some(None),
+                            reel: Some(0),
+                            release: Some(true),
+                            pushoff: Some(false),
+                        };
+                    }
+                }
+            }
+        }
     }
 
     // SWOOP RELEASE — release into free flight only when well-aimed.
