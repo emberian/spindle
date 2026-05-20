@@ -569,18 +569,26 @@ impl Env for RigEnv {
 
         // Build the AI inputs for the uncontrolled riggers.
         let snap = self.sim.snapshot();
-        let ai_sim = conv::snap_to_ai(&snap);
-        let ai_match = conv::msm_to_ai(self.mat.state());
-        let ai_frame = self.ai.tick(&ai_sim, &ai_match, &self.cfgs, self.seed);
-
-        // Fold in the external actions for controlled_ids (positional).
-        // Unknown ids are counted but skipped — deterministic, no panic.
         let controlled: std::collections::HashSet<&str> = self
             .scenario
             .controlled_ids
             .iter()
             .map(|s| s.as_str())
             .collect();
+
+        // Skip the expensive AiSystem tick entirely when all players are
+        // externally controlled (self-play mode). This removes the plan_grapple
+        // bottleneck from the training loop.
+        let ai_frame = if controlled.len() >= snap.players.len() {
+            ai::InputFrame { tick: snap.tick as f64, players: vec![] }
+        } else {
+            let ai_sim = conv::snap_to_ai(&snap);
+            let ai_match = conv::msm_to_ai(self.mat.state());
+            self.ai.tick(&ai_sim, &ai_match, &self.cfgs, self.seed)
+        };
+
+        // Fold in the external actions for controlled_ids (positional).
+        // Unknown ids are counted but skipped — deterministic, no panic.
         let mut unmatched = 0usize;
         let mut players: Vec<ai::PlayerInput> = ai_frame
             .players
