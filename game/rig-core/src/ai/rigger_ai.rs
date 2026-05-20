@@ -2052,28 +2052,20 @@ fn wmax_coverage_target(
     let is_shadow = assignment.is_shadow();
     let support_during_loose =
         bell_loose && assignment.job == Job::Support;
-    // When ball is loose, support players should converge toward the ball's
-    // predicted path (not spread away). Only spread when a diver is clearly
-    // on it (low gap). If the ball has been loose > 2s, everyone converges.
-    let ball_loose_ticks = if bell_loose {
-        (state.tick - state.bell.release_tick).max(0.0)
+    // PACK BEHAVIOR: stay near the ball. No spreading to cover volume —
+    // that looks like seven spectators. Instead: converge around the action
+    // with slight forward bias so the team flows WITH the ball.
+    let (w_crowd, w_redun, _w_resp, w_fwd) = if support_during_loose {
+        // Loose ball: converge hard, minimal spread
+        (0.4_f64, 0.3_f64, 2.0_f64, 1.0_f64)
     } else {
-        0.0
-    };
-    let loose_long = ball_loose_ticks > 480.0; // > 2 seconds
-    let (w_crowd, w_redun, _w_resp, w_fwd) = if support_during_loose && loose_long {
-        // Ball has been loose too long — collapse toward it, stop spreading
-        (0.5_f64, 0.5_f64, 2.5_f64, 0.8_f64)
-    } else if support_during_loose {
-        (1.5_f64, 1.2_f64, 1.2_f64, 1.2_f64)
-    } else {
-        (1.0_f64, 1.0_f64, 1.0_f64, 1.0_f64)
+        // Possession: mild crowd avoidance but stay close
+        (0.8_f64, 0.6_f64, 1.5_f64, 1.2_f64)
     };
     let bell_p = state.bell.p;
-    // Standoff radius shrinks as the ball stays loose (urgency grows)
-    let standoff_r = if loose_long { 10.0 } else { 18.0 };
-    let swarm_standoff_r: f64 = standoff_r;
-    let swarm_standoff_w: f64 = if loose_long { 1.0 } else { 2.5 };
+    // Minimal standoff — let players cluster near the ball
+    let swarm_standoff_r: f64 = 8.0;
+    let swarm_standoff_w: f64 = 0.5;
 
     // Defense (Zone) anchors nearer our own ring; offense (Support / role)
     // anchors around the bell and ahead toward the attack gate. A SHADOW
@@ -2093,12 +2085,11 @@ fn wmax_coverage_target(
     } else if defending {
         defend_ring_x(team) + sgn * ep.cov_defense_anchor_ahead
     } else if support_during_loose {
-        // Push the coverage fan AHEAD of the bell, down our advance axis,
-        // so support pre-positions for the catch→outlet→advance payoff
-        // instead of converging on the loose ball.
-        state.bell.p.x + sgn * (ep.cov_offense_anchor_ahead + 36.0)
+        // Loose: anchor ON the bell so the pack converges around it
+        state.bell.p.x + sgn * 10.0
     } else {
-        state.bell.p.x + sgn * ep.cov_offense_anchor_ahead
+        // Possession: anchor slightly ahead of the ball for flow
+        state.bell.p.x + sgn * 20.0
     };
 
     // Style gives each agent a STABLE distinct slice of the fan so the team
@@ -2122,10 +2113,10 @@ fn wmax_coverage_target(
         .map(|p| p.p)
         .collect();
 
-    // Candidate FAN: 3 depths along the attack axis × 4 cross angles ×
-    // 2 radii — broad regions spanning the tube, not points.
-    let depths = [-70.0_f64, 10.0, 90.0];
-    let radii = [14.0_f64 + s_rad * 8.0, 30.0 + s_rad * 10.0];
+    // Candidate FAN: 3 depths × 4 cross angles × 2 radii — tight pack
+    // around the ball, not spread across the whole tube.
+    let depths = [-15.0_f64, 10.0, 35.0];
+    let radii = [10.0_f64 + s_rad * 6.0, 20.0 + s_rad * 8.0];
     let mut best: Option<Vec3> = None;
     let mut best_score = f64::NEG_INFINITY;
 
@@ -2293,10 +2284,12 @@ fn role_target(
         let (center_x, center_y, center_z) = if let Some(pc) = play_center {
             (pc.x, pc.y, pc.z)
         } else {
-            let target_ring_x = director.attack_ring_x;
             let from_x = carrier.map(|c| c.p.x).unwrap_or(state.bell.p.x);
             let min_lead = director.attack_sign * 14.0;
-            let mut cx = from_x + (target_ring_x - from_x) * assignment.depth_slot;
+            // Cap receiver lead: 30-60m ahead of carrier (not 100m+).
+            // Keeps receivers within realistic passing range.
+            let max_lead = 30.0 + assignment.depth_slot * 30.0; // 30-60m
+            let mut cx = from_x + director.attack_sign * max_lead;
             if director.attack_sign > 0.0 {
                 cx = cx.max(from_x + min_lead);
             } else {
