@@ -104,7 +104,15 @@ addEventListener('keydown', (e: KeyboardEvent) => {
   legibToast.style.display = 'block';
   legibToastUntil = performance.now() + 1500;
 });
-const audio = new AudioEngine();
+// Audio disabled during development — re-enable by removing the null override.
+// @ts-ignore unused
+const _audioReal = new AudioEngine(); // eslint-disable-line
+const audio = {
+  start() {},
+  event(_e: string) {},
+  setBell(_c: number, _s: number, _p: number, _h: boolean) {},
+  setHush(_v: number) {},
+};
 const hud = new HUD(app);
 const onboarding = new Onboarding(app);
 
@@ -271,7 +279,7 @@ async function runMatch(
   );
   trail.clear();
   gcam.reset();
-  riggers.setViewScale(1);
+  riggers.setViewScale(3);
   input.setFaithRingX?.(GATE_X); // player (home) attacks the +x Faith ring
   if (!shownOnboarding) {
     shownOnboarding = true;
@@ -603,7 +611,7 @@ async function runWatch(
   );
   trail.clear();
   gcam.reset();
-  riggers.setViewScale(1);
+  riggers.setViewScale(3);
   ai.reset();
   pol?.reset();
   let ended = false;
@@ -990,7 +998,7 @@ async function runReplay(
   match.consume([{ type: 'foul_garrote', by: '__start__' }], sim.snapshot());
   trail.clear();
   gcam.reset();
-  riggers.setViewScale(1);
+  riggers.setViewScale(3);
   let fi = 0;
   let ended = false;
   let prevLoop = false;
