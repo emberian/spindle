@@ -30,6 +30,7 @@
 
 pub mod policy;
 pub mod attention;
+pub mod loco;
 
 #[cfg(not(target_arch = "wasm32"))]
 pub mod value;
@@ -49,6 +50,8 @@ pub use policy::{
 };
 
 pub use attention::{AttentionPolicy, ATTN_PARAM_W, N_ENTITIES, D_MODEL};
+
+pub use loco::{LocoPolicy, LocoObs, LocoPlayerState, LocoAction, LOCO_FEAT_W, LOCO_OUT_W, LOCO_PARAM_W};
 
 #[cfg(not(target_arch = "wasm32"))]
 pub use train::{judge, train_policy, JudgeSignals, TrainConfig, Trained};
