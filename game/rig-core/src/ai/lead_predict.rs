@@ -11,7 +11,7 @@
 //! solver's flight model is byte-identical to the simulation.
 
 use crate::math::Vec3;
-use crate::trajectory::{rk4_step, PointState};
+use crate::trajectory::{analytic, rk4_step, PointState};
 
 /// Result of a successful lead solve.
 #[derive(Clone, Copy, Debug)]
@@ -24,53 +24,34 @@ pub struct LeadResult {
     pub flight_time: f64,
 }
 
-// Integration step for lead solving (coarser than sim — good enough for AI).
+// Integration step for ball propagation in the Newton solver.
 const SOLVE_H: f64 = 1.0 / 30.0;
 const MAX_FLIGHT_STEPS: i64 = 300; // 10 s max
 const NEWTON_ITERS: i64 = 8;
 const CONVERGE_SQ: f64 = 0.25; // 0.5 m tolerance
 
-/// Pre-rolled Coriolis-correct receiver predictor.
+/// Analytical Coriolis-correct receiver predictor.
 ///
-/// Mirror of TS `makeReceiverPredictor`: pre-rolls a trajectory table at
-/// `SOLVE_H` granularity up to the MAX horizon, then linearly interpolates
-/// between samples. The receiver is integrated forward with the SAME
-/// trajectory predictor used for the bell (Coriolis-correct).
+/// Uses the closed-form `trajectory::analytic` solution to compute the exact
+/// receiver position at any time t. This eliminates step-size-dependent
+/// numerical drift that caused the 8.2m miss at 100m range when the old RK4
+/// table was built at SOLVE_H=1/30 but the sim integrates at 1/240.
 struct ReceiverPredictor {
     p0: Vec3,
-    table: Vec<Vec3>,
+    v0: Vec3,
+    omega: f64,
 }
 
 impl ReceiverPredictor {
     fn new(p0: Vec3, v0: Vec3, omega: f64) -> Self {
-        // Pre-roll a trajectory table at SOLVE_H granularity up to MAX horizon.
-        let mut table: Vec<Vec3> = Vec::with_capacity((MAX_FLIGHT_STEPS + 1) as usize);
-        table.push(p0);
-        let mut s = PointState { p: p0, v: v0 };
-        for _i in 1..=MAX_FLIGHT_STEPS {
-            s = rk4_step(s, omega, SOLVE_H);
-            table.push(s.p);
-        }
-        ReceiverPredictor { p0, table }
+        ReceiverPredictor { p0, v0, omega }
     }
 
     fn predict(&self, t: f64) -> Vec3 {
         if t <= 0.0 {
             return self.p0;
         }
-        let f = t / SOLVE_H;
-        let i = f.floor() as i64;
-        if i >= MAX_FLIGHT_STEPS {
-            return self.table[MAX_FLIGHT_STEPS as usize];
-        }
-        let frac = f - i as f64;
-        let a = self.table[i as usize];
-        let b = self.table[(i + 1) as usize];
-        Vec3::new(
-            a.x + (b.x - a.x) * frac,
-            a.y + (b.y - a.y) * frac,
-            a.z + (b.z - a.z) * frac,
-        )
+        analytic(self.p0, self.v0, self.omega, t)
     }
 }
 
@@ -100,7 +81,6 @@ pub fn solve_lead_velocity(
     let mut best_result: Option<LeadResult> = None;
 
     for _iter in 0..NEWTON_ITERS {
-        // Build direction from throw_pos to aim_pt.
         let raw = aim_pt.sub(throw_pos);
         let dist = raw.len();
         if dist < 0.01 {
@@ -109,15 +89,10 @@ pub fn solve_lead_velocity(
         let dir = raw.norm();
         let v0: Vec3 = dir.scale(throw_speed);
 
-        // Estimate flight time: dist / speed (straight line, fast enough).
         let est_time = dist / throw_speed;
         let steps = MAX_FLIGHT_STEPS.min((est_time / SOLVE_H).ceil() as i64 + 2);
 
-        // Find the tick where the bell is closest to the predicted intercept.
-        let mut s = PointState {
-            p: throw_pos,
-            v: v0,
-        };
+        let mut s = PointState { p: throw_pos, v: v0 };
         let mut closest_dist: f64 = f64::INFINITY;
         let mut closest_pos: Vec3 = throw_pos;
         let mut closest_time: f64 = 0.0;
@@ -126,21 +101,18 @@ pub fn solve_lead_velocity(
             s = rk4_step(s, omega, SOLVE_H);
             let t = step as f64 * SOLVE_H;
             let rcv = predict_receiver.predict(t);
-            let err = s.p.sub(rcv);
-            let d = err.len();
+            let d = s.p.sub(rcv).len();
             if d < closest_dist {
                 closest_dist = d;
                 closest_pos = s.p;
                 closest_time = t;
             }
             if d < CONVERGE_SQ.sqrt() {
-                // Close enough — accept.
                 if d < best_error {
                     best_error = d;
-                    let intercept = predict_receiver.predict(t);
                     best_result = Some(LeadResult {
                         v0,
-                        intercept,
+                        intercept: rcv,
                         flight_time: t,
                     });
                 }
@@ -152,7 +124,6 @@ pub fn solve_lead_velocity(
             break;
         }
 
-        // Record best regardless of convergence.
         if closest_dist < best_error {
             best_error = closest_dist;
             let intercept = predict_receiver.predict(closest_time);
@@ -163,7 +134,6 @@ pub fn solve_lead_velocity(
             });
         }
 
-        // Newton correction: shift aim_pt opposite to position error.
         let rcv_at_close = predict_receiver.predict(closest_time);
         let err_vec = closest_pos.sub(rcv_at_close);
         aim_pt = aim_pt.sub(err_vec.scale(0.65));
