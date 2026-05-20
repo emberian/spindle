@@ -375,6 +375,19 @@ pub(crate) fn is_dive_committer(
     pack[0].id == player.id
 }
 
+/// Urgency second-diver: true if this player is the second-closest on
+/// their team to the ball. Used when the ball has been loose too long.
+fn is_second_closest_to_bell(player: &PlayerSim, state: &SimState) -> bool {
+    let mut team_dists: Vec<(&str, f64)> = state
+        .players
+        .iter()
+        .filter(|p| p.team == player.team)
+        .map(|p| (p.id.as_str(), vlen(vsub(state.bell.p, p.p))))
+        .collect();
+    team_dists.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+    team_dists.get(1).map(|(id, _)| *id == player.id).unwrap_or(false)
+}
+
 /// PART C — DEFENSIVE CONTEST. The single committed contester of an
 /// OPPONENT-controlled bell, gated by the Director's `contest_commit`.
 ///
@@ -997,8 +1010,21 @@ pub fn compute_player_input(
         let still_takeable = bell_loose
             && state.bell.thrown_by.as_deref() != Some(player.id.as_str())
             && vlen(to_bell) < 85.0;
+        // When the ball has been loose > 2s, allow a SECOND diver (the
+        // primary clearly failed or the ball is bouncing unpredictably).
+        let loose_ticks = if bell_loose {
+            (state.tick - state.bell.release_tick).max(0.0)
+        } else {
+            0.0
+        };
+        let urgency_second_dive = bell_loose && loose_ticks > 480.0 && vlen(to_bell) < 50.0;
+
         let commit_dive = if already && still_takeable {
             true
+        } else if urgency_second_dive {
+            // Under urgency, the two closest players both dive
+            is_dive_committer(player, state, director, &cur_assignment, active_pass_target)
+                || is_second_closest_to_bell(player, state)
         } else {
             is_dive_committer(
                 player,
@@ -2026,22 +2052,28 @@ fn wmax_coverage_target(
     let is_shadow = assignment.is_shadow();
     let support_during_loose =
         bell_loose && assignment.job == Job::Support;
-    // Role weight multipliers on the EXISTING params (1.0 = unchanged).
-    // SUPPORT during a loose bell: heavier team-spread (don't clump),
-    // lighter raw bell-responsiveness (the recover unit owns the ball),
-    // stronger forward flow so the spread is a useful advancing shape.
-    let (w_crowd, w_redun, _w_resp, w_fwd) = if support_during_loose {
-        (2.2_f64, 1.6_f64, 0.45_f64, 1.5_f64)
+    // When ball is loose, support players should converge toward the ball's
+    // predicted path (not spread away). Only spread when a diver is clearly
+    // on it (low gap). If the ball has been loose > 2s, everyone converges.
+    let ball_loose_ticks = if bell_loose {
+        (state.tick - state.bell.release_tick).max(0.0)
+    } else {
+        0.0
+    };
+    let loose_long = ball_loose_ticks > 480.0; // > 2 seconds
+    let (w_crowd, w_redun, _w_resp, w_fwd) = if support_during_loose && loose_long {
+        // Ball has been loose too long — collapse toward it, stop spreading
+        (0.5_f64, 0.5_f64, 2.5_f64, 0.8_f64)
+    } else if support_during_loose {
+        (1.5_f64, 1.2_f64, 1.2_f64, 1.2_f64)
     } else {
         (1.0_f64, 1.0_f64, 1.0_f64, 1.0_f64)
     };
-    // Anti-swarm bell stand-off: a deterministic geometric penalty that
-    // grows as a candidate nears the live bell point while the recover
-    // unit owns it — the explicit "stop gawking on the ball" term. Pure
-    // geometry over the bell position; no rng, order-free.
     let bell_p = state.bell.p;
-    const SWARM_STANDOFF_R: f64 = 26.0; // m — recover unit's exclusive bubble
-    const SWARM_STANDOFF_W: f64 = 4.0; // EFE weight of intruding it
+    // Standoff radius shrinks as the ball stays loose (urgency grows)
+    let standoff_r = if loose_long { 10.0 } else { 18.0 };
+    let swarm_standoff_r: f64 = standoff_r;
+    let swarm_standoff_w: f64 = if loose_long { 1.0 } else { 2.5 };
 
     // Defense (Zone) anchors nearer our own ring; offense (Support / role)
     // anchors around the bell and ahead toward the attack gate. A SHADOW
@@ -2137,9 +2169,9 @@ fn wmax_coverage_target(
                     let db = (cand.x - bell_p.x)
                         .hypot(cand.y - bell_p.y)
                         .hypot(cand.z - bell_p.z);
-                    if db < SWARM_STANDOFF_R {
-                        let t = 1.0 - db / SWARM_STANDOFF_R;
-                        SWARM_STANDOFF_W * t * t
+                    if db < swarm_standoff_r {
+                        let t = 1.0 - db / swarm_standoff_r;
+                        swarm_standoff_w * t * t
                     } else {
                         0.0
                     }
@@ -2641,9 +2673,10 @@ fn navigate_to(
         commit.last_anchor_pos = None;
     }
 
-    // SWOOP RELEASE — aggressive: release into swing arcs early and let
-    // Coriolis curve carry us to the target. Don't require near-perfect
-    // alignment before releasing.
+    // SWOOP RELEASE — release into free flight only when well-aimed.
+    // Previous thresholds (0.35 align, 0.15 momentum) let players release
+    // nearly perpendicular to their target, producing Coriolis drift arcs
+    // that look aimless. Tightened so releases are visibly purposeful.
     if let Some(line) = &player.line {
         if line.taut {
             if let Some(p) = plan {
@@ -2654,14 +2687,10 @@ fn navigate_to(
                     if dl > 1e-6 {
                         let align = vdot(player.v, to_t) / (sp.max(1e-6) * dl);
 
-                        // Release if we have reasonable speed and are heading
-                        // in a broadly correct direction.
-                        let speed_ok = sp > 5.0; // was SWOOP_MIN_V (8.0)
-                        let align_ok = align > 0.35; // was SWOOP_ALIGN (0.6)
+                        let speed_ok = sp > 8.0;
+                        let align_ok = align > 0.55;
 
-                        // Also release if we have HIGH speed even with moderate
-                        // alignment — momentum is king, don't waste a good swing.
-                        let momentum_release = sp > 12.0 && align > 0.15;
+                        let momentum_release = sp > 18.0 && align > 0.4;
 
                         if (speed_ok && align_ok) || momentum_release {
                             commit.last_anchor_pos = None;
@@ -2733,16 +2762,12 @@ fn decide_throw(
     // If we just caught a pass that has already been relayed (multiple
     // throwers in the chain), we're deep in a chain and can throw sooner.
     let continuing_chain = state.bell.pass_chain.len() >= 2;
-    let fresh_possession = state.bell.pass_chain.is_empty()
-        && (state.tick - state.bell.release_tick) < 60.0;
-    let min_hold = if fresh_possession && nearest_opp > 12.0 {
-        18.0 // fast break: quick outlet before defense sets
-    } else if nearest_opp < 12.0 {
-        12.0 // urgent — dump in ~0.05s
-    } else if nearest_opp < 18.0 || continuing_chain {
-        30.0 // moderate pressure or relay — throw in ~0.125s
+    let min_hold = if nearest_opp < 12.0 {
+        24.0 // urgent — dump in ~0.1s
+    } else if nearest_opp < 18.0 {
+        48.0 // moderate pressure — throw in ~0.2s
     } else {
-        60.0 // safe — full reposition window
+        72.0 // safe — let receivers reposition (~0.3s)
     };
     if hold < min_hold && !is_forced {
         let commit = cache.value.as_mut().unwrap();
@@ -2937,15 +2962,6 @@ fn decide_throw(
                     bias -= 0.15;
                 }
             }
-            if fresh_possession {
-                let tm_fp = forward_progress(team, tm.p.x);
-                let gain = tm_fp - my_fp;
-                if gain > 30.0 {
-                    bias += 0.30;
-                } else if gain > 15.0 {
-                    bias += 0.15;
-                }
-            }
             candidates.push(ThrowCandidate {
                 v0: lead.v0,
                 target_id: Some(tm.id.clone()),
@@ -3042,12 +3058,11 @@ fn decide_throw(
     let ev_threshold = if force {
         0.0
     } else if pressured {
-        0.15
+        0.20
     } else if best_is_targeted {
-        0.30
+        0.35
     } else {
-        // Untargeted throw needs much higher bar (or just hold and carry)
-        0.55
+        0.60
     };
 
     let chosen = match best_candidate.clone() {

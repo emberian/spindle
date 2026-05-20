@@ -2158,16 +2158,17 @@ pub fn plan_grapple(
         return None;
     }
 
-    // ── Soar phase: don't re-anchor when already flying well toward target ──
-    // If the player has no active line AND has good speed AND is heading broadly
-    // toward the target, return None (coast). This produces free-flight arcs
-    // instead of constant short winches. Re-anchor once speed drops, alignment
-    // drifts, or we get close enough to need fine control.
+    // ── Soar phase: coast only when genuinely well-aimed at the target ──
+    // Tighter thresholds than before: omega=0.32 means Coriolis curves
+    // trajectories fast (7.7 m/s² at 12 m/s). A loose alignment of 0.3
+    // (~73°) degrades to perpendicular within ~2s, producing the aimless
+    // drift that makes the game look unintentional. Now require 0.6 (53°)
+    // and higher speed so the soar is clearly purposeful and short.
     let speed = vel.len();
-    if sticky.is_none() && speed > 12.0 && direct_dist > 15.0 {
+    if sticky.is_none() && speed > 16.0 && direct_dist > 20.0 {
         let to_target = target.sub(pos);
         let align = vel.dot(to_target) / (speed * direct_dist);
-        if align > 0.3 {
+        if align > 0.6 {
             return None;
         }
     }
