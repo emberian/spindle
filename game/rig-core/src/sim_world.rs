@@ -202,11 +202,11 @@ pub struct Snapshot {
 // ── Internal player record ────────────────────────────────────────────────────
 
 #[derive(Clone)]
-struct WorldPlayer {
-    id: String,
-    team: TeamSide,
-    role: RiggerRole,
-    body: PlayerBody,
+pub(crate) struct WorldPlayer {
+    pub(crate) id: String,
+    pub(crate) team: TeamSide,
+    pub(crate) role: RiggerRole,
+    pub(crate) body: PlayerBody,
 }
 
 // ── SimWorld ──────────────────────────────────────────────────────────────────
@@ -237,7 +237,7 @@ pub struct SimWorld {
     /// launch/grip/catch. Not a physics quantity (no p/v) so it does not
     /// enter hash_snapshot; it only gates a one-shot event, deterministically.
     contest_emitted: bool,
-    players: Vec<WorldPlayer>,
+    pub(crate) players: Vec<WorldPlayer>,
     loop_tracker: LoopTracker,
     rng: Rng,
     events: Vec<SimEvent>,

@@ -33,6 +33,12 @@ pub mod attention;
 pub mod loco;
 
 #[cfg(not(target_arch = "wasm32"))]
+pub mod loco_env;
+
+#[cfg(not(target_arch = "wasm32"))]
+pub mod loco_train;
+
+#[cfg(not(target_arch = "wasm32"))]
 pub mod value;
 
 #[cfg(not(target_arch = "wasm32"))]
