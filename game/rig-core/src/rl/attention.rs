@@ -408,12 +408,35 @@ impl AttentionPolicy {
     /// Decode raw outputs into `ai::PlayerInput` — reuses the same decode
     /// logic as the MLP policy (aim normalize, reel argmax, fire gate,
     /// relational pass head, etc.).
+    ///
+    /// HIERARCHICAL INTENTS: when `out[INTENT_GATE_IDX] > 0`, the argmax
+    /// over `out[INTENT_LOGITS_BASE..INTENT_LOGITS_BASE+N_INTENTS]` selects
+    /// a high-level tactical intent. The intent executor calls proven
+    /// baseline controller geometry (lead solver, gate solver, planner) to
+    /// produce the full `PlayerInput`. If the executor returns `None`
+    /// (solver failure, missing data), the low-level heads are used.
     pub fn decode(
         &self,
         out: &[f64; OUT_W],
         obs: &Observation,
         self_id: &str,
     ) -> ai::PlayerInput {
+        use super::policy::{INTENT_GATE_IDX, INTENT_LOGITS_BASE, N_INTENTS};
+
+        // ── Intent gate check ───────────────────────────────────────────
+        if out[INTENT_GATE_IDX] > 0.0 {
+            let mut best = 0usize;
+            for i in 1..N_INTENTS {
+                if out[INTENT_LOGITS_BASE + i] > out[INTENT_LOGITS_BASE + best] {
+                    best = i;
+                }
+            }
+            if let Some(action) = execute_intent(best, obs, self_id) {
+                return action;
+            }
+        }
+
+        // ── Low-level decode (unchanged) ────────────────────────────────
         let mut a = ai::PlayerInput::idle(self_id);
         let me = obs.players.iter().find(|p| p.id == self_id);
         let self_p = me.map(|p| p.p).unwrap_or(Vec3::new(0.0, 0.0, 0.0));
@@ -496,6 +519,284 @@ impl AttentionPolicy {
         let out = self.forward(obs, self_id);
         self.decode(&out, obs, self_id)
     }
+}
+
+// ── Hierarchical intent execution ─────────────────────────────────────────
+//
+// Pure, deterministic, wasm-safe intent executors. Each takes the obs and
+// self_id, uses existing geometry solvers to produce a complete PlayerInput.
+// Returns None on solver failure → the low-level heads are used instead.
+
+const INTENT_PASS_SPEED: f64 = VEL_SCALE; // 26 m/s
+
+fn execute_intent(
+    intent_idx: usize,
+    obs: &Observation,
+    self_id: &str,
+) -> Option<ai::PlayerInput> {
+    match intent_idx {
+        0 => intent_nav_advance(obs, self_id),
+        1 => intent_pass_gate_receiver(obs, self_id),
+        2 => intent_pass_best(obs, self_id),
+        3 => intent_catch_commit(obs, self_id),
+        4 => intent_receive_stage(obs, self_id),
+        5 => intent_mark_nearest(obs, self_id),
+        6 => intent_spread_coverage(obs, self_id),
+        _ => None,
+    }
+}
+
+/// Reconstruct a minimal planner SimState from the observation.
+fn obs_to_planner_state(obs: &Observation) -> crate::planner::SimState {
+    crate::planner::SimState {
+        omega: tuning::OMEGA,
+        tick: obs.tick as i64,
+        players: obs
+            .players
+            .iter()
+            .map(|p| crate::planner::PlayerSim {
+                id: p.id.clone(),
+                team: p.team as i32,
+                p: p.p,
+                v: p.v,
+            })
+            .collect(),
+    }
+}
+
+/// Build a PlayerInput by navigating toward a target using the grapple planner.
+fn navigate_intent(
+    obs: &Observation,
+    self_id: &str,
+    target: Vec3,
+    catch_intent: bool,
+) -> Option<ai::PlayerInput> {
+    let me = obs.players.iter().find(|p| p.id == self_id)?;
+    let state = obs_to_planner_state(obs);
+    let player = crate::planner::PlayerSim {
+        id: self_id.to_string(),
+        team: me.team as i32,
+        p: me.p,
+        v: me.v,
+    };
+    let plan = crate::planner::plan_grapple(&player, target, &state, true, None, 0)?;
+    let aim = norm3(Vec3::new(
+        plan.anchor_pos.x - me.p.x,
+        plan.anchor_pos.y - me.p.y,
+        plan.anchor_pos.z - me.p.z,
+    ));
+    Some(ai::PlayerInput {
+        id: self_id.to_string(),
+        aim,
+        fire_line_at: Some(plan.anchor_pos),
+        reel: plan.reel,
+        release: false,
+        pushoff: false,
+        throw_charge: 0.0,
+        throw_released: false,
+        throw_spin: 0.0,
+        thrumbler: Vec3::new(0.0, 0.0, 0.0),
+        catch_intent,
+    })
+}
+
+/// Intent 0: Navigate forward toward the attack ring (carrier behavior).
+fn intent_nav_advance(obs: &Observation, self_id: &str) -> Option<ai::PlayerInput> {
+    let me = obs.players.iter().find(|p| p.id == self_id)?;
+    let sgn = obs.attack_sign;
+    let step = 110.0_f64.min((obs.gate_plane_x - me.p.x).abs() + 40.0);
+    let ahead_x = me.p.x + sgn * step;
+    let r = (me.p.y * me.p.y + me.p.z * me.p.z).sqrt();
+    let target_r = r.min(6.0);
+    let yz_len = if r > 1e-6 { r } else { 1.0 };
+    let target = Vec3::new(
+        ahead_x,
+        (me.p.y / yz_len) * target_r,
+        (me.p.z / yz_len) * target_r,
+    );
+    navigate_intent(obs, self_id, target, false)
+}
+
+/// Intent 1: Execute a gate-clearing throw using the closed-form gate solver.
+fn intent_pass_gate_receiver(obs: &Observation, self_id: &str) -> Option<ai::PlayerInput> {
+    let me = obs.players.iter().find(|p| p.id == self_id)?;
+    if obs.bell_held_by.as_deref() != Some(self_id) {
+        return None;
+    }
+    let team = if obs.attack_sign > 0.0 {
+        crate::ai::types::TeamSide::Home
+    } else {
+        crate::ai::types::TeamSide::Away
+    };
+    let gs = crate::ai::gate_solve::solve_gate_throw(
+        me.p,
+        team,
+        tuning::OMEGA,
+        24.0,
+        0.5,
+        me.v,
+    )?;
+    let aim = norm3(gs.throw_vec);
+    let charge = ((gs.release_speed - crate::ai::gate_solve::THROW_MIN_SPEED)
+        / (crate::ai::gate_solve::THROW_MAX_SPEED - crate::ai::gate_solve::THROW_MIN_SPEED))
+        .clamp(0.0, 1.0);
+    Some(ai::PlayerInput {
+        id: self_id.to_string(),
+        aim,
+        fire_line_at: None,
+        reel: 0,
+        release: false,
+        pushoff: false,
+        throw_charge: charge,
+        throw_released: true,
+        throw_spin: -0.5,
+        thrumbler: Vec3::new(0.0, 0.0, 0.0),
+        catch_intent: false,
+    })
+}
+
+/// Intent 2: Execute an advancing pass to the best-positioned teammate.
+fn intent_pass_best(obs: &Observation, self_id: &str) -> Option<ai::PlayerInput> {
+    let me = obs.players.iter().find(|p| p.id == self_id)?;
+    if obs.bell_held_by.as_deref() != Some(self_id) {
+        return None;
+    }
+    let sgn = obs.attack_sign;
+    let (mates, _) = sorted_others(obs, me, self_id);
+    // Pick the furthest-forward teammate.
+    let target = mates
+        .iter()
+        .max_by(|a, b| {
+            let fa = a.p.x * sgn;
+            let fb = b.p.x * sgn;
+            fa.partial_cmp(&fb).unwrap_or(std::cmp::Ordering::Equal)
+        })?;
+    let lr = crate::ai::lead_predict::solve_lead_velocity(
+        me.p,
+        INTENT_PASS_SPEED,
+        target.p,
+        target.v,
+        tuning::OMEGA,
+    )?;
+    let aim = norm3(Vec3::new(
+        lr.intercept.x - me.p.x,
+        lr.intercept.y - me.p.y,
+        lr.intercept.z - me.p.z,
+    ));
+    let dist = ((lr.intercept.x - me.p.x).powi(2)
+        + (lr.intercept.y - me.p.y).powi(2)
+        + (lr.intercept.z - me.p.z).powi(2))
+    .sqrt();
+    let charge = ((dist / lr.flight_time - crate::ai::gate_solve::THROW_MIN_SPEED)
+        / (crate::ai::gate_solve::THROW_MAX_SPEED - crate::ai::gate_solve::THROW_MIN_SPEED))
+        .clamp(0.3, 1.0);
+    Some(ai::PlayerInput {
+        id: self_id.to_string(),
+        aim,
+        fire_line_at: None,
+        reel: 0,
+        release: false,
+        pushoff: false,
+        throw_charge: charge,
+        throw_released: true,
+        throw_spin: 0.0,
+        thrumbler: Vec3::new(0.0, 0.0, 0.0),
+        catch_intent: false,
+    })
+}
+
+/// Intent 3: Dive toward the bell's predicted intercept point.
+fn intent_catch_commit(obs: &Observation, self_id: &str) -> Option<ai::PlayerInput> {
+    let me = obs.players.iter().find(|p| p.id == self_id)?;
+    if obs.bell_held_by.is_some() {
+        return None;
+    }
+    // Predict bell intercept using the lead solver in reverse (where will
+    // the ball be when I can reach it?). Simple: aim at bell_p + lead based
+    // on bell velocity, capped horizon.
+    let gap = ((obs.bell_p.x - me.p.x).powi(2)
+        + (obs.bell_p.y - me.p.y).powi(2)
+        + (obs.bell_p.z - me.p.z).powi(2))
+    .sqrt();
+    let close_v = 24.0;
+    let t_lead = (gap / close_v).max(0.1).min(2.5);
+    let intercept = Vec3::new(
+        obs.bell_p.x + obs.bell_v.x * t_lead,
+        obs.bell_p.y + obs.bell_v.y * t_lead,
+        obs.bell_p.z + obs.bell_v.z * t_lead,
+    );
+    navigate_intent(obs, self_id, intercept, true)
+}
+
+/// Intent 4: Hold the gate-receiver staging position.
+fn intent_receive_stage(obs: &Observation, self_id: &str) -> Option<ai::PlayerInput> {
+    let sgn = obs.attack_sign;
+    let gate_lead = 22.0;
+    let stage_x = obs.gate_plane_x + sgn * gate_lead;
+    let r = 5.0;
+    let ang = std::f64::consts::PI * 0.5;
+    let target = Vec3::new(stage_x, r * ang.cos(), r * ang.sin());
+    navigate_intent(obs, self_id, target, false)
+}
+
+/// Intent 5: Track the nearest opponent (defensive positioning).
+fn intent_mark_nearest(obs: &Observation, self_id: &str) -> Option<ai::PlayerInput> {
+    let me = obs.players.iter().find(|p| p.id == self_id)?;
+    let (_, opps) = sorted_others(obs, me, self_id);
+    let opp = opps.first()?;
+    // Position between the opponent and the bell.
+    let to_bell = Vec3::new(
+        obs.bell_p.x - opp.p.x,
+        obs.bell_p.y - opp.p.y,
+        obs.bell_p.z - opp.p.z,
+    );
+    let d = (to_bell.x * to_bell.x + to_bell.y * to_bell.y + to_bell.z * to_bell.z).sqrt();
+    let standoff = 6.0;
+    let target = if d > 1e-6 {
+        Vec3::new(
+            opp.p.x + to_bell.x / d * standoff,
+            opp.p.y + to_bell.y / d * standoff,
+            opp.p.z + to_bell.z / d * standoff,
+        )
+    } else {
+        opp.p
+    };
+    navigate_intent(obs, self_id, target, false)
+}
+
+/// Intent 6: Spread into an anti-clump coverage position.
+fn intent_spread_coverage(obs: &Observation, self_id: &str) -> Option<ai::PlayerInput> {
+    let me = obs.players.iter().find(|p| p.id == self_id)?;
+    let (mates, _) = sorted_others(obs, me, self_id);
+    // Compute teammate centroid.
+    let n = mates.len().max(1) as f64;
+    let cx = mates.iter().map(|m| m.p.x).sum::<f64>() / n;
+    let cy = mates.iter().map(|m| m.p.y).sum::<f64>() / n;
+    let cz = mates.iter().map(|m| m.p.z).sum::<f64>() / n;
+    // Move away from centroid, biased forward along attack axis.
+    let sgn = obs.attack_sign;
+    let away = Vec3::new(me.p.x - cx, me.p.y - cy, me.p.z - cz);
+    let away_len = (away.x * away.x + away.y * away.y + away.z * away.z).sqrt();
+    let spread_dist = 40.0;
+    let target = if away_len > 1e-6 {
+        Vec3::new(
+            me.p.x + away.x / away_len * spread_dist * 0.5 + sgn * 30.0,
+            me.p.y + away.y / away_len * spread_dist,
+            me.p.z + away.z / away_len * spread_dist,
+        )
+    } else {
+        Vec3::new(me.p.x + sgn * 60.0, me.p.y + 20.0, me.p.z)
+    };
+    // Clamp inside the cylinder skin.
+    let skin_r = tuning::R - 2.0;
+    let rho = (target.y * target.y + target.z * target.z).sqrt();
+    let target = if rho > skin_r && rho > 1e-6 {
+        let s = skin_r / rho;
+        Vec3::new(target.x, target.y * s, target.z * s)
+    } else {
+        target
+    };
+    navigate_intent(obs, self_id, target, false)
 }
 
 // ── Weight (de)serialization ───────────────────────────────────────────────

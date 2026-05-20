@@ -73,20 +73,20 @@
 
 <section>
   <h2>Raise the action level</h2>
-  <p>Raw aim/reel/fire controls are expressive, but they make the learner discover basic piloting and team tactics at the same time. That is a slow way to get an interesting sport. A better split is tactical intent from the learner, low-level execution from controllers.</p>
+  <p>Raw aim/reel/fire controls are expressive, but they make the learner discover basic piloting and team tactics at the same time. That is a slow way to get an interesting sport. A better split is tactical intent from the learner, low-level execution from controllers. This is now implemented: the attention policy has a gated <b>hierarchical intent layer</b> alongside the raw action heads.</p>
 
   <div class="grid">
     <div class="card">
       <h3>Policy chooses intent</h3>
-      <p>Carry, receive, lead-pass to space, mark, screen, recover, pressure, or hold shape.</p>
+      <p>Seven tactical intents: advance, gate-pass, lead-pass, catch-commit, receive-stage, mark, and spread-coverage. Selected by a categorical head; executed by proven geometry solvers.</p>
     </div>
     <div class="card">
       <h3>Controller executes motion</h3>
-      <p>The existing grappling controller can turn intent into line targets, reel choices, catch posture, and throws.</p>
+      <p>The gate solver, lead predictor, grapple planner, and intercept predictor turn intent into exact PlayerInput. The policy does not need to rediscover physics.</p>
     </div>
     <div class="card">
       <h3>End-to-end remains possible</h3>
-      <p>Once tactics work, lower-level residual actions can let the learner improve on the controller instead of being trapped by it.</p>
+      <p>The intent gate is a learned sigmoid: when it fires, intents drive; when it does not, the raw 22-head action space remains available for novel maneuvers the controller cannot express.</p>
     </div>
   </div>
 

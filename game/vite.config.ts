@@ -1,4 +1,5 @@
 import { defineConfig } from 'vite';
+import { resolve } from 'path';
 
 // GitHub Pages serves this project under https://emberian.github.io/spindle/
 // so base must be the absolute project subpath for hashed assets to resolve.
@@ -7,7 +8,16 @@ import { defineConfig } from 'vite';
 // which Vite fingerprints as an asset (assetsInclude).
 export default defineConfig({
   base: '/spindle/',
-  build: { target: 'esnext', outDir: 'dist' },
+  build: {
+    target: 'esnext',
+    outDir: 'dist',
+    rollupOptions: {
+      input: {
+        main: resolve(__dirname, 'index.html'),
+        drill: resolve(__dirname, 'drill.html'),
+      },
+    },
+  },
   assetsInclude: ['**/*.wasm'],
   server: { fs: { allow: ['..'] } },
 });

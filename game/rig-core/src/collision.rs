@@ -92,10 +92,11 @@ pub fn try_catch_ex(
     let rel_speed = rel.len();
     // Closing speed: positive means the bell is approaching the player.
     let closing = if gap < 1e-6 { 1.0 } else { -rel.dot(d.norm()) };
-    // A committed catcher can still claim a bell that is only drifting
-    // slowly away (they reach back for it); reflex catch cannot.
-    let closing_floor = if committed { -3.0 } else { -0.5 };
-    if closing < closing_floor {
+    // A committed catcher (tether-claw dive) is deliberately putting
+    // themselves in the bell's path — closing direction is irrelevant; the
+    // rel_speed check is the real skill gate. Reflex catch needs the ball
+    // approaching.
+    if !committed && closing < -0.5 {
         return CatchResult::Miss;
     }
     if rel_speed <= absorb {

@@ -878,7 +878,7 @@ function openSpectate(): void {
   spectate.show(TEAMS, {
     onWatch: (h, a, src) => startWatch(h, a, src),
     onWatchBracket: (src) => startWatchBracket(src),
-    onBack: () => landing.show(() => title.show(enterJump), openSpectate, openReplay),
+    onBack: () => landing.show(() => title.show(enterJump), openSpectate, openReplay, quickWatch),
   });
 }
 
@@ -1104,9 +1104,16 @@ function openReplay(): void {
       });
     },
     onDelete: () => { /* ReplayScreen removes from store + refreshes itself */ },
-    onBack: () => landing.show(() => title.show(enterJump), openSpectate, openReplay),
+    onBack: () => landing.show(() => title.show(enterJump), openSpectate, openReplay, quickWatch),
   });
 }
 
-landing.show(() => title.show(enterJump), openSpectate, openReplay);
+function quickWatch(): void {
+  const home = TEAMS[(Math.random() * TEAMS.length) | 0];
+  let away = TEAMS[(Math.random() * TEAMS.length) | 0];
+  while (away.id === home.id) away = TEAMS[(Math.random() * TEAMS.length) | 0];
+  startWatch(home, away, { home: 'baseline', away: 'baseline' });
+}
+
+landing.show(() => title.show(enterJump), openSpectate, openReplay, quickWatch);
 console.info('RIG v2 P7 — shell + spectate + re-call. master seed %s', masterSeed);

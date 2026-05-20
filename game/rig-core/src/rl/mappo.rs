@@ -26,7 +26,7 @@
 use crate::ai::types as ai;
 use crate::gym::{Env, Observation, RewardConfig, RigEnv, Scenario, TeamSide};
 use crate::rl::attention::{AttentionPolicy, ATTN_PARAM_W};
-use crate::rl::policy::{sorted_others, K, OUT_W};
+use crate::rl::policy::{sorted_others, K, OUT_W, N_INTENTS, INTENT_GATE_IDX, INTENT_LOGITS_BASE};
 use crate::rl::self_play::{Population, SelfPlayEnv, SelfPlayStep};
 use crate::rl::value::{compute_gae, value_featurize, CentralizedValue, VALUE_FEAT_W, VALUE_PARAM_W};
 
@@ -100,6 +100,14 @@ pub fn compute_log_prob(out: &[f64; OUT_W], action_taken: &ActionRecord) -> f64 
     let pass_logits: Vec<f64> = (0..K).map(|k| out[19 + k]).collect();
     lp += log_softmax_at(&pass_logits, action_taken.pass_target_idx);
 
+    // 10. Intent gate: Bernoulli (out[22])
+    lp += bernoulli_log_prob(out[INTENT_GATE_IDX], action_taken.intent_gate);
+
+    // 11. Intent selection: N_INTENTS-way categorical over out[23..30]
+    let intent_logits: Vec<f64> =
+        (0..N_INTENTS).map(|i| out[INTENT_LOGITS_BASE + i]).collect();
+    lp += log_softmax_at(&intent_logits, action_taken.intent_idx);
+
     lp
 }
 
@@ -116,14 +124,19 @@ pub fn compute_entropy(out: &[f64; OUT_W]) -> f64 {
         * CONTINUOUS_STD * CONTINUOUS_STD).ln();
     ent += 11.0 * gauss_ent;
 
-    // Binary heads: Bernoulli entropy (5 heads: fire_gate, release, pushoff, catch, pass_gate)
-    for &idx in &[6usize, 10, 11, 12, 18] {
+    // Binary heads: Bernoulli entropy (6 heads: fire_gate, release, pushoff, catch, pass_gate, intent_gate)
+    for &idx in &[6usize, 10, 11, 12, 18, INTENT_GATE_IDX] {
         ent += bernoulli_entropy(out[idx]);
     }
 
     // Pass target: categorical entropy
     let pass_logits: Vec<f64> = (0..K).map(|k| out[19 + k]).collect();
     ent += categorical_entropy(&pass_logits);
+
+    // Intent selection: categorical entropy
+    let intent_logits: Vec<f64> =
+        (0..N_INTENTS).map(|i| out[INTENT_LOGITS_BASE + i]).collect();
+    ent += categorical_entropy(&intent_logits);
 
     ent
 }
@@ -143,6 +156,8 @@ pub struct ActionRecord {
     pub thrumbler: [f64; 3],
     pub pass_gate: bool,
     pub pass_target_idx: usize, // 0..K
+    pub intent_gate: bool,
+    pub intent_idx: usize,      // 0..N_INTENTS
 }
 
 impl ActionRecord {
@@ -165,6 +180,14 @@ impl ActionRecord {
             }
         }
 
+        // Intent: argmax
+        let mut intent_idx = 0usize;
+        for i in 1..N_INTENTS {
+            if out[INTENT_LOGITS_BASE + i] > out[INTENT_LOGITS_BASE + intent_idx] {
+                intent_idx = i;
+            }
+        }
+
         ActionRecord {
             reel_idx,
             aim: [out[0], out[1], out[2]],
@@ -178,6 +201,8 @@ impl ActionRecord {
             thrumbler: [out[15], out[16], out[17]],
             pass_gate: out[18] > 0.0,
             pass_target_idx: pass_idx,
+            intent_gate: out[INTENT_GATE_IDX] > 0.0,
+            intent_idx,
         }
     }
 }
@@ -933,6 +958,8 @@ fn compute_batch_entropy(actor_w: &[f64], obs: &[Observation], ids: &[String]) -
 // ── Rank Normalization ────────────────────────────────────────────────────────
 
 /// Rank-normalize fitnesses to centered utilities in [-0.5, 0.5].
+/// Best fitness → +0.5, worst → -0.5 (ascending rank order so the
+/// antithetic gradient step moves weights TOWARD better perturbations).
 fn rank_normalize(fits: &[f64]) -> Vec<f64> {
     let pop = fits.len();
     if pop == 0 {
@@ -940,10 +967,10 @@ fn rank_normalize(fits: &[f64]) -> Vec<f64> {
     }
     let mut order: Vec<usize> = (0..pop).collect();
     order.sort_by(|&i, &j| {
-        fits[j]
-            .partial_cmp(&fits[i])
+        fits[i]
+            .partial_cmp(&fits[j])
             .unwrap_or(std::cmp::Ordering::Equal)
-            .then(i.cmp(&j))
+            .then(j.cmp(&i))
     });
     let mut util = vec![0.0_f64; pop];
     let denom = (pop - 1).max(1) as f64;
@@ -1028,10 +1055,10 @@ mod tests {
         assert_eq!(utils.len(), 6);
         let sum: f64 = utils.iter().sum();
         assert!((sum).abs() < 1e-10, "utilities should sum to ~0: {sum}");
-        // Best fitness (9.0 at index 4) should get utility -0.5 (rank 0).
-        assert!((utils[4] - (-0.5)).abs() < 1e-10);
-        // Worst fitness (1.0 at index 3) should get utility 0.5 (rank 5).
-        assert!((utils[3] - 0.5).abs() < 1e-10);
+        // Best fitness (9.0 at index 4) should get utility +0.5 (highest rank).
+        assert!((utils[4] - 0.5).abs() < 1e-10);
+        // Worst fitness (1.0 at index 3) should get utility -0.5 (lowest rank).
+        assert!((utils[3] - (-0.5)).abs() < 1e-10);
     }
 
     /// Micro MAPPO smoke test: 2 envs, 32 horizon, 2 gens. Completes without

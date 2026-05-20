@@ -50,6 +50,16 @@ mod ai_wasm;
 // module itself is excluded from the wasm32 target.
 #[cfg(not(target_arch = "wasm32"))]
 mod skill_eval;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod drill;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod match_analytics;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod adversarial_eval;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod curriculum;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod generalization_eval;
 // Stage 3: the offline GA over planner profile-space (deterministic,
 // seeded ChaCha8). ADDITIVE & NATIVE-ONLY — it does not change production
 // behavior (production still uses the default Coordination profile); the

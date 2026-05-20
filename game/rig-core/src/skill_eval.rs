@@ -26,13 +26,13 @@ use crate::sim_world::{RingEnd as SwRing, SimEvent as SwEv, SimWorld, Snapshot};
 use std::collections::HashMap;
 
 // ── Roster (headless.ts ROSTER) ──────────────────────────────────────────────
-struct RosterEntry {
-    id: &'static str,
-    team: ai::TeamSide,
-    role: ai::RiggerRole,
-    x: f64,
+pub(crate) struct RosterEntry {
+    pub id: &'static str,
+    pub team: ai::TeamSide,
+    pub role: ai::RiggerRole,
+    pub x: f64,
 }
-fn roster() -> [RosterEntry; 8] {
+pub(crate) fn roster() -> [RosterEntry; 8] {
     use ai::RiggerRole::*;
     use ai::TeamSide::*;
     [
@@ -52,18 +52,18 @@ const H: f64 = 1.0 / 240.0;
 // Normalisation caps + weights — verbatim from headless.ts (CAP/WT). The
 // 9 weights sum to 1.0; each sub-signal is clamped to [0,1] so no metric
 // can be Goodharted past its cap.
-struct Caps {
-    gate: f64,
-    pass: f64,
-    intc: f64,
-    score: f64,
-    poss: f64,
-    thrash_k: f64,
-    skin_pct: f64,
-    shot_conv: f64,
-    chain: f64,
+pub(crate) struct Caps {
+    pub gate: f64,
+    pub pass: f64,
+    pub intc: f64,
+    pub score: f64,
+    pub poss: f64,
+    pub thrash_k: f64,
+    pub skin_pct: f64,
+    pub shot_conv: f64,
+    pub chain: f64,
 }
-const CAP: Caps = Caps {
+pub(crate) const CAP: Caps = Caps {
     gate: 6.0,
     pass: 6.0,
     intc: 8.0,
@@ -79,7 +79,7 @@ const CAP: Caps = Caps {
 // Possession/calm/field remain useful diagnostics, but they are deliberately
 // low-weight because they are easy to Goodhart via holding, low-event play or
 // conservative anti-thrash behavior.
-const WT: [(&str, f64); 9] = [
+pub(crate) const WT: [(&str, f64); 9] = [
     ("prog", 0.22),
     ("pass", 0.14),
     ("intc", 0.08),
@@ -369,7 +369,7 @@ fn gate_ord(g: ai::Gate) -> i32 {
 /// are guaranteed consistent and the documented ranker composites are
 /// untouched (the only difference between the paths is WHICH planner profile
 /// the thread-local holds when `aisys.tick` → `plan_grapple` reads it).
-fn run_scored_match(
+pub(crate) fn run_scored_match(
     h_style: &str,
     h_cyl: &str,
     a_style: &str,
@@ -682,7 +682,7 @@ fn one_match_profile(
 /// `eval_skill` keeps its own inline copy verbatim so its path is provably
 /// untouched (this helper is byte-equivalent — verified by
 /// `eval_profile_matches_eval_skill_for_class_profile`).
-fn assemble_composite(
+pub(crate) fn assemble_composite(
     label: &str,
     results: Vec<(HashMap<&str, f64>, HashMap<&str, f64>)>,
 ) -> Composite {
@@ -854,6 +854,302 @@ mod tests {
     //   cargo test -p rig-core ranks_the_algorithm_zoo -- --ignored --nocapture
     // The fast `deterministic_same_seed` test above stays always-on as
     // the harness regression guard.
+    #[test]
+    #[ignore = "diagnostic; run with --ignored --nocapture. Use skill_drill binary instead."]
+    fn diagnose_game_loop() {
+        // Instruments a single match to trace WHERE the game loop breaks:
+        // throw attempts, catch outcomes, hold duration, ball states.
+        set_planner_class(0); // MPC baseline
+        let mut sim = SimWorld::new(1234);
+        let rs = roster();
+        let team_of: HashMap<String, ai::TeamSide> =
+            rs.iter().map(|r| (r.id.to_string(), r.team)).collect();
+        for (k, r) in rs.iter().enumerate() {
+            let ang = (k as f64 / rs.len() as f64) * std::f64::consts::PI * 2.0;
+            let sw_team = match r.team {
+                ai::TeamSide::Home => crate::sim_world::TeamSide::Home,
+                ai::TeamSide::Away => crate::sim_world::TeamSide::Away,
+            };
+            let sw_role = match r.role {
+                ai::RiggerRole::Anchor => crate::sim_world::RiggerRole::Anchor,
+                ai::RiggerRole::Spinner => crate::sim_world::RiggerRole::Spinner,
+                ai::RiggerRole::Faithwing => crate::sim_world::RiggerRole::Faithwing,
+                ai::RiggerRole::Freewing => crate::sim_world::RiggerRole::Freewing,
+                ai::RiggerRole::Reach => crate::sim_world::RiggerRole::Reach,
+            };
+            sim.add_player(
+                r.id,
+                sw_team,
+                sw_role,
+                Vec3::new(r.x, ang.cos() * 8.0, ang.sin() * 8.0),
+            );
+        }
+        sim.set_bell_held("H1");
+
+        let mut mat = MatchStateMachine::new(scoring::RingEnd::PlusX, scoring::TeamSide::Home);
+        let snap0 = sim.snapshot();
+        let s0 = conv::ai_to_scoring(&conv::snap_to_ai(&snap0));
+        mat.consume(
+            &[scoring::SimEvent::FoulGarrote { by: "__start__".to_string() }],
+            &s0,
+        );
+
+        let cfgs = vec![
+            TeamConfig {
+                side: ai::TeamSide::Home,
+                profile: style_to_profile("fall-dynasty", "big-slow"),
+                difficulty: Difficulty::Pro,
+            },
+            TeamConfig {
+                side: ai::TeamSide::Away,
+                profile: style_to_profile("fall-dynasty", "big-slow"),
+                difficulty: Difficulty::Pro,
+            },
+        ];
+        let mut aisys = AiSystem::new();
+
+        // Counters
+        let mut throw_attempts = 0u32;
+        let mut catches = 0u32;
+        let mut bobbles = 0u32;
+        let mut clatters = 0u32;
+        let mut skin_bounces = 0u32;
+        let mut possession_changes = 0u32;
+        let mut hold_durations: Vec<u32> = Vec::new();
+        let mut current_hold = 0u32;
+        let mut prev_holder: Option<String> = None;
+        let mut bell_free_ticks = 0u32;
+        let mut bell_held_ticks = 0u32;
+        let mut catch_intent_count = 0u32;
+        let mut dive_attempts = 0u32;
+        let mut rearms = 0u32;
+
+        // Per-tick speed/distance tracking (sampled)
+        let mut ball_speeds: Vec<f64> = Vec::new();
+        let mut player_speeds: Vec<f64> = Vec::new();
+        let mut ball_player_dists: Vec<f64> = Vec::new();
+
+        // Track close approaches to understand WHY catches fail
+        let mut close_approach_count = 0u32; // within 7m (commit reach)
+        let mut close_approach_rel_speeds: Vec<f64> = Vec::new();
+        let mut close_approach_closings: Vec<f64> = Vec::new();
+
+        let max_ticks = 4000u64; // ~16.7 seconds at 240Hz
+        for tick in 0..max_ticks {
+            if mat.state().winner.is_some() {
+                break;
+            }
+            let snap = sim.snapshot();
+            let ai_sim = conv::snap_to_ai(&snap);
+            let ai_match = conv::msm_to_ai(mat.state());
+
+            // Track possession state
+            if snap.bell.held_by.is_some() {
+                bell_held_ticks += 1;
+                current_hold += 1;
+                if prev_holder.as_deref() != snap.bell.held_by.as_deref() {
+                    possession_changes += 1;
+                }
+            } else {
+                bell_free_ticks += 1;
+                if current_hold > 0 {
+                    hold_durations.push(current_hold);
+                    current_hold = 0;
+                }
+            }
+            prev_holder = snap.bell.held_by.clone();
+
+            // Sample speeds/distances every 60 ticks (4x/sec)
+            if tick % 60 == 0 {
+                let bs = (snap.bell.v.x.powi(2) + snap.bell.v.y.powi(2) + snap.bell.v.z.powi(2)).sqrt();
+                ball_speeds.push(bs);
+                let mut min_dist = f64::INFINITY;
+                let mut avg_speed = 0.0;
+                for p in &snap.players {
+                    let ps = (p.v.x.powi(2) + p.v.y.powi(2) + p.v.z.powi(2)).sqrt();
+                    avg_speed += ps;
+                    let d = ((p.p.x - snap.bell.p.x).powi(2)
+                        + (p.p.y - snap.bell.p.y).powi(2)
+                        + (p.p.z - snap.bell.p.z).powi(2))
+                    .sqrt();
+                    if d < min_dist {
+                        min_dist = d;
+                    }
+                }
+                player_speeds.push(avg_speed / snap.players.len() as f64);
+                ball_player_dists.push(min_dist);
+            }
+
+            let frame = aisys.tick(&ai_sim, &ai_match, &cfgs, 1234);
+
+            // Count throw attempts and catch intents
+            for inp in &frame.players {
+                if inp.throw_released {
+                    throw_attempts += 1;
+                }
+                if inp.catch_intent {
+                    catch_intent_count += 1;
+                }
+                if inp.fire_line_at.is_some() && inp.reel == -1 {
+                    dive_attempts += 1;
+                }
+            }
+
+            // Track close approaches (ball is free, player within commit reach)
+            if snap.bell.held_by.is_none() {
+                let bell_p = snap.bell.p;
+                let bell_v = snap.bell.v;
+                for p in &snap.players {
+                    let d = ((p.p.x - bell_p.x).powi(2) + (p.p.y - bell_p.y).powi(2) + (p.p.z - bell_p.z).powi(2)).sqrt();
+                    if d <= 7.0 { // COMMIT_ARM_REACH
+                        close_approach_count += 1;
+                        let rel_vx = bell_v.x - p.v.x;
+                        let rel_vy = bell_v.y - p.v.y;
+                        let rel_vz = bell_v.z - p.v.z;
+                        let rel_speed = (rel_vx*rel_vx + rel_vy*rel_vy + rel_vz*rel_vz).sqrt();
+                        close_approach_rel_speeds.push(rel_speed);
+                        // Closing: positive means approaching
+                        let dx = bell_p.x - p.p.x;
+                        let dy = bell_p.y - p.p.y;
+                        let dz = bell_p.z - p.p.z;
+                        let d_len = d.max(1e-6);
+                        let closing = -(rel_vx * dx + rel_vy * dy + rel_vz * dz) / d_len;
+                        close_approach_closings.push(closing);
+                        if close_approach_count <= 10 {
+                            println!("  t={:>4} CLOSE {} gap={:.1}m rel_v={:.1} closing={:.1} intent={}",
+                                tick, p.id, d, rel_speed, closing,
+                                frame.players.iter().find(|i| i.id == p.id).map(|i| i.catch_intent).unwrap_or(false));
+                        }
+                    }
+                }
+            }
+            // Sample ball position and nearest player early
+            if tick % 240 == 0 && snap.bell.held_by.is_none() && tick < 2400 {
+                let mut nearest_id = "";
+                let mut nearest_d = f64::INFINITY;
+                let mut nearest_has_line = false;
+                for p in &snap.players {
+                    let d = ((p.p.x - snap.bell.p.x).powi(2) + (p.p.y - snap.bell.p.y).powi(2) + (p.p.z - snap.bell.p.z).powi(2)).sqrt();
+                    if d < nearest_d {
+                        nearest_d = d;
+                        nearest_id = &p.id;
+                        nearest_has_line = p.line_anchor.is_some();
+                    }
+                }
+                println!("  t={:>4} ({:.1}s) BALL@({:.0},{:.0},{:.0}) spd={:.1} nearest={} dist={:.1}m line={}",
+                    tick, tick as f64 / 240.0,
+                    snap.bell.p.x, snap.bell.p.y, snap.bell.p.z,
+                    (snap.bell.v.x.powi(2) + snap.bell.v.y.powi(2) + snap.bell.v.z.powi(2)).sqrt(),
+                    nearest_id, nearest_d, nearest_has_line);
+            }
+
+            let sw_frame = conv::frame_ai_to_sw(&frame);
+            let evs = sim.step(&sw_frame, H);
+            for e in &evs {
+                match e {
+                    SwEv::BellCaught { by } => {
+                        catches += 1;
+                        if tick < 600 || catches <= 5 {
+                            println!("  t={:>4} CAUGHT by {} (ball_v={:.1})", tick, by,
+                                (snap.bell.v.x.powi(2) + snap.bell.v.y.powi(2) + snap.bell.v.z.powi(2)).sqrt());
+                        }
+                    }
+                    SwEv::BellBobble { by } => {
+                        bobbles += 1;
+                        if tick < 600 || bobbles <= 5 {
+                            println!("  t={:>4} BOBBLE by {} (ball_v={:.1})", tick, by,
+                                (snap.bell.v.x.powi(2) + snap.bell.v.y.powi(2) + snap.bell.v.z.powi(2)).sqrt());
+                        }
+                    }
+                    SwEv::BellClatter { by } => {
+                        clatters += 1;
+                    }
+                    SwEv::BellSkin => {
+                        skin_bounces += 1;
+                    }
+                    _ => {}
+                }
+            }
+
+            // Re-arm dead ball (same as skill_eval)
+            let scoring_evs: Vec<scoring::SimEvent> =
+                evs.iter().map(conv::ev_sw_to_scoring).collect();
+            let post = conv::ai_to_scoring(&conv::snap_to_ai(&sim.snapshot()));
+            mat.consume(&scoring_evs, &post);
+            if mat.state().winner.is_none() && mat.state().phase != MatchPhase::Live {
+                let poss = mat.state().possession;
+                if let Some(r) = rs.iter().find(|r| conv::team_ai_to_scoring(r.team) == poss) {
+                    sim.set_bell_held(r.id);
+                }
+                mat.resume_live();
+                rearms += 1;
+            }
+        }
+        // Final hold
+        if current_hold > 0 {
+            hold_durations.push(current_hold);
+        }
+
+        println!("\n=== GAME LOOP DIAGNOSTIC ({}t = {:.1}s) ===", max_ticks, max_ticks as f64 / 240.0);
+        println!("POSSESSION: held={} free={} ratio={:.1}%",
+            bell_held_ticks, bell_free_ticks,
+            100.0 * bell_held_ticks as f64 / max_ticks as f64);
+        println!("THROWS: {} attempts ({:.1}/sec)",
+            throw_attempts, throw_attempts as f64 / (max_ticks as f64 / 240.0));
+        println!("CATCHES: {} clean, {} bobbles, {} clatters",
+            catches, bobbles, clatters);
+        println!("CATCH RATE: {:.1}% (catches / (catches+bobbles+clatters))",
+            if catches + bobbles + clatters > 0 {
+                100.0 * catches as f64 / (catches + bobbles + clatters) as f64
+            } else { 0.0 });
+        println!("CATCH_INTENT signaled: {} total ({:.1}/sec player-ticks)",
+            catch_intent_count, catch_intent_count as f64 / (max_ticks as f64 / 240.0));
+        println!("DIVE attempts (fire+reel=-1): {}", dive_attempts);
+        println!("SKIN bounces: {}", skin_bounces);
+        println!("REARMS (dead ball): {}", rearms);
+        println!("POSSESSION changes: {}", possession_changes);
+        if !hold_durations.is_empty() {
+            let avg_hold = hold_durations.iter().sum::<u32>() as f64 / hold_durations.len() as f64;
+            let max_hold = *hold_durations.iter().max().unwrap();
+            println!("HOLD DURATIONS: count={} avg={:.0}t ({:.2}s) max={}t ({:.2}s)",
+                hold_durations.len(), avg_hold, avg_hold / 240.0,
+                max_hold, max_hold as f64 / 240.0);
+        } else {
+            println!("HOLD DURATIONS: NO HOLDS EVER");
+        }
+        if !ball_speeds.is_empty() {
+            let avg_bs: f64 = ball_speeds.iter().sum::<f64>() / ball_speeds.len() as f64;
+            let max_bs = ball_speeds.iter().cloned().fold(0.0_f64, f64::max);
+            println!("BALL SPEED: avg={:.1} max={:.1} m/s", avg_bs, max_bs);
+        }
+        if !player_speeds.is_empty() {
+            let avg_ps: f64 = player_speeds.iter().sum::<f64>() / player_speeds.len() as f64;
+            println!("PLAYER SPEED (avg of all): {:.1} m/s", avg_ps);
+        }
+        if !ball_player_dists.is_empty() {
+            let avg_d: f64 = ball_player_dists.iter().sum::<f64>() / ball_player_dists.len() as f64;
+            let min_d = ball_player_dists.iter().cloned().fold(f64::INFINITY, f64::min);
+            println!("NEAREST PLAYER TO BALL: avg={:.1}m min={:.1}m", avg_d, min_d);
+        }
+        println!("CLOSE APPROACHES (within 7m): {}", close_approach_count);
+        if !close_approach_rel_speeds.is_empty() {
+            let n = close_approach_rel_speeds.len();
+            let avg_rel = close_approach_rel_speeds.iter().sum::<f64>() / n as f64;
+            let max_rel = close_approach_rel_speeds.iter().cloned().fold(0.0_f64, f64::max);
+            let under_38 = close_approach_rel_speeds.iter().filter(|&&s| s <= 38.0).count();
+            let avg_closing = close_approach_closings.iter().sum::<f64>() / n as f64;
+            let pos_closing = close_approach_closings.iter().filter(|&&c| c > -3.0).count();
+            println!("  rel_speed: avg={:.1} max={:.1} m/s, under_38={}/{} ({:.0}%)",
+                avg_rel, max_rel, under_38, n, 100.0 * under_38 as f64 / n as f64);
+            println!("  closing: avg={:.1}, positive(>-3)={}/{} ({:.0}%)",
+                avg_closing, pos_closing, n, 100.0 * pos_closing as f64 / n as f64);
+        }
+        println!("MATCH STATE: phase={:?} gate={:?} throws_left={}",
+            mat.state().phase, mat.state().cast.gate, mat.state().cast.throws_left);
+        println!("SCORE: home={} away={}", mat.state().score_home, mat.state().score_away);
+        set_planner_class(0);
+    }
+
     #[test]
     #[ignore = "exploration tool; run with --ignored --nocapture"]
     fn ranks_the_algorithm_zoo() {

@@ -196,7 +196,18 @@ const RICH_BASE: usize = 32 + 2 * K * OTHER_W; // = 68
 ///            teammate slots (argmax → which teammate to feed); if that
 ///            slot is empty the pass gate is ignored (graceful: falls
 ///            back to the continuous fire head, every field stays valid)
-pub const OUT_W: usize = 18 + 1 + K; // = 22
+///   ── HIERARCHICAL INTENT head ──
+///   [22]     intent gate logit (>0 ⇒ use high-level intent mode;
+///            the baseline controller executes the selected intent)
+///   [23..30) intent logits (argmax → which tactical intent to execute)
+pub const OUT_W: usize = 18 + 1 + K + 1 + N_INTENTS; // = 30
+
+/// Number of hierarchical intents the attention policy can select.
+pub const N_INTENTS: usize = 7;
+/// Intent gate logit index in the output vector.
+pub const INTENT_GATE_IDX: usize = 22;
+/// Base index for the N_INTENTS intent logits.
+pub const INTENT_LOGITS_BASE: usize = 23;
 
 /// Hidden layer width (two hidden layers).
 pub const HID: usize = 64;
@@ -206,10 +217,15 @@ pub const HID: usize = 64;
 /// grapple point; the sim clamps/ignores it under latency/cooldown).
 const FIRE_RANGE: f64 = 60.0;
 
-/// Total trainable parameter count: W1(HID×FEAT_W)+b1 + W2(HID×HID)+b2 +
-/// W3(OUT_W×HID)+b3.
+/// The MLP policy's output width — the low-level heads only (no intents).
+/// The MLP does not use the hierarchical intent heads; keeping its param
+/// count independent of OUT_W preserves compatibility with committed
+/// weight artifacts.
+const MLP_OUT_W: usize = 18 + 1 + K; // = 22
+
+/// Total trainable parameter count for the MLP policy.
 pub const PARAM_W: usize =
-    HID * FEAT_W + HID + HID * HID + HID + OUT_W * HID + OUT_W;
+    HID * FEAT_W + HID + HID * HID + HID + MLP_OUT_W * HID + MLP_OUT_W;
 
 #[inline]
 fn d2(a: Vec3, b: Vec3) -> f64 {
@@ -486,20 +502,21 @@ impl RlPolicy {
         }
         o += HID;
 
-        // Layer 3: OUT_W x HID + OUT_W bias, linear (decode applies the
-        // per-head squashing).
+        // Layer 3: MLP_OUT_W x HID + MLP_OUT_W bias, linear (decode applies
+        // the per-head squashing). Intent heads [22..30) are zero (the MLP
+        // does not produce them; the attention policy does).
         let mut out = [0.0_f64; OUT_W];
-        for (i, ov) in out.iter_mut().enumerate() {
+        for i in 0..MLP_OUT_W {
             let mut acc = 0.0;
             let row = o + i * HID;
             for j in 0..HID {
                 acc += w[row + j] * h2[j];
             }
-            *ov = acc;
+            out[i] = acc;
         }
-        o += OUT_W * HID;
-        for (i, ov) in out.iter_mut().enumerate() {
-            *ov += w[o + i];
+        o += MLP_OUT_W * HID;
+        for i in 0..MLP_OUT_W {
+            out[i] += w[o + i];
         }
         out
     }

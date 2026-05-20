@@ -182,13 +182,31 @@ pub(crate) fn wants_catch(
     if matches!(assignment.job, Job::Recover | Job::Receive) {
         return true;
     }
-    // Anyone else commits only if the bell is actually coming at them.
+    // Anyone else commits if the bell is reachable. Check both current gap
+    // AND predicted future gap (a crossing ball might be far now but pass
+    // close within 1-2 seconds).
+    if gap < 15.0 {
+        return true;
+    }
     let bs = vlen(state.bell.v);
     if bs < 1e-3 {
-        return gap < 12.0;
+        return gap < 15.0;
+    }
+    // Predicted closest approach: project bell along its velocity and check
+    // minimum distance to the player (simple linear CPA estimate).
+    let rel_pos = to_bell; // bell - player
+    let rel_vel = vsub(state.bell.v, player.v);
+    let rv2 = vdot(rel_vel, rel_vel);
+    if rv2 > 1e-6 {
+        let t_cpa = (-vdot(rel_pos, rel_vel) / rv2).clamp(0.0, 3.0);
+        let cpa_pos = vadd(rel_pos, vscale(rel_vel, t_cpa));
+        let cpa_dist = vlen(cpa_pos);
+        if cpa_dist < 25.0 && t_cpa < 2.5 {
+            return true;
+        }
     }
     let closing = -vdot(state.bell.v, to_bell) / (bs * gap.max(1e-6));
-    closing > 0.2 && gap < 45.0
+    closing > 0.0 && gap < 50.0
 }
 
 /// OFFENSE REBUILD — lead-intercept point of the live bell, so a committed
@@ -294,11 +312,12 @@ pub(crate) fn is_dive_committer(
     if primary_valid {
         return false;
     }
-    if i_am_shadow || assignment.job != Job::Recover {
+    if i_am_shadow {
         return false;
     }
-    // Recover-unit members that genuinely can take the bell and are not
-    // the shadow — deterministic best-intercept compare, id tie-break.
+    // EXPANDED FALLBACK: when the Director hasn't assigned valid Recover
+    // roles, the closest teammate that wants the catch gets to dive. This
+    // ensures a loose ball always has a diver regardless of Director state.
     let mut pack: Vec<&PlayerSim> = state
         .players
         .iter()
@@ -306,13 +325,13 @@ pub(crate) fn is_dive_committer(
             if p.team != player.team {
                 return false;
             }
-            match director.assignments.get(&p.id) {
+            let a = director.assignments.get(&p.id);
+            match a {
                 Some(a) => {
-                    a.job == Job::Recover
-                        && !a.is_shadow()
+                    !a.is_shadow()
                         && wants_catch(p, state, a, active_pass_target)
                 }
-                None => false,
+                None => wants_catch(p, state, assignment, active_pass_target),
             }
         })
         .collect();
@@ -558,34 +577,36 @@ fn decisive_dive_input(player: &PlayerSim, state: &SimState) -> (PartialInput, V
             Vec3::new(attack_sign(player.team), 0.0, 0.0)
         }
     };
-    // Rendezvous anchor: DOWNRANGE on the bell's OWN future path, not the
-    // straight rigger→point line. The terminal winch then drags the rigger
-    // parallel to the bell's velocity (≈ co-linear), so at the catch point
-    // |bell_v − player_v| ≈ ||bell_v| − REEL_PULL_SPEED|, small enough for
-    // the terminal ease to bleed into the committed absorb window.
+    // Rendezvous anchor placement depends on ball speed. Fast balls curve
+    // under Coriolis so we can run parallel; slow balls need direct interception.
     let bspeed = vlen(bv);
     let bvdir = if bspeed > 1e-3 {
         vscale(bv, 1.0 / bspeed)
     } else {
-        // Bell barely moving: a plain straight dive is already a rendezvous
-        // (rel-speed ≈ our own speed, which the terminal ease kills).
         app_dir
     };
-    // Far out we still need to actually CLOSE the gap to the bell's path;
-    // near in we want to be running parallel to it. Blend the two with a
-    // smooth, distance-only (deterministic) weight: mostly approach when
-    // far, mostly bell-parallel once within ~3 terminal radii.
     let term_r = crate::tuning::DIVE_TERMINAL_RADIUS;
-    let w_par = (1.0 - (d / (3.0 * term_r)).min(1.0)).clamp(0.0, 1.0);
-    let blended = vnorm(vadd(
-        vscale(app_dir, 1.0 - w_par),
-        vscale(bvdir, w_par),
-    ));
-    let dir = if vlen(blended) > 1e-6 { blended } else { app_dir };
-    // Anchor ahead of the catch point along the bell's path so reeling
-    // converges onto — and then runs with — the bell's trajectory.
-    let beyond = 14.0_f64;
-    let mut anchor = vadd(ip, vscale(bvdir, beyond));
+    // For slow/medium balls (< 20 m/s), use direct interception — fire
+    // straight at the predicted catch point, no parallel-run blending.
+    // The ball isn't curving enough to make rendezvous geometry work.
+    let dir = if bspeed < 20.0 {
+        app_dir
+    } else {
+        // Fast balls: blend approach (far) and parallel (near) so we end up
+        // running alongside the ball's trajectory at the catch point.
+        let w_par = (1.0 - (d / (3.0 * term_r)).min(1.0)).clamp(0.0, 1.0);
+        let blended = vnorm(vadd(
+            vscale(app_dir, 1.0 - w_par),
+            vscale(bvdir, w_par),
+        ));
+        if vlen(blended) > 1e-6 { blended } else { app_dir }
+    };
+    // Anchor placement: for fast balls, ahead along the bell's path so
+    // reeling converges onto the trajectory. For slow balls, just past the
+    // catch point along the approach direction (direct interception).
+    let beyond = if bspeed < 20.0 { 8.0 } else { 14.0 };
+    let anchor_dir = if bspeed < 20.0 { app_dir } else { bvdir };
+    let mut anchor = vadd(ip, vscale(anchor_dir, beyond));
     // Keep the anchor inside the chamber (clamp cross-radius below the
     // skin) so the powered hook has real purchase.
     let arho = (anchor.y * anchor.y + anchor.z * anchor.z).sqrt();
@@ -986,10 +1007,17 @@ pub fn compute_player_input(
             // commit-once latch (no per-tick fireLineAt re-issue), kept
             // deterministic (snapshot-driven, no rng, no wall clock).
             let has_line = player.line.is_some();
-            let bell_escaped = vlen(to_bell) > 60.0;
+            // Release if the ball is clearly not catchable: either far away (>25m)
+            // OR we've reached/passed the predicted catch point but the ball isn't
+            // here (missed the rendezvous).
+            let to_catch = vlen(vsub(catch_pt, player.p));
+            let bell_far = vlen(to_bell) > 25.0;
+            let past_catch_point =
+                to_catch < crate::tuning::DIVE_TERMINAL_RADIUS && vlen(to_bell) > 12.0;
+            let should_release = bell_far || past_catch_point;
             let (fire, do_release) = if !has_line {
                 (partial.fire_line_at.unwrap_or(None), false)
-            } else if bell_escaped {
+            } else if should_release {
                 (None, true)
             } else {
                 (None, false)
@@ -1008,9 +1036,13 @@ pub fn compute_player_input(
             // catch_intent = true so `committed` stays set. Geometry only
             // (a radius test on the deterministic predicted point): no rng,
             // no wall clock, fully tick-reproducible.
-            let near_catch =
+            // Ease when BOTH near the predicted catch point AND near the
+            // actual ball. If the prediction was off (ball diverged), keep
+            // winching until either we're close to the ball or we release.
+            let near_catch_pt =
                 vlen(vsub(catch_pt, player.p)) <= crate::tuning::DIVE_TERMINAL_RADIUS;
-            let reel_cmd: i32 = if near_catch {
+            let near_bell = vlen(to_bell) <= crate::tuning::DIVE_TERMINAL_RADIUS + 3.0;
+            let reel_cmd: i32 = if near_catch_pt && near_bell {
                 0
             } else {
                 partial.reel.unwrap_or(-1)

@@ -40,6 +40,12 @@ const CSS = `
   font-weight:700;letter-spacing:.24em;text-transform:uppercase;color:${PAL.cyanCss};
   cursor:pointer;border:1px solid ${PAL.cyanCss}88;border-radius:6px;background:transparent;}
 #rig-landing .watch:hover{background:${PAL.cyanCss}1a;border-color:${PAL.cyanCss};}
+#rig-landing .more-menu{display:flex;flex-wrap:wrap;gap:8px 14px;justify-content:center;
+  margin-top:1.2em;padding-top:1.2em;border-top:1px solid ${PAL.dimCss}33;}
+#rig-landing .more-btn{font:inherit;font-size:12px;letter-spacing:.14em;text-transform:uppercase;
+  color:${PAL.dimCss};cursor:pointer;border:1px solid ${PAL.dimCss}44;border-radius:4px;
+  padding:8px 18px;background:transparent;}
+#rig-landing .more-btn:hover{color:${PAL.paperCss};border-color:${PAL.dimCss}88;background:#1a1e28;}
 #rig-landing .links{text-align:center;margin-top:2.4em;font-size:12px;color:${PAL.dimCss};}
 #rig-landing .links a{color:${PAL.cyanCss};text-decoration:none;margin:0 12px;}
 #rig-landing .foot{text-align:center;margin-top:3em;color:${PAL.dimCss};
@@ -58,6 +64,7 @@ export class LandingScreen {
   private onPlay: (() => void) | null = null;
   private onSpectate: (() => void) | null = null;
   private onReplay: (() => void) | null = null;
+  private onQuickWatch: (() => void) | null = null;
 
   constructor(root: HTMLElement) {
     if (!document.getElementById('rig-landing-css')) {
@@ -91,9 +98,13 @@ export class LandingScreen {
           <span><b>SPIN</b> bend the bell</span>
         </div>
         <div class="acts">
-          <button class="play" id="rig-play-btn">PLAY</button>
-          <button class="watch" id="rig-watch-btn">Watch a match</button>
-          <button class="watch" id="rig-recall-btn">Re-calls</button>
+          <button class="play" id="rig-watch-btn">WATCH A MATCH</button>
+          <button class="watch" id="rig-drill-btn">Watch Drills</button>
+        </div>
+        <div class="more-menu">
+          <button class="more-btn" id="rig-play-btn">Play (WIP)</button>
+          <button class="more-btn" id="rig-recall-btn">Re-calls</button>
+          <button class="more-btn" id="rig-spectate-btn">Pick Teams</button>
         </div>
         <p class="links">
           <a href="classic/">Classic (the 2D original)</a> ·
@@ -103,13 +114,16 @@ export class LandingScreen {
       </div>`;
     root.style.position = 'relative';
     root.appendChild(this.el);
-    this.el.querySelector<HTMLButtonElement>('#rig-play-btn')!.addEventListener('click', () => {
-      const cb = this.onPlay;
+    this.el.querySelector<HTMLButtonElement>('#rig-watch-btn')!.addEventListener('click', () => {
+      const cb = this.onQuickWatch;
       this.hide();
       cb?.();
     });
-    this.el.querySelector<HTMLButtonElement>('#rig-watch-btn')!.addEventListener('click', () => {
-      const cb = this.onSpectate;
+    this.el.querySelector<HTMLButtonElement>('#rig-drill-btn')!.addEventListener('click', () => {
+      window.location.href = './drill.html';
+    });
+    this.el.querySelector<HTMLButtonElement>('#rig-play-btn')!.addEventListener('click', () => {
+      const cb = this.onPlay;
       this.hide();
       cb?.();
     });
@@ -118,12 +132,18 @@ export class LandingScreen {
       this.hide();
       cb?.();
     });
+    this.el.querySelector<HTMLButtonElement>('#rig-spectate-btn')!.addEventListener('click', () => {
+      const cb = this.onSpectate;
+      this.hide();
+      cb?.();
+    });
   }
 
-  show(onPlay: () => void, onSpectate?: () => void, onReplay?: () => void): void {
+  show(onPlay: () => void, onSpectate?: () => void, onReplay?: () => void, onQuickWatch?: () => void): void {
     this.onPlay = onPlay;
     this.onSpectate = onSpectate ?? null;
     this.onReplay = onReplay ?? null;
+    this.onQuickWatch = onQuickWatch ?? onSpectate ?? null;
     this.el.style.display = 'block';
     this.el.scrollTop = 0;
   }
@@ -133,5 +153,6 @@ export class LandingScreen {
     this.onPlay = null;
     this.onSpectate = null;
     this.onReplay = null;
+    this.onQuickWatch = null;
   }
 }

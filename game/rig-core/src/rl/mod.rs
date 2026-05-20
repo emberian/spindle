@@ -45,6 +45,7 @@ pub mod mappo;
 
 pub use policy::{
     Observation, ObsPlayer, RlPolicy, FEAT_W, K, OUT_W, PARAM_W,
+    N_INTENTS, INTENT_GATE_IDX, INTENT_LOGITS_BASE,
 };
 
 pub use attention::{AttentionPolicy, ATTN_PARAM_W, N_ENTITIES, D_MODEL};
